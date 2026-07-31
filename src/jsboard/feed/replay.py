@@ -1,0 +1,292 @@
+"""Offline feeds: a synthetic market and a recorded-session replayer.
+
+`SyntheticFeed` exists so the engine, the quoter and the UI can be exercised
+without a network — and, being seeded, so tests get the same market twice.
+It is a caricature of a real book, not a calibrated model: a random-walk mid,
+depth that decays with distance from the touch, and Poisson trade arrivals
+skewed by book imbalance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import random
+import time
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from ..core.types import Instrument, Side
+from .base import DepthDelta, DepthSnapshot, Feed, FeedEvent, FeedStatus, TradeTick
+
+
+class SyntheticFeed(Feed):
+    """A self-contained fake market."""
+
+    def __init__(
+        self,
+        instrument: Instrument,
+        *,
+        start_price: float = 64000.0,
+        levels: int = 25,
+        tick_interval: float = 0.1,
+        volatility_bps: float = 0.1,
+        base_depth_lots: int = 20_000,
+        spread_ticks: int = 8,
+        trade_rate: float = 15.0,
+        seed: int | None = None,
+        max_events: int | None = None,
+    ) -> None:
+        super().__init__(instrument)
+        self.levels = levels
+        self.tick_interval = tick_interval
+        # Volatility is per emitted tick, and these defaults are chosen to be
+        # *mutually* consistent rather than individually realistic. 0.1bps per
+        # 100ms scales to roughly 1%/day; the 8-tick spread and 20k-lot levels
+        # then leave a book a maker can actually work — wide enough to quote
+        # inside, deep enough that queue position still costs something.
+        self.volatility_bps = volatility_bps
+        self.base_depth_lots = base_depth_lots
+        self.spread_ticks = max(1, spread_ticks)
+        self.trade_rate = trade_rate
+        self.max_events = max_events
+        self._rng = random.Random(seed)
+        self._mid = instrument.to_ticks(start_price)
+        self._update_id = 1
+        self._bids: dict[int, int] = {}
+        self._asks: dict[int, int] = {}
+        # Virtual clock. Advances by `tick_interval` whether or not we actually
+        # sleep, so a zero-delay backtest still has a coherent timeline for
+        # requote intervals, latency, and staleness checks.
+        self._now_ns = time.time_ns()
+        self._step_ns = int((tick_interval or 0.1) * 1e9)
+
+    @property
+    def now_ns(self) -> int:
+        return self._now_ns
+
+    # ------------------------------------------------------------ mechanics
+
+    def _depth_for(self, distance: int) -> int:
+        """Level size: thin at the touch, fatter behind it, plus noise."""
+        shape = 1.0 - math.exp(-0.45 * (distance + 1))
+        noise = self._rng.uniform(0.55, 1.45)
+        return max(1, int(self.base_depth_lots * shape * noise))
+
+    def _build_book(self) -> tuple[dict[int, int], dict[int, int]]:
+        half = self.spread_ticks // 2
+        best_bid = self._mid - half - (self.spread_ticks % 2)
+        best_ask = self._mid + half + 1
+        bids = {best_bid - i: self._depth_for(i) for i in range(self.levels)}
+        asks = {best_ask + i: self._depth_for(i) for i in range(self.levels)}
+        return bids, asks
+
+    def _step_mid(self) -> None:
+        sigma = self._mid * self.volatility_bps / 10_000.0
+        self._mid = max(1, int(round(self._mid + self._rng.gauss(0.0, sigma))))
+
+    def _diff(self, old: dict[int, int], new: dict[int, int]) -> tuple[tuple[int, int], ...]:
+        """Absolute quantities for every level that moved; 0 means delete."""
+        changed = [(p, q) for p, q in new.items() if old.get(p) != q]
+        changed += [(p, 0) for p in old if p not in new]
+        return tuple(sorted(changed))
+
+    def _maybe_trades(self) -> list[TradeTick]:
+        """Poisson arrivals, leaning toward the heavier side of the book."""
+        # Rate is per second of *simulated* time. Using the wall-clock sleep
+        # interval instead would silence the tape entirely in a zero-delay
+        # backtest, where that interval is 0.
+        n = self._poisson(self.trade_rate * self._step_ns / 1e9)
+        if not n:
+            return []
+        best_bid = max(self._bids) if self._bids else None
+        best_ask = min(self._asks) if self._asks else None
+        if best_bid is None or best_ask is None:
+            return []
+
+        bid_qty = self._bids[best_bid]
+        ask_qty = self._asks[best_ask]
+        # A heavy bid means queued buyers, so the next print more often lifts
+        # the offer. Same intuition as the microprice.
+        p_buy = bid_qty / (bid_qty + ask_qty) if (bid_qty + ask_qty) else 0.5
+
+        out = []
+        for _ in range(n):
+            if self._rng.random() < p_buy:
+                side, price = Side.BUY, best_ask
+            else:
+                side, price = Side.SELL, best_bid
+            qty = max(1, int(self._rng.expovariate(1.0 / max(1.0, self.base_depth_lots * 0.08))))
+            out.append(
+                TradeTick(
+                    price=price,
+                    qty=qty,
+                    aggressor=side,
+                    trade_id=self._update_id,
+                    ts_ns=self._now_ns,
+                )
+            )
+        return out
+
+    def _poisson(self, lam: float) -> int:
+        if lam <= 0:
+            return 0
+        threshold, k, p = math.exp(-lam), 0, 1.0
+        while True:
+            p *= self._rng.random()
+            if p <= threshold:
+                return k
+            k += 1
+            if k > 50:  # guard against pathological lambda
+                return k
+
+    # --------------------------------------------------------------- stream
+
+    async def stream(self) -> AsyncIterator[FeedEvent]:
+        yield FeedStatus("connecting", "synthetic market")
+        self._bids, self._asks = self._build_book()
+        yield DepthSnapshot(
+            bids=tuple(sorted(self._bids.items(), reverse=True)),
+            asks=tuple(sorted(self._asks.items())),
+            last_update_id=self._update_id,
+            ts_ns=self._now_ns,
+        )
+        yield FeedStatus("live", "synthetic market")
+
+        emitted = 0
+        while self.max_events is None or emitted < self.max_events:
+            if self.tick_interval:
+                await asyncio.sleep(self.tick_interval)
+            self._now_ns += self._step_ns
+
+            self._step_mid()
+            new_bids, new_asks = self._build_book()
+            bid_diff = self._diff(self._bids, new_bids)
+            ask_diff = self._diff(self._asks, new_asks)
+            self._bids, self._asks = new_bids, new_asks
+
+            first = self._update_id + 1
+            self._update_id += 1
+            if bid_diff or ask_diff:
+                yield DepthDelta(
+                    bids=bid_diff,
+                    asks=ask_diff,
+                    first_id=first,
+                    final_id=self._update_id,
+                    ts_ns=self._now_ns,
+                )
+
+            for trade in self._maybe_trades():
+                yield trade
+
+            emitted += 1
+
+
+class JsonlRecorder:
+    """Append raw feed events to a JSONL file for later replay."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = None
+
+    def __enter__(self) -> JsonlRecorder:
+        self._fh = self.path.open("a", encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+    def write(self, event: FeedEvent) -> None:
+        if self._fh is None:
+            raise RuntimeError("recorder used outside its context manager")
+        self._fh.write(json.dumps(_encode(event)) + "\n")
+
+
+class ReplayFeed(Feed):
+    """Replay a JSONL recording, optionally in original wall-clock time."""
+
+    def __init__(
+        self,
+        instrument: Instrument,
+        path: str | Path,
+        *,
+        speed: float = 1.0,
+    ) -> None:
+        super().__init__(instrument)
+        self.path = Path(path)
+        self.speed = speed
+
+    async def stream(self) -> AsyncIterator[FeedEvent]:
+        yield FeedStatus("connecting", str(self.path))
+        prev_ts: int | None = None
+        with self.path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                event = _decode(json.loads(line))
+                ts = getattr(event, "ts_ns", None)
+                if self.speed > 0 and prev_ts is not None and ts is not None:
+                    gap = (ts - prev_ts) / 1e9 / self.speed
+                    if 0 < gap < 5.0:
+                        await asyncio.sleep(gap)
+                if ts is not None:
+                    prev_ts = ts
+                yield event
+        yield FeedStatus("disconnected", "replay exhausted")
+
+
+# ------------------------------------------------------------ (de)serialising
+
+_KINDS = {
+    "snapshot": DepthSnapshot,
+    "delta": DepthDelta,
+    "trade": TradeTick,
+    "status": FeedStatus,
+}
+_NAMES = {v: k for k, v in _KINDS.items()}
+
+
+def _encode(event: FeedEvent) -> dict:
+    kind = _NAMES[type(event)]
+    if isinstance(event, TradeTick):
+        body = {
+            "price": event.price,
+            "qty": event.qty,
+            "aggressor": int(event.aggressor),
+            "trade_id": event.trade_id,
+            "ts_ns": event.ts_ns,
+        }
+    elif isinstance(event, DepthSnapshot):
+        body = {
+            "bids": [list(x) for x in event.bids],
+            "asks": [list(x) for x in event.asks],
+            "last_update_id": event.last_update_id,
+            "ts_ns": event.ts_ns,
+        }
+    elif isinstance(event, DepthDelta):
+        body = {
+            "bids": [list(x) for x in event.bids],
+            "asks": [list(x) for x in event.asks],
+            "first_id": event.first_id,
+            "final_id": event.final_id,
+            "ts_ns": event.ts_ns,
+        }
+    else:
+        body = {"state": event.state, "detail": event.detail, "ts_ns": event.ts_ns}
+    return {"k": kind, **body}
+
+
+def _decode(row: dict) -> FeedEvent:
+    kind = row.pop("k")
+    cls = _KINDS[kind]
+    if cls is TradeTick:
+        row["aggressor"] = Side(row["aggressor"])
+    elif cls in (DepthSnapshot, DepthDelta):
+        row["bids"] = tuple(tuple(x) for x in row["bids"])
+        row["asks"] = tuple(tuple(x) for x in row["asks"])
+    return cls(**row)
