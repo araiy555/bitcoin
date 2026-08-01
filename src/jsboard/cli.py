@@ -292,6 +292,8 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         min_quote_volume=args.min_volume,
         min_trades=args.min_trades,
         size_quote=args.size_quote,
+        thin_ratio=args.thin_ratio,
+        crowded_ratio=args.crowded_ratio,
     )
 
     console.print("[dim]Binance の全銘柄を取得中…[/dim]")
@@ -325,21 +327,33 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     table.add_column("net\n(bps)", justify="right")
     table.add_column(f"1往復\n({filters.size_quote:,.0f})", justify="right")
     table.add_column("24h出来高", justify="right")
-    table.add_column("約定数", justify="right")
     table.add_column("板の厚み", justify="right")
+    table.add_column("行列/自分", justify="right")
+    table.add_column("判定")
+
+    verdict_style = {"可": "green", "行列が長い": "yellow", "板が薄い": "yellow"}
 
     shown = results[: args.top]
     for s in shown:
         net = s.net_bps(filters.maker_bps)
         style = "green" if net > 0 else "red"
+        verdict = (
+            s.capacity_verdict(
+                filters.size_quote, thin=filters.thin_ratio, crowded=filters.crowded_ratio
+            )
+            if net > 0
+            else "手数料割れ"
+        )
+        ratio = s.queue_ratio(filters.size_quote)
         table.add_row(
             s.symbol,
             f"{s.spread_bps:,.2f}",
             f"[{style}]{net:+,.2f}[/{style}]",
             f"[{style}]{s.profit_per_round_trip(filters.maker_bps, filters.size_quote):+,.4f}[/{style}]",
             f"{s.quote_volume:,.0f}",
-            f"{s.trades:,}",
             f"{s.top_of_book_quote:,.0f}",
+            f"{ratio:,.1f}x",
+            f"[{verdict_style.get(verdict, 'red')}]{verdict}[/{verdict_style.get(verdict, 'red')}]",
         )
 
     console.print()
@@ -347,6 +361,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     console.print(
         f"\n  {considered:,} 銘柄 → 流動性条件を満たす [bold]{stats['liquid']:,}[/bold] 件"
         f" → 手数料を超える [bold]{stats['viable']:,}[/bold] 件"
+        f" → 注文が置ける [bold]{stats['tradeable']:,}[/bold] 件"
     )
     console.print(
         f"  スプレッドの中央値 [bold]{stats['median_spread_bps']:.2f} bps[/bold]"
@@ -358,12 +373,20 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             "\n  [yellow]この手数料でスプレッドを超える銘柄はありません。[/yellow]\n"
             "  [dim]手数料を下げる以外に、この戦略が成立する道はありません。[/dim]"
         )
+    elif stats["tradeable"] == 0:
+        console.print(
+            f"\n  [yellow]手数料を超える {stats['viable']} 件は、すべて別の理由で成立しません。[/yellow]\n"
+            f"  [dim]行列が長い {stats['too_deep']} 件 … 自分の前に並ぶ枚数が多すぎて順番が回らない\n"
+            f"  板が薄い　　 {stats['too_thin']} 件 … 自分の注文が板の大半を占める。抜けられない[/dim]\n"
+            f"  [dim]--size-quote を下げれば「板より大きい」は解消しますが、\n"
+            f"  1往復の利益も同じ比率で下がります。[/dim]"
+        )
     else:
         console.print(
             "\n  [yellow]数字の読み方[/yellow]\n"
             "  [dim]スプレッドが広い銘柄は、誰も建値を置きたがらないから広いのが普通です。\n"
-            "  net が正でも、約定数が少なければ回転せず、板が薄ければ在庫を捌けません。\n"
-            "  net・約定数・板の厚みの3つが揃って初めて意味があります。[/dim]"
+            "  「行列/自分」は自分の前に並んでいる金額の倍率。大きいほど約定しません。\n"
+            "  1未満は自分が板より大きいという意味で、そこでは在庫を捌けません。[/dim]"
         )
     console.rule()
     return 0
@@ -454,6 +477,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--min-volume", type=float, default=1_000_000.0, help="24h出来高の下限")
     p_scan.add_argument("--min-trades", type=int, default=1_000, help="24h約定数の下限")
     p_scan.add_argument("--size-quote", type=float, default=1_000.0, help="1回の注文金額")
+    p_scan.add_argument("--thin-ratio", type=float, default=5.0,
+                        help="板がこの倍率未満なら「薄い」と判定")
+    p_scan.add_argument("--crowded-ratio", type=float, default=50.0,
+                        help="行列がこの倍率を超えたら「長い」と判定")
     p_scan.add_argument("--top", type=int, default=25, help="表示件数")
     p_scan.set_defaults(func=cmd_scan)
 

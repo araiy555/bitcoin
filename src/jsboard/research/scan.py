@@ -76,14 +76,39 @@ class SymbolStats:
         """Notional resting at the touch — how much size the level can absorb."""
         return min(self.bid_qty * self.bid, self.ask_qty * self.ask)
 
-    def daily_ceiling(self, maker_bps: float, size_quote: float) -> float:
-        """A generous upper bound on a day's take.
+    def queue_ratio(self, size_quote: float) -> float:
+        """How many times our own size is already queued ahead of us."""
+        if size_quote <= 0:
+            return float("inf")
+        return self.top_of_book_quote / size_quote
 
-        Assumes we round-trip once per public trade, which no maker ever
-        achieves — we are one participant among many in the same queue. Useful
-        only for spotting symbols where even the fantasy number is negligible.
+    def capacity_verdict(
+        self, size_quote: float, *, thin: float = 5.0, crowded: float = 50.0
+    ) -> str:
+        """Whether an order of this size can realistically work here.
+
+        Clearing the fee is necessary and nowhere near sufficient. The two
+        ways a surviving symbol still fails are opposites, and a symbol has
+        to thread between them:
+
+        too thin    our order is a large share of the level. We are not
+                    joining a book, we *are* the book — the fill model stops
+                    describing anything real, and there is no size to exit
+                    into. The default draws the line at a fifth of the level.
+
+        too deep    the queue ahead dwarfs us, so our turn rarely comes.
+                    Queue position is most of a maker's edge and we would be
+                    at the back of a very long line.
+
+        Both thresholds are judgement, not law — a real desk would set them
+        from its own fill data. They are arguments so they can be argued with.
         """
-        return self.profit_per_round_trip(maker_bps, size_quote) * self.trades / 2.0
+        ratio = self.queue_ratio(size_quote)
+        if ratio < thin:
+            return "板が薄い"
+        if ratio > crowded:
+            return "行列が長い"
+        return "可"
 
 
 @dataclass(slots=True)
@@ -93,6 +118,10 @@ class ScanFilters:
     min_quote_volume: float = 1_000_000.0
     min_trades: int = 1_000
     size_quote: float = 1_000.0
+    thin_ratio: float = 5.0
+    """Below this many times our size at the touch, we would be the book."""
+    crowded_ratio: float = 50.0
+    """Above this, the queue ahead is long enough that we rarely reach it."""
     exclude_leveraged: bool = True
     """Drop UP/DOWN/BULL/BEAR tokens, which are not spot pairs in spirit."""
 
@@ -186,9 +215,18 @@ async def scan(filters: ScanFilters) -> tuple[list[SymbolStats], int]:
 def summarise(results: list[SymbolStats], filters: ScanFilters) -> dict:
     """Headline numbers for the report."""
     viable = [s for s in results if s.net_bps(filters.maker_bps) > 0]
+    def verdict(s: SymbolStats) -> str:
+        return s.capacity_verdict(
+            filters.size_quote, thin=filters.thin_ratio, crowded=filters.crowded_ratio
+        )
+
+    tradeable = [s for s in viable if verdict(s) == "可"]
     return {
         "liquid": len(results),
         "viable": len(viable),
+        "tradeable": len(tradeable),
+        "too_deep": sum(1 for s in viable if verdict(s) == "行列が長い"),
+        "too_thin": sum(1 for s in viable if verdict(s) == "板が薄い"),
         "best_net_bps": viable[0].net_bps(filters.maker_bps) if viable else 0.0,
         "breakeven_spread_bps": 2.0 * filters.maker_bps,
         "median_spread_bps": _median([s.spread_bps for s in results]),

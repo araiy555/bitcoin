@@ -202,14 +202,55 @@ class TestRankingAndSummary:
         assert s["median_spread_bps"] == 0.0
 
 
-class TestDailyCeiling:
-    def test_ceiling_scales_with_trade_count(self):
-        busy = stats(bid=100.0, ask=101.0, trades=100_000)
-        quiet = stats(bid=100.0, ask=101.0, trades=1_000)
+class TestCapacity:
+    """Clearing the fee is necessary and nowhere near sufficient."""
 
-        assert busy.daily_ceiling(10.0, 1_000.0) > quiet.daily_ceiling(10.0, 1_000.0)
+    def test_a_long_queue_is_flagged(self):
+        # PEPEUSDT shape: $128k resting ahead of a $1,000 order.
+        s = stats(bid=100.0, ask=100.4, bid_qty=1_280.0, ask_qty=1_280.0)
 
-    def test_ceiling_is_negative_when_the_fee_dominates(self):
-        s = stats(bid=64_000.00, ask=64_000.02, trades=1_000_000)
+        assert s.queue_ratio(1_000.0) == pytest.approx(128.0)
+        assert s.capacity_verdict(1_000.0) == "行列が長い"
 
-        assert s.daily_ceiling(10.0, 1_000.0) < 0
+    def test_a_book_thinner_than_our_order_is_flagged(self):
+        # AEVOUSDT shape: $117 at the touch, nowhere to put $1,000.
+        s = stats(bid=100.0, ask=100.4, bid_qty=1.17, ask_qty=1.17)
+
+        assert s.queue_ratio(1_000.0) < 1.0
+        assert s.capacity_verdict(1_000.0) == "板が薄い"
+
+    def test_a_workable_depth_passes(self):
+        s = stats(bid=100.0, ask=100.4, bid_qty=50.0, ask_qty=50.0)
+
+        assert s.capacity_verdict(1_000.0) == "可"
+
+    def test_shrinking_the_order_escapes_the_thin_book(self):
+        s = stats(bid=100.0, ask=100.4, bid_qty=1.17, ask_qty=1.17)
+
+        assert s.capacity_verdict(1_000.0) == "板が薄い"
+        assert s.capacity_verdict(20.0, thin=0.1) == "可"
+
+    def test_summary_separates_the_two_failure_modes(self):
+        market = rank(
+            [
+                stats("DEEPUSDT", 100.0, 100.4, bid_qty=1_280.0, ask_qty=1_280.0),
+                stats("THINUSDT", 100.0, 100.4, bid_qty=1.17, ask_qty=1.17),
+                stats("OKUSDT", 100.0, 100.4, bid_qty=50.0, ask_qty=50.0),
+            ],
+            maker_bps=10.0,
+        )
+
+        s = summarise(market, ScanFilters(maker_bps=10.0, size_quote=1_000.0))
+
+        assert s["viable"] == 3
+        assert s["tradeable"] == 1
+        assert s["too_deep"] == 1
+        assert s["too_thin"] == 1
+
+    def test_symbols_below_the_fee_are_not_counted_as_tradeable(self):
+        market = rank([stats("NARROWUSDT", 100.0, 100.01, bid_qty=50.0, ask_qty=50.0)], 10.0)
+
+        s = summarise(market, ScanFilters(maker_bps=10.0))
+
+        assert s["viable"] == 0
+        assert s["tradeable"] == 0
