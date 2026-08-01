@@ -254,3 +254,83 @@ class TestCapacity:
 
         assert s["viable"] == 0
         assert s["tradeable"] == 0
+
+
+class TestSampling:
+    """One snapshot of a thin book proves nothing; medians are the point."""
+
+    def _sampled(self, spreads, depths):
+        s = stats(bid=100.0, ask=101.0)
+        s.spread_samples = list(spreads)
+        s.depth_samples = list(depths)
+        return s
+
+    def test_median_spread_is_used_when_sampled(self):
+        s = self._sampled([10.0, 20.0, 30.0, 40.0, 100.0], [1_000.0] * 5)
+
+        assert s.spread_bps == pytest.approx(30.0)
+
+    def test_median_depth_is_used_when_sampled(self):
+        # The exact swing observed live: SHIBUSDT 20,723 -> 4,841.
+        s = self._sampled([20.0] * 3, [20_723.0, 4_841.0, 9_000.0])
+
+        assert s.top_of_book_quote == pytest.approx(9_000.0)
+
+    def test_a_single_outlier_no_longer_decides_the_verdict(self):
+        """One unlucky poll used to flip a symbol between 可 and 板が薄い."""
+        s = self._sampled([20.0] * 5, [8_000.0, 9_000.0, 200.0, 8_500.0, 9_500.0])
+
+        assert s.capacity_verdict(1_000.0) == "可"
+
+    def test_unsampled_stats_fall_back_to_the_live_touch(self):
+        s = stats(bid=100.0, ask=101.0, bid_qty=10.0, ask_qty=10.0)
+
+        assert s.spread_bps == pytest.approx(99.5, abs=0.5)
+        assert s.top_of_book_quote == pytest.approx(1_000.0)
+
+    def test_swing_reports_how_far_the_touch_moved(self):
+        s = self._sampled([20.0] * 3, [100.0, 500.0, 1_000.0])
+
+        assert s.depth_swing == pytest.approx(10.0)
+
+    def test_a_steady_book_reports_no_swing(self):
+        s = self._sampled([20.0] * 3, [1_000.0] * 3)
+
+        assert s.depth_swing == pytest.approx(1.0)
+
+    def test_swing_needs_two_samples_to_mean_anything(self):
+        assert self._sampled([20.0], [1_000.0]).depth_swing == 1.0
+        assert stats().depth_swing == 1.0
+
+    def test_zero_depth_samples_do_not_blow_up_the_swing(self):
+        s = self._sampled([20.0] * 3, [0.0, 500.0, 1_000.0])
+
+        assert s.depth_swing == pytest.approx(2.0)
+
+    def test_add_sample_accumulates_across_polls(self):
+        from jsboard.research.scan import add_sample
+
+        book = parse_book_tickers([book_row("AAAUSDT", 100.0, 101.0, 10.0, 10.0)])
+        add_sample(book, [book_row("AAAUSDT", 100.0, 101.0, 10.0, 10.0)])
+        add_sample(book, [book_row("AAAUSDT", 100.0, 101.0, 50.0, 50.0)])
+
+        assert book["AAAUSDT"].samples_taken == 2
+        assert book["AAAUSDT"].depth_swing == pytest.approx(5.0)
+
+    def test_one_sided_observations_are_not_sampled(self):
+        from jsboard.research.scan import add_sample
+
+        book = parse_book_tickers([book_row("AAAUSDT", 100.0, 101.0)])
+        add_sample(book, [book_row("AAAUSDT", 0.0, 101.0)])
+
+        assert book["AAAUSDT"].samples_taken == 0
+
+    def test_summary_counts_unstable_symbols(self):
+        steady = self._sampled([200.0] * 3, [10_000.0] * 3)
+        steady.symbol = "STEADYUSDT"
+        jumpy = self._sampled([200.0] * 3, [1_000.0, 9_000.0, 5_000.0])
+        jumpy.symbol = "JUMPYUSDT"
+
+        s = summarise(rank([steady, jumpy], 10.0), ScanFilters(maker_bps=10.0))
+
+        assert s["unstable"] == 1

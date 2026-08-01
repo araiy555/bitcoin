@@ -285,6 +285,15 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _swing_cell(swing: float) -> str:
+    """Flag symbols whose touch moves so much that one look proves nothing."""
+    if swing >= 10.0:
+        return f"[red]{swing:,.1f}x[/red]"
+    if swing >= 3.0:
+        return f"[yellow]{swing:,.1f}x[/yellow]"
+    return f"[dim]{swing:,.1f}x[/dim]"
+
+
 async def cmd_scan(args: argparse.Namespace) -> int:
     filters = ScanFilters(
         quote_asset=args.quote.upper(),
@@ -294,11 +303,19 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         size_quote=args.size_quote,
         thin_ratio=args.thin_ratio,
         crowded_ratio=args.crowded_ratio,
+        samples=args.samples,
+        sample_interval=args.sample_interval,
     )
 
-    console.print("[dim]Binance の全銘柄を取得中…[/dim]")
+    def progress(n: int, total: int) -> None:
+        console.print(f"[dim]  板を観測中 {n}/{total}[/dim]", end="\r")
+
+    console.print(
+        f"[dim]Binance の全銘柄を取得中… "
+        f"（板を {filters.samples} 回、{filters.sample_interval:.0f}秒間隔で観測）[/dim]"
+    )
     try:
-        results, considered = await scan(filters)
+        results, considered = await scan(filters, on_sample=progress)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]取得に失敗しました: {exc}[/red]")
         hint = describe_tls_error(exc)
@@ -329,6 +346,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     table.add_column("24h出来高", justify="right")
     table.add_column("板の厚み", justify="right")
     table.add_column("行列/自分", justify="right")
+    table.add_column("板のぶれ", justify="right")
     table.add_column("判定")
 
     verdict_style = {"可": "green", "行列が長い": "yellow", "板が薄い": "yellow"}
@@ -353,6 +371,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             f"{s.quote_volume:,.0f}",
             f"{s.top_of_book_quote:,.0f}",
             f"{ratio:,.1f}x",
+            _swing_cell(s.depth_swing),
             f"[{verdict_style.get(verdict, 'red')}]{verdict}[/{verdict_style.get(verdict, 'red')}]",
         )
 
@@ -367,6 +386,11 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         f"  スプレッドの中央値 [bold]{stats['median_spread_bps']:.2f} bps[/bold]"
         f"（損益分岐は {breakeven:.1f} bps）"
     )
+    if stats["unstable"]:
+        console.print(
+            f"  [yellow]うち {stats['unstable']} 件は板が観測中に3倍以上ぶれています。"
+            f"1回の観測では判定できません。[/yellow]"
+        )
 
     if stats["viable"] == 0:
         console.print(
@@ -481,6 +505,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="板がこの倍率未満なら「薄い」と判定")
     p_scan.add_argument("--crowded-ratio", type=float, default=50.0,
                         help="行列がこの倍率を超えたら「長い」と判定")
+    p_scan.add_argument("--samples", type=int, default=5,
+                        help="板を観測する回数。1回では薄い板を判定できない")
+    p_scan.add_argument("--sample-interval", type=float, default=2.0, help="観測の間隔（秒）")
     p_scan.add_argument("--top", type=int, default=25, help="表示件数")
     p_scan.set_defaults(func=cmd_scan)
 
