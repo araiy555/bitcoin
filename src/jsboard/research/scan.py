@@ -30,6 +30,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from ..net import make_session
+
 REST_BASE = "https://api.binance.com"
 BOOK_TICKER = "/api/v3/ticker/bookTicker"
 DAY_TICKER = "/api/v3/ticker/24hr"
@@ -152,7 +154,7 @@ def rank(candidates: list[SymbolStats], maker_bps: float) -> list[SymbolStats]:
 async def fetch_market(session: aiohttp.ClientSession | None = None) -> dict[str, SymbolStats]:
     """Two requests, the whole spot market."""
     owns = session is None
-    session = session or aiohttp.ClientSession(trust_env=True)
+    session = session or make_session()
     timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with session.get(REST_BASE + BOOK_TICKER, timeout=timeout) as resp:

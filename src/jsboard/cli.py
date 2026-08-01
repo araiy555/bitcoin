@@ -36,6 +36,7 @@ from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
+from .net import describe_tls_error, make_session
 from .research.scan import ScanFilters, scan, summarise
 from .sim.paper import PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
@@ -69,7 +70,7 @@ async def fetch_instrument(symbol: str) -> Instrument:
     import aiohttp
 
     url = "https://api.binance.com/api/v3/exchangeInfo"
-    async with aiohttp.ClientSession(trust_env=True) as session, session.get(
+    async with make_session() as session, session.get(
         url, params={"symbol": symbol.upper()}, timeout=aiohttp.ClientTimeout(total=15)
     ) as resp:
         resp.raise_for_status()
@@ -298,7 +299,12 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         results, considered = await scan(filters)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]取得に失敗しました: {exc}[/red]")
-        console.print("[dim]ネットワークから api.binance.com に到達できるか確認してください。[/dim]")
+        hint = describe_tls_error(exc)
+        console.print(
+            f"[yellow]{hint}[/yellow]"
+            if hint
+            else "[dim]ネットワークから api.binance.com に到達できるか確認してください。[/dim]"
+        )
         return 1
 
     stats = summarise(results, filters)

@@ -27,6 +27,7 @@ import aiohttp
 import websockets
 
 from ..core.types import Instrument, Side
+from ..net import make_session, ssl_context
 from .base import DepthDelta, DepthSnapshot, Feed, FeedEvent, FeedStatus, TradeTick
 
 log = logging.getLogger(__name__)
@@ -74,8 +75,7 @@ class BinanceFeed(Feed):
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            # trust_env picks up HTTPS_PROXY / the CA bundle from the environment.
-            self._session = aiohttp.ClientSession(trust_env=True)
+            self._session = make_session()
             self._owns_session = True
         return self._session
 
@@ -150,6 +150,7 @@ class BinanceFeed(Feed):
             ping_interval=20,
             ping_timeout=20,
             max_queue=2**16,
+            ssl=ssl_context(),
         ) as ws:
             async for event in self._sync(ws):
                 yield event
