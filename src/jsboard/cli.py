@@ -24,6 +24,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.table import Table
 
 from .core.market import MarketView
 from .core.types import Instrument
@@ -35,6 +36,7 @@ from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
+from .research.scan import ScanFilters, scan, summarise
 from .sim.paper import PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .ui.board import Board
@@ -282,6 +284,85 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_scan(args: argparse.Namespace) -> int:
+    filters = ScanFilters(
+        quote_asset=args.quote.upper(),
+        maker_bps=args.maker_bps,
+        min_quote_volume=args.min_volume,
+        min_trades=args.min_trades,
+        size_quote=args.size_quote,
+    )
+
+    console.print("[dim]Binance の全銘柄を取得中…[/dim]")
+    try:
+        results, considered = await scan(filters)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]取得に失敗しました: {exc}[/red]")
+        console.print("[dim]ネットワークから api.binance.com に到達できるか確認してください。[/dim]")
+        return 1
+
+    stats = summarise(results, filters)
+    breakeven = stats["breakeven_spread_bps"]
+
+    console.print()
+    console.rule("[bold cyan]マーケットメイクが成立しうる銘柄")
+    console.print(
+        f"  メイカー手数料 [bold]{filters.maker_bps:.1f} bps[/bold]"
+        f"  →  損益分岐スプレッド [bold]{breakeven:.1f} bps[/bold]\n"
+        f"  条件: {filters.quote_asset}建て / 24h出来高 {filters.min_quote_volume:,.0f} 以上"
+        f" / 約定 {filters.min_trades:,} 件以上"
+    )
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("symbol", style="cyan")
+    table.add_column("spread\n(bps)", justify="right")
+    table.add_column("net\n(bps)", justify="right")
+    table.add_column(f"1往復\n({filters.size_quote:,.0f})", justify="right")
+    table.add_column("24h出来高", justify="right")
+    table.add_column("約定数", justify="right")
+    table.add_column("板の厚み", justify="right")
+
+    shown = results[: args.top]
+    for s in shown:
+        net = s.net_bps(filters.maker_bps)
+        style = "green" if net > 0 else "red"
+        table.add_row(
+            s.symbol,
+            f"{s.spread_bps:,.2f}",
+            f"[{style}]{net:+,.2f}[/{style}]",
+            f"[{style}]{s.profit_per_round_trip(filters.maker_bps, filters.size_quote):+,.4f}[/{style}]",
+            f"{s.quote_volume:,.0f}",
+            f"{s.trades:,}",
+            f"{s.top_of_book_quote:,.0f}",
+        )
+
+    console.print()
+    console.print(table)
+    console.print(
+        f"\n  {considered:,} 銘柄 → 流動性条件を満たす [bold]{stats['liquid']:,}[/bold] 件"
+        f" → 手数料を超える [bold]{stats['viable']:,}[/bold] 件"
+    )
+    console.print(
+        f"  スプレッドの中央値 [bold]{stats['median_spread_bps']:.2f} bps[/bold]"
+        f"（損益分岐は {breakeven:.1f} bps）"
+    )
+
+    if stats["viable"] == 0:
+        console.print(
+            "\n  [yellow]この手数料でスプレッドを超える銘柄はありません。[/yellow]\n"
+            "  [dim]手数料を下げる以外に、この戦略が成立する道はありません。[/dim]"
+        )
+    else:
+        console.print(
+            "\n  [yellow]数字の読み方[/yellow]\n"
+            "  [dim]スプレッドが広い銘柄は、誰も建値を置きたがらないから広いのが普通です。\n"
+            "  net が正でも、約定数が少なければ回転せず、板が薄ければ在庫を捌けません。\n"
+            "  net・約定数・板の厚みの3つが揃って初めて意味があります。[/dim]"
+        )
+    console.rule()
+    return 0
+
+
 # ------------------------------------------------------------------ parser
 
 
@@ -360,6 +441,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--volatility", type=float, default=0.1)
     p_bt.add_argument("--seed", type=int, default=7)
     p_bt.set_defaults(func=cmd_sim, headless=True)
+
+    p_scan = sub.add_parser("scan", help="全銘柄を走査し、手数料を超えるスプレッドを探す")
+    p_scan.add_argument("--quote", default="USDT", help="建て通貨")
+    p_scan.add_argument("--maker-bps", type=float, default=10.0, help="自分のメイカー手数料")
+    p_scan.add_argument("--min-volume", type=float, default=1_000_000.0, help="24h出来高の下限")
+    p_scan.add_argument("--min-trades", type=int, default=1_000, help="24h約定数の下限")
+    p_scan.add_argument("--size-quote", type=float, default=1_000.0, help="1回の注文金額")
+    p_scan.add_argument("--top", type=int, default=25, help="表示件数")
+    p_scan.set_defaults(func=cmd_scan)
 
     return parser
 

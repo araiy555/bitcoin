@@ -35,12 +35,29 @@ Binance の板を取り込み、マーケットメイカーを走らせ、ター
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
+jsboard scan --maker-bps 10        # 手数料を超える銘柄があるか探す（最初にこれ）
 jsboard sim                        # 合成市場 + ライブ板（ネットワーク不要）
 jsboard backtest --seed 7          # ヘッドレス実行、P&L サマリのみ
 jsboard live --symbol BTCUSDT      # Binance の実板、約定はペーパー
 jsboard record --out cap.jsonl     # ライブセッションを記録
 jsboard replay cap.jsonl --speed 4 # 記録を再生
 ```
+
+## 最初に確認すべきこと
+
+**この戦略は、手数料がゼロ以下でなければ成立しません。** 建値を出して稼げるのは
+1往復あたり最大でスプレッド1回分、対して手数料は売り買いの両方にかかるので、
+
+```
+spread_bps  >  2 × maker_fee_bps
+```
+
+を満たさない限り、1回売買するごとに必ず損をします。BTCUSDT でこれは
+**0.003 対 20** であり、成立しません。約6,400倍足りない計算です。
+
+`jsboard scan` は同じ判定を全銘柄に対して行います。ただし
+スプレッドが広い銘柄は「誰も建値を置きたがらないから広い」のが普通なので、
+net・約定数・板の厚みの3つを並べて表示します。どれか1つだけ良い銘柄は罠です。
 
 実注文を出す経路は存在しない。`live` は実データを読むだけで、
 API キーを受け取る箇所も取引所への発注パスもコード上に無い。
