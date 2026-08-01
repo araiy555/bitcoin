@@ -37,7 +37,7 @@ from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
-from .research.scan import ScanFilters, scan, summarise
+from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
 from .sim.paper import PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .ui.board import Board
@@ -294,8 +294,81 @@ def _swing_cell(swing: float) -> str:
     return f"[dim]{swing:,.1f}x[/dim]"
 
 
-async def cmd_scan(args: argparse.Namespace) -> int:
-    filters = ScanFilters(
+async def cmd_watch(args: argparse.Namespace) -> int:
+    """Repeat the scan over hours and report which symbols keep qualifying."""
+    filters = _scan_filters(args)
+    total_min = args.rounds * args.every / 60.0
+
+    console.rule("[bold cyan]持続性を測る")
+    console.print(
+        f"  {args.rounds} 回 × {args.every / 60:.0f}分間隔 = 約 {total_min:.0f}分\n"
+        f"  [dim]1回のスキャンは「今この瞬間」しか答えません。実際に建値を出し続ける\n"
+        f"  時間スケールで同じ銘柄が残るかを見ます。Ctrl-C で途中集計を表示します。[/dim]\n"
+    )
+
+    tally: dict = {}
+
+    def on_round(n, total, current, considered):
+        placeable = sum(1 for p in current.values() if p.tradeable_rounds)
+        console.print(
+            f"  [dim]{n}/{total} 回目 … これまでに一度でも置けた銘柄 {placeable} 件[/dim]"
+        )
+        tally.update(current)
+
+    try:
+        tally = await watch(
+            filters, rounds=args.rounds, every_seconds=args.every, on_round=on_round
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        console.print("\n[yellow]中断しました。途中までの集計を表示します。[/yellow]")
+
+    if not tally:
+        console.print("[red]1回も観測できませんでした。[/red]")
+        return 1
+
+    ranked = [p for p in rank_persistence(tally) if p.viable_rounds]
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("symbol", style="cyan")
+    table.add_column("置けた\n回数", justify="right")
+    table.add_column("持続率", justify="right")
+    table.add_column("出現率", justify="right")
+    table.add_column("net中央値\n(bps)", justify="right")
+    table.add_column("板の厚み\n中央値", justify="right")
+    table.add_column("板のぶれ\n(観測全体)", justify="right")
+
+    for p in ranked[: args.top]:
+        style = "green" if p.persistence >= 0.8 else "yellow" if p.persistence >= 0.5 else "red"
+        table.add_row(
+            p.symbol,
+            f"{p.tradeable_rounds}/{p.total_rounds or p.rounds}",
+            f"[{style}]{p.persistence:.0%}[/{style}]",
+            f"[dim]{p.presence:.0%}[/dim]",
+            f"{p.median_net_bps:+,.2f}",
+            f"{p.median_depth:,.0f}",
+            _swing_cell(p.depth_swing),
+        )
+
+    console.print()
+    console.print(table)
+
+    reliable = [p for p in ranked if p.persistence >= 0.8]
+    console.print(
+        f"\n  一度でも手数料を超えた銘柄 [bold]{len(ranked)}[/bold] 件のうち、"
+        f"8割以上の回で注文が置けたのは [bold]{len(reliable)}[/bold] 件"
+    )
+    if not reliable:
+        console.print(
+            "\n  [yellow]継続して成立する銘柄はありませんでした。[/yellow]\n"
+            "  [dim]スキャン1回では数件が「可」になりますが、それは観測した瞬間の話で、\n"
+            "  次に見たときには別の銘柄に入れ替わっています。建値を出し続ける戦略の\n"
+            "  対象としては使えません。[/dim]"
+        )
+    console.rule()
+    return 0
+
+
+def _scan_filters(args: argparse.Namespace) -> ScanFilters:
+    return ScanFilters(
         quote_asset=args.quote.upper(),
         maker_bps=args.maker_bps,
         min_quote_volume=args.min_volume,
@@ -306,6 +379,10 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         samples=args.samples,
         sample_interval=args.sample_interval,
     )
+
+
+async def cmd_scan(args: argparse.Namespace) -> int:
+    filters = _scan_filters(args)
 
     def progress(n: int, total: int) -> None:
         console.print(f"[dim]  板を観測中 {n}/{total}[/dim]", end="\r")
@@ -457,6 +534,23 @@ def add_common(p: argparse.ArgumentParser) -> None:
     sim.add_argument("--taker-bps", type=float, default=4.0)
 
 
+def add_scan_args(p: argparse.ArgumentParser) -> None:
+    """Arguments shared by `scan` and `watch` — watch is scan, repeated."""
+    p.add_argument("--quote", default="USDT", help="建て通貨")
+    p.add_argument("--maker-bps", type=float, default=10.0, help="自分のメイカー手数料")
+    p.add_argument("--min-volume", type=float, default=1_000_000.0, help="24h出来高の下限")
+    p.add_argument("--min-trades", type=int, default=1_000, help="24h約定数の下限")
+    p.add_argument("--size-quote", type=float, default=1_000.0, help="1回の注文金額")
+    p.add_argument("--thin-ratio", type=float, default=5.0,
+                   help="板がこの倍率未満なら「薄い」と判定")
+    p.add_argument("--crowded-ratio", type=float, default=50.0,
+                   help="行列がこの倍率を超えたら「長い」と判定")
+    p.add_argument("--samples", type=int, default=5,
+                   help="板を観測する回数。1回では薄い板を判定できない")
+    p.add_argument("--sample-interval", type=float, default=2.0, help="観測の間隔（秒）")
+    p.add_argument("--top", type=int, default=25, help="表示件数")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jsboard", description=__doc__.split("\n")[0])
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -496,20 +590,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.set_defaults(func=cmd_sim, headless=True)
 
     p_scan = sub.add_parser("scan", help="全銘柄を走査し、手数料を超えるスプレッドを探す")
-    p_scan.add_argument("--quote", default="USDT", help="建て通貨")
-    p_scan.add_argument("--maker-bps", type=float, default=10.0, help="自分のメイカー手数料")
-    p_scan.add_argument("--min-volume", type=float, default=1_000_000.0, help="24h出来高の下限")
-    p_scan.add_argument("--min-trades", type=int, default=1_000, help="24h約定数の下限")
-    p_scan.add_argument("--size-quote", type=float, default=1_000.0, help="1回の注文金額")
-    p_scan.add_argument("--thin-ratio", type=float, default=5.0,
-                        help="板がこの倍率未満なら「薄い」と判定")
-    p_scan.add_argument("--crowded-ratio", type=float, default=50.0,
-                        help="行列がこの倍率を超えたら「長い」と判定")
-    p_scan.add_argument("--samples", type=int, default=5,
-                        help="板を観測する回数。1回では薄い板を判定できない")
-    p_scan.add_argument("--sample-interval", type=float, default=2.0, help="観測の間隔（秒）")
-    p_scan.add_argument("--top", type=int, default=25, help="表示件数")
+    add_scan_args(p_scan)
     p_scan.set_defaults(func=cmd_scan)
+
+    p_watch = sub.add_parser("watch", help="スキャンを繰り返し、持続して成立する銘柄を探す")
+    add_scan_args(p_watch)
+    p_watch.add_argument("--rounds", type=int, default=12, help="スキャンの回数")
+    p_watch.add_argument("--every", type=float, default=300.0, help="スキャンの間隔（秒）")
+    p_watch.set_defaults(func=cmd_watch)
 
     return parser
 

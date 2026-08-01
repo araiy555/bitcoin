@@ -311,3 +311,115 @@ def _median(values: list[float]) -> float:
 
 def run(filters: ScanFilters) -> tuple[list[SymbolStats], int]:
     return asyncio.run(scan(filters))
+
+
+# --------------------------------------------------------------- persistence
+
+
+@dataclass(slots=True)
+class Persistence:
+    """How reliably one symbol qualified, across repeated scans.
+
+    A single scan answers "is this symbol viable right now", which turns out
+    not to be the question. Two scans half an hour apart shared only half
+    their surviving symbols, and of four that looked placeable in the first,
+    one still did in the second — the touch on BONKUSDT fell to 0.15x and on
+    MIRAUSDT to 0.09x, flipping both verdicts.
+
+    Sampling the touch a few seconds apart does not catch this: within such a
+    window these books barely move. The instability lives at the timescale you
+    would actually run a maker over, so the only honest measurement is to
+    repeat the whole scan over hours and count how often each symbol held up.
+    """
+
+    symbol: str
+    rounds: int = 0
+    """Rounds this symbol appeared in at all — it may drop out of the liquid
+    set entirely between scans."""
+    total_rounds: int = 0
+    """Rounds the watch ran. Persistence is measured against this, not against
+    `rounds`: a symbol that vanishes for half the watch has not been reliable,
+    and scoring it only on the rounds it showed up for would say the opposite."""
+    viable_rounds: int = 0
+    tradeable_rounds: int = 0
+    net_bps: list[float] = field(default_factory=list)
+    depth: list[float] = field(default_factory=list)
+
+    @property
+    def persistence(self) -> float:
+        """Fraction of the whole watch where the symbol was actually placeable."""
+        denominator = self.total_rounds or self.rounds
+        return self.tradeable_rounds / denominator if denominator else 0.0
+
+    @property
+    def presence(self) -> float:
+        """Fraction of the watch where the symbol even made the liquid set."""
+        return self.rounds / self.total_rounds if self.total_rounds else 0.0
+
+    @property
+    def median_net_bps(self) -> float:
+        return _median(self.net_bps)
+
+    @property
+    def median_depth(self) -> float:
+        return _median(self.depth)
+
+    @property
+    def depth_swing(self) -> float:
+        usable = [d for d in self.depth if d > 0]
+        if len(usable) < 2:
+            return 1.0
+        return max(usable) / min(usable)
+
+
+def fold_round(
+    tally: dict[str, Persistence], results: list[SymbolStats], filters: ScanFilters
+) -> None:
+    """Add one completed scan to the running tally."""
+    for stats in results:
+        entry = tally.setdefault(stats.symbol, Persistence(symbol=stats.symbol))
+        entry.rounds += 1
+        net = stats.net_bps(filters.maker_bps)
+        entry.net_bps.append(net)
+        entry.depth.append(stats.top_of_book_quote)
+        if net > 0:
+            entry.viable_rounds += 1
+            verdict = stats.capacity_verdict(
+                filters.size_quote, thin=filters.thin_ratio, crowded=filters.crowded_ratio
+            )
+            if verdict == "可":
+                entry.tradeable_rounds += 1
+
+
+def rank_persistence(tally: dict[str, Persistence]) -> list[Persistence]:
+    """Most reliably placeable first; ties broken by the edge on offer."""
+    return sorted(
+        tally.values(),
+        key=lambda p: (p.persistence, p.median_net_bps),
+        reverse=True,
+    )
+
+
+async def watch(
+    filters: ScanFilters,
+    *,
+    rounds: int,
+    every_seconds: float,
+    on_round=None,
+) -> dict[str, Persistence]:
+    """Repeat the scan and record which symbols keep qualifying.
+
+    Interrupting part-way is fine — whatever rounds completed are returned,
+    which is usually what you want from a long watch.
+    """
+    tally: dict[str, Persistence] = {}
+    for i in range(rounds):
+        if i:
+            await asyncio.sleep(every_seconds)
+        results, considered = await scan(filters)
+        fold_round(tally, results, filters)
+        for entry in tally.values():
+            entry.total_rounds = i + 1
+        if on_round:
+            on_round(i + 1, rounds, tally, considered)
+    return tally

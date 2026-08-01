@@ -334,3 +334,152 @@ class TestSampling:
         s = summarise(rank([steady, jumpy], 10.0), ScanFilters(maker_bps=10.0))
 
         assert s["unstable"] == 1
+
+
+class TestPersistence:
+    """One scan answers "right now", which turned out not to be the question."""
+
+    def _round(self, symbol, spread_bps, depth_quote):
+        s = stats(symbol, 100.0, 100.0 * (1 + spread_bps / 10_000))
+        s.bid_qty = s.ask_qty = depth_quote / 100.0
+        return s
+
+    def test_a_symbol_that_always_qualifies_scores_full_persistence(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        for i in range(5):
+            fold_round(tally, [self._round("STEADYUSDT", 40.0, 20_000.0)], f)
+            for e in tally.values():
+                e.total_rounds = i + 1
+
+        assert tally["STEADYUSDT"].persistence == 1.0
+        assert tally["STEADYUSDT"].tradeable_rounds == 5
+
+    def test_a_symbol_that_comes_and_goes_scores_partially(self):
+        """The live case: BONKUSDT's touch fell to 0.15x and the verdict flipped."""
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        for i, depth in enumerate((20_000.0, 20_000.0, 500.0, 500.0)):
+            fold_round(tally, [self._round("BONKUSDT", 36.0, depth)], f)
+            for e in tally.values():
+                e.total_rounds = i + 1
+
+        entry = tally["BONKUSDT"]
+        assert entry.rounds == 4
+        assert entry.viable_rounds == 4  # the spread held up
+        assert entry.tradeable_rounds == 2  # the depth did not
+        assert entry.persistence == 0.5
+
+    def test_clearing_the_fee_is_counted_separately_from_being_placeable(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        # Wide enough to clear the fee, always far too thin to use.
+        for i in range(3):
+            fold_round(tally, [self._round("THINUSDT", 40.0, 200.0)], f)
+            for e in tally.values():
+                e.total_rounds = i + 1
+
+        assert tally["THINUSDT"].viable_rounds == 3
+        assert tally["THINUSDT"].tradeable_rounds == 0
+        assert tally["THINUSDT"].persistence == 0.0
+
+    def test_symbols_absent_from_a_round_do_not_gain_credit(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        fold_round(tally, [self._round("AUSDT", 40.0, 20_000.0)], f)
+        fold_round(tally, [self._round("BUSDT", 40.0, 20_000.0)], f)
+
+        assert tally["AUSDT"].rounds == 1
+        assert tally["BUSDT"].rounds == 1
+
+    def test_ranking_puts_the_reliable_symbol_first(self):
+        from jsboard.research.scan import Persistence, fold_round, rank_persistence
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        for _ in range(4):
+            fold_round(tally, [self._round("STEADYUSDT", 30.0, 20_000.0)], f)
+        for depth in (20_000.0, 200.0, 200.0, 200.0):
+            # A bigger edge, but almost never usable.
+            fold_round(tally, [self._round("FLAKYUSDT", 90.0, depth)], f)
+
+        ordered = [p.symbol for p in rank_persistence(tally)]
+
+        assert ordered[0] == "STEADYUSDT"
+
+    def test_swing_spans_the_whole_watch(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        for depth in (15_793.0, 2_354.0):  # the observed BONKUSDT collapse
+            fold_round(tally, [self._round("BONKUSDT", 36.0, depth)], f)
+
+        assert tally["BONKUSDT"].depth_swing == pytest.approx(6.71, abs=0.05)
+
+    async def test_watch_runs_the_requested_rounds(self, monkeypatch):
+        import jsboard.research.scan as scan_mod
+
+        calls = []
+
+        async def fake_scan(filters, on_sample=None):
+            calls.append(1)
+            return [self._round("AUSDT", 40.0, 20_000.0)], 1
+
+        monkeypatch.setattr(scan_mod, "scan", fake_scan)
+
+        tally = await scan_mod.watch(
+            ScanFilters(maker_bps=10.0), rounds=3, every_seconds=0.0
+        )
+
+        assert len(calls) == 3
+        assert tally["AUSDT"].rounds == 3
+
+    def test_a_symbol_that_vanishes_is_not_credited_for_the_rounds_it_missed(self):
+        """The live failure: half the surviving list turned over in 30 minutes."""
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=10.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        rounds = [
+            [self._round("STEADYUSDT", 30.0, 20_000.0)],
+            [self._round("STEADYUSDT", 30.0, 20_000.0), self._round("LATEUSDT", 30.0, 20_000.0)],
+            [self._round("STEADYUSDT", 30.0, 20_000.0), self._round("LATEUSDT", 30.0, 20_000.0)],
+            [self._round("STEADYUSDT", 30.0, 20_000.0)],
+        ]
+        for i, results in enumerate(rounds):
+            fold_round(tally, results, f)
+            for e in tally.values():
+                e.total_rounds = i + 1
+
+        # LATEUSDT qualified whenever it appeared, but only appeared half the time.
+        assert tally["LATEUSDT"].tradeable_rounds == 2
+        assert tally["LATEUSDT"].presence == 0.5
+        assert tally["LATEUSDT"].persistence == 0.5
+        assert tally["STEADYUSDT"].persistence == 1.0
+
+    async def test_watch_scores_against_the_whole_run(self, monkeypatch):
+        import jsboard.research.scan as scan_mod
+
+        rounds = iter([
+            [self._round("AUSDT", 40.0, 20_000.0), self._round("BUSDT", 40.0, 20_000.0)],
+            [self._round("AUSDT", 40.0, 20_000.0)],
+            [self._round("AUSDT", 40.0, 20_000.0)],
+        ])
+
+        async def fake_scan(filters, on_sample=None):
+            return next(rounds), 1
+
+        monkeypatch.setattr(scan_mod, "scan", fake_scan)
+        tally = await scan_mod.watch(ScanFilters(maker_bps=10.0), rounds=3, every_seconds=0.0)
+
+        assert tally["AUSDT"].persistence == 1.0
+        assert tally["BUSDT"].persistence == pytest.approx(1 / 3)
