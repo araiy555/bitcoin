@@ -96,6 +96,13 @@ class MarketMaker:
 
     def should_requote(self) -> bool:
         elapsed_ms = (self.clock() - self.stats.last_requote_ns) / 1e6
+        if elapsed_ms < 0:
+            # The clock went backwards. A replay does this at the first event,
+            # when the source of "now" switches from the wall clock to the
+            # recording's own timestamps; an NTP step does it in production.
+            # Re-baseline instead of waiting for a deadline that has already
+            # passed, which would freeze quoting for the rest of the run.
+            return True
         return elapsed_ms >= self.config.requote_interval_ms
 
     def requote(self, force: bool = False) -> QuoteSet:

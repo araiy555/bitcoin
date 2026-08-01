@@ -157,8 +157,18 @@ class SyntheticFeed(Feed):
         emitted = 0
         while self.max_events is None or emitted < self.max_events:
             if self.tick_interval:
+                # Real-time mode: the data is generated on demand, so it *is*
+                # current. Read the wall clock rather than accumulating the
+                # nominal interval — each loop really takes `tick_interval`
+                # plus however long the consumer spent rendering, and adding
+                # only the nominal amount makes the stamp fall further behind
+                # every tick until the staleness gate pulls quotes for good.
                 await asyncio.sleep(self.tick_interval)
-            self._now_ns += self._step_ns
+                self._now_ns = time.time_ns()
+            else:
+                # No sleeping, so there is no wall clock worth reading; advance
+                # the simulated timeline instead.
+                self._now_ns += self._step_ns
 
             self._step_mid()
             new_bids, new_asks = self._build_book()

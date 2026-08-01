@@ -6,13 +6,14 @@ fees — a strategy that reliably printed money against it would mean the
 simulator had a bug, not that the strategy was good.
 """
 
+import json
 from decimal import Decimal
 
 import pytest
 
 from jsboard.core.market import MarketView
 from jsboard.core.types import Instrument, Side
-from jsboard.feed.replay import SyntheticFeed
+from jsboard.feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed
 from jsboard.mm.fair_value import FairValueEstimator
 from jsboard.mm.inventory import FeeSchedule, Position
 from jsboard.mm.quoter import Quoter, QuoterConfig
@@ -176,6 +177,71 @@ class TestFeeSensitivity:
         await session(mm, events=5_000)
 
         assert mm.stats.fills > 0
+
+
+class TestReplay:
+    """A recording must behave the same whenever it is replayed."""
+
+    async def _capture(self, path, *, seed=5, events=800):
+        feed = SyntheticFeed(BTC, seed=seed, tick_interval=0.0, max_events=events)
+        with JsonlRecorder(path) as rec:
+            async for event in feed.stream():
+                rec.write(event)
+        return path
+
+    def _backdate(self, path, days=1):
+        """Rewrite every timestamp `days` into the past."""
+        shift = days * 86_400 * 10**9
+        rows = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if "ts_ns" in row:
+                row["ts_ns"] -= shift
+            rows.append(json.dumps(row))
+        path.write_text("\n".join(rows) + "\n")
+
+    async def _replay(self, path):
+        mm = build()
+        result = await run(ReplayFeed(BTC, path, speed=0), mm, max_events=1_000_000)
+        return mm, result
+
+    async def test_a_fresh_capture_quotes_and_fills(self, tmp_path):
+        path = await self._capture(tmp_path / "cap.jsonl")
+        mm, _ = await self._replay(path)
+
+        assert mm.stats.cycles > 50
+        assert mm.stats.orders_placed > 0
+        assert mm.stats.fills > 0
+
+    async def test_an_old_capture_behaves_identically(self, tmp_path):
+        """Regression: a day-old recording read as a day-stale book.
+
+        Staleness was measured against the wall clock, so every capture older
+        than a couple of seconds tripped the risk gate and the maker placed
+        nothing at all. Replaying a recording means adopting its timeline.
+        """
+        fresh = await self._capture(tmp_path / "fresh.jsonl")
+        old = await self._capture(tmp_path / "old.jsonl")
+        self._backdate(old, days=1)
+
+        mm_fresh, _ = await self._replay(fresh)
+        mm_old, _ = await self._replay(old)
+
+        assert mm_old.stats.orders_placed > 0
+        assert mm_old.stats.fills > 0
+        assert mm_old.stats.cycles == mm_fresh.stats.cycles
+        assert mm_old.position.lots == mm_fresh.position.lots
+
+    async def test_replaying_twice_gives_the_same_result(self, tmp_path):
+        """Parameter comparisons are only meaningful if the run is repeatable."""
+        path = await self._capture(tmp_path / "cap.jsonl")
+
+        first, _ = await self._replay(path)
+        second, _ = await self._replay(path)
+
+        assert first.summary() == second.summary()
 
 
 class TestHalting:

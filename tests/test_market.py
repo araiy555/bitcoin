@@ -1,5 +1,6 @@
 """MarketView: feed ingestion, derived signals, and the synthetic/replay feeds."""
 
+import asyncio
 import math
 from decimal import Decimal
 
@@ -182,6 +183,34 @@ class TestSyntheticFeed:
 
         assert stamps == sorted(stamps)
         assert stamps[-1] > stamps[0]
+
+    async def test_real_time_stamps_track_the_wall_clock(self):
+        """Regression: event stamps must not drift behind real time.
+
+        Accumulating the nominal tick interval ignored the time the consumer
+        spent between events, so every tick fell a few more milliseconds
+        behind. The book looked progressively staler until the risk gate
+        pulled every quote and never resumed — on a feed that is generated on
+        demand and is by definition current.
+        """
+        feed = SyntheticFeed(BTC, seed=3, tick_interval=0.01)
+        market = MarketView(instrument=BTC)
+        ages = []
+        seen = 0
+
+        async for event in feed.stream():
+            market.apply(event)
+            await asyncio.sleep(0.005)  # stands in for the cost of rendering
+            seen += 1
+            if market.last_update_ns:  # skip the status frame before the snapshot
+                ages.append(market.age_ms)
+            if seen >= 90:
+                break
+
+        early = sum(ages[:30]) / 30
+        late = sum(ages[-30:]) / 30
+        assert late < early + 50, f"staleness is growing: {early:.0f}ms → {late:.0f}ms"
+        assert max(ages) < 250
 
     async def test_the_book_stays_two_sided(self):
         feed = SyntheticFeed(BTC, seed=5, tick_interval=0.0, max_events=100)

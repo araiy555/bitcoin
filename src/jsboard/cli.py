@@ -272,6 +272,12 @@ async def cmd_replay(args: argparse.Namespace) -> int:
 
     feed = ReplayFeed(instrument, path, speed=args.speed)
     mm = build_maker(instrument, args)
+    # A recording carries the timestamps it was captured with. Judged against
+    # the wall clock those are always in the past — a day-old capture reads as
+    # a book that is a day stale, and the risk gate pulls every quote before
+    # one is ever placed. "Now", during a replay, is the timestamp of the
+    # event being replayed.
+    attach_virtual_clock(mm)
     await drive(feed, mm, args, headless=args.headless)
     return 0
 
