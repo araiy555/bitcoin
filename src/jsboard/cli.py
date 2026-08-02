@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from .core.market import MarketView
 from .core.types import Instrument
 from .feed.base import Feed
 from .feed.binance import BinanceFeed
+from .feed.binance_futures import BinanceFuturesFeed
 from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
@@ -38,6 +40,7 @@ from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
 from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
+from .sim.capture import MultiCapture, write_meta
 from .sim.paper import PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .ui.board import Board
@@ -93,6 +96,45 @@ async def fetch_instrument(symbol: str) -> Instrument:
         base=info["baseAsset"],
         quote=info["quoteAsset"],
     )
+
+
+async def fetch_futures_instrument(symbol: str) -> Instrument:
+    """Tick and lot for the USDⓈ-M perpetual.
+
+    They differ from spot for the same ticker — BTCUSDT is 0.01/0.00001 on
+    spot and 0.1/0.001 on the perp — so the two must be fetched separately.
+    The futures exchangeInfo takes no symbol filter, so the whole list comes
+    back and is searched locally.
+    """
+    import aiohttp
+
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    async with make_session() as session, session.get(
+        url, timeout=aiohttp.ClientTimeout(total=30)
+    ) as resp:
+        resp.raise_for_status()
+        payload = await resp.json()
+
+    wanted = symbol.upper()
+    for info in payload["symbols"]:
+        if info["symbol"] != wanted:
+            continue
+        tick = lot = None
+        for f in info["filters"]:
+            if f["filterType"] == "PRICE_FILTER":
+                tick = f["tickSize"]
+            elif f["filterType"] == "LOT_SIZE":
+                lot = f["stepSize"]
+        if tick is None or lot is None:
+            raise RuntimeError(f"futures exchangeInfo for {wanted} had no price/lot filter")
+        return Instrument(
+            symbol=info["symbol"],
+            tick_size=Decimal(tick).normalize(),
+            lot_size=Decimal(lot).normalize(),
+            base=info["baseAsset"],
+            quote=info["quoteAsset"],
+        )
+    raise RuntimeError(f"{wanted} is not listed on USDⓈ-M futures")
 
 
 def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker:
@@ -524,6 +566,107 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_capture(args: argparse.Namespace) -> int:
+    """Record spot and perp together, onto one timeline."""
+    if args.spot_only and args.perp_only:
+        console.print("[red]--spot-only と --perp-only は同時に指定できません。[/red]")
+        return 2
+
+    sources: dict = {}
+    specs: dict = {}
+
+    if not args.perp_only:
+        try:
+            spot = await fetch_instrument(args.symbol)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]spot exchangeInfo unavailable ({exc}); using built-in[/yellow]")
+            spot = build_instrument(args.symbol, None, None)
+        sources["spot"] = BinanceFeed(spot, depth_ms=args.spot_depth_ms)
+        specs["spot"] = _spec_dict(spot, "spot")
+        console.print(f"[dim]spot  tick={spot.tick_size} lot={spot.lot_size}[/dim]")
+
+    if not args.spot_only:
+        try:
+            perp = await fetch_futures_instrument(args.symbol)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]perp exchangeInfo failed: {exc}[/red]")
+            hint = describe_tls_error(exc)
+            if hint:
+                console.print(f"[yellow]{hint}[/yellow]")
+            return 1
+        sources["perp"] = BinanceFuturesFeed(
+            perp, depth_ms=args.perp_depth_ms, open_interest_interval=args.oi_interval
+        )
+        specs["perp"] = _spec_dict(perp, "perp")
+        console.print(f"[dim]perp  tick={perp.tick_size} lot={perp.lot_size}[/dim]")
+
+    out = Path(args.out)
+    capture = MultiCapture(sources, out)
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} を記録")
+    console.print(
+        f"  出力   : {out}\n"
+        f"  対象   : {', '.join(sources)}\n"
+        f"  停止   : "
+        + (f"{args.duration:.0f}秒後" if args.duration else "Ctrl-C まで")
+        + "\n  [dim]取引所時刻と受信時刻の両方を記録します。前者は市場が何をしたか、\n"
+        "  後者は戦略が何を知り得たか。片方だけでは後から問い直せません。[/dim]\n"
+    )
+
+    last_report = [time.monotonic()]
+
+    def on_event(_name, _event) -> None:
+        now = time.monotonic()
+        if now - last_report[0] < 5.0:
+            return
+        last_report[0] = now
+        parts = []
+        for name, st in capture.stats.items():
+            kinds = " ".join(f"{k}={v:,}" for k, v in sorted(st.by_kind.items()))
+            parts.append(f"{name}[{st.status}] {st.events:,} ({kinds})")
+        console.print(f"  [dim]{' | '.join(parts)}[/dim]")
+
+    capture.on_event = on_event
+
+    try:
+        result = await capture.run(duration_s=args.duration, max_events=args.max_events)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]中断しました。[/yellow]")
+        return 130
+
+    meta = write_meta(out, specs)
+
+    console.print()
+    console.rule("[bold cyan]記録完了")
+    console.print(
+        f"  停止理由 : {result.stopped_because}\n"
+        f"  時間     : {result.duration_s:,.1f}秒\n"
+        f"  イベント : {result.total_events:,} 件\n"
+        f"  出力     : {out}  ({out.stat().st_size / 1e6:,.1f} MB)\n"
+        f"  メタ     : {meta.name}"
+    )
+    for name, st in result.stats.items():
+        kinds = ", ".join(f"{k} {v:,}" for k, v in sorted(st.by_kind.items()))
+        console.print(f"  [bold]{name}[/bold]: {st.events:,} 件  [dim]{kinds}[/dim]")
+        if st.errors:
+            console.print(f"    [yellow]切断 {st.errors} 回[/yellow]")
+        if st.events == 0:
+            console.print("    [red]1件も受信していません。接続を確認してください。[/red]")
+    console.rule()
+    return 0
+
+
+def _spec_dict(inst: Instrument, market: str) -> dict:
+    return {
+        "symbol": inst.symbol,
+        "market": market,
+        "tick_size": str(inst.tick_size),
+        "lot_size": str(inst.lot_size),
+        "base": inst.base,
+        "quote": inst.quote,
+    }
+
+
 # ------------------------------------------------------------------ parser
 
 
@@ -629,6 +772,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--rounds", type=int, default=12, help="スキャンの回数")
     p_watch.add_argument("--every", type=float, default=300.0, help="スキャンの間隔（秒）")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
+    p_cap.add_argument("--symbol", default="BTCUSDT")
+    p_cap.add_argument("--out", default="capture.jsonl")
+    p_cap.add_argument("--duration", type=float, default=None, help="秒。省略で Ctrl-C まで")
+    p_cap.add_argument("--max-events", type=int, default=None)
+    p_cap.add_argument("--spot-depth-ms", type=int, default=100, choices=(100, 1000))
+    p_cap.add_argument("--perp-depth-ms", type=int, default=100, choices=(100, 250, 500))
+    p_cap.add_argument("--oi-interval", type=float, default=15.0, help="建玉残高の取得間隔（秒）")
+    p_cap.add_argument("--spot-only", action="store_true")
+    p_cap.add_argument("--perp-only", action="store_true")
+    p_cap.set_defaults(func=cmd_capture)
 
     return parser
 

@@ -18,7 +18,17 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from ..core.types import Instrument, Side
-from .base import DepthDelta, DepthSnapshot, Feed, FeedEvent, FeedStatus, TradeTick
+from .base import (
+    DepthDelta,
+    DepthSnapshot,
+    Feed,
+    FeedEvent,
+    FeedStatus,
+    Liquidation,
+    MarkPrice,
+    OpenInterest,
+    TradeTick,
+)
 
 
 class SyntheticFeed(Feed):
@@ -257,6 +267,9 @@ _KINDS = {
     "delta": DepthDelta,
     "trade": TradeTick,
     "status": FeedStatus,
+    "mark": MarkPrice,
+    "oi": OpenInterest,
+    "liq": Liquidation,
 }
 _NAMES = {v: k for k, v in _KINDS.items()}
 
@@ -286,6 +299,23 @@ def _encode(event: FeedEvent) -> dict:
             "final_id": event.final_id,
             "ts_ns": event.ts_ns,
         }
+    elif isinstance(event, MarkPrice):
+        body = {
+            "mark": event.mark,
+            "index": event.index,
+            "funding_rate": event.funding_rate,
+            "next_funding_ns": event.next_funding_ns,
+            "ts_ns": event.ts_ns,
+        }
+    elif isinstance(event, OpenInterest):
+        body = {"lots": event.lots, "ts_ns": event.ts_ns}
+    elif isinstance(event, Liquidation):
+        body = {
+            "price": event.price,
+            "qty": event.qty,
+            "side": int(event.side),
+            "ts_ns": event.ts_ns,
+        }
     else:
         body = {"state": event.state, "detail": event.detail, "ts_ns": event.ts_ns}
     return {"k": kind, **body}
@@ -296,6 +326,8 @@ def _decode(row: dict) -> FeedEvent:
     cls = _KINDS[kind]
     if cls is TradeTick:
         row["aggressor"] = Side(row["aggressor"])
+    elif cls is Liquidation:
+        row["side"] = Side(row["side"])
     elif cls in (DepthSnapshot, DepthDelta):
         row["bids"] = tuple(tuple(x) for x in row["bids"])
         row["asks"] = tuple(tuple(x) for x in row["asks"])
