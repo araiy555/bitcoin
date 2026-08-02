@@ -483,3 +483,41 @@ class TestPersistence:
 
         assert tally["AUSDT"].persistence == 1.0
         assert tally["BUSDT"].persistence == pytest.approx(1 / 3)
+
+    def test_breakeven_fee_is_half_the_spread(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=0.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        # ASTERUSDT's observed shape: 16.65bps of spread at a 0bps fee.
+        for i in range(3):
+            fold_round(tally, [self._round("ASTERUSDT", 16.65, 20_000.0)], f)
+            for e in tally.values():
+                e.total_rounds = i + 1
+
+        assert tally["ASTERUSDT"].breakeven_fee_bps(0.0) == pytest.approx(8.32, abs=0.02)
+
+    def test_breakeven_is_independent_of_the_fee_it_was_scanned_at(self):
+        """The same symbol must report the same ceiling from either run."""
+        from jsboard.research.scan import Persistence, fold_round
+
+        results = {}
+        for scanned_at in (0.0, 5.0, 10.0):
+            f = ScanFilters(maker_bps=scanned_at, size_quote=1_000.0)
+            tally: dict[str, Persistence] = {}
+            fold_round(tally, [self._round("XUSDT", 16.65, 20_000.0)], f)
+            tally["XUSDT"].total_rounds = 1
+            results[scanned_at] = tally["XUSDT"].breakeven_fee_bps(scanned_at)
+
+        assert results[0.0] == pytest.approx(results[5.0], abs=0.01)
+        assert results[0.0] == pytest.approx(results[10.0], abs=0.01)
+
+    def test_a_one_tick_major_has_essentially_no_ceiling(self):
+        from jsboard.research.scan import Persistence, fold_round
+
+        f = ScanFilters(maker_bps=0.0, size_quote=1_000.0)
+        tally: dict[str, Persistence] = {}
+        fold_round(tally, [self._round("BTCUSDT", 0.003, 125_000.0)], f)
+        tally["BTCUSDT"].total_rounds = 1
+
+        assert tally["BTCUSDT"].breakeven_fee_bps(0.0) < 0.01

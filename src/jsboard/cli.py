@@ -285,6 +285,21 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+# Binance spot maker fees by VIP tier, for reading the breakeven column
+# against something concrete. Check the current schedule before relying on it.
+BINANCE_MAKER_TIERS = ((10.0, "VIP0"), (9.0, "VIP1"), (8.0, "VIP2"), (4.2, "VIP3"),
+                       (3.0, "VIP6"), (1.2, "VIP9"))
+
+
+def _fee_cell(breakeven: float) -> str:
+    """Colour the breakeven fee by which tier would reach it."""
+    if breakeven >= 8.0:
+        return f"[green]{breakeven:,.2f}[/green]"
+    if breakeven >= 1.2:
+        return f"[yellow]{breakeven:,.2f}[/yellow]"
+    return f"[red]{breakeven:,.2f}[/red]"
+
+
 def _swing_cell(swing: float) -> str:
     """Flag symbols whose touch moves so much that one look proves nothing."""
     if swing >= 10.0:
@@ -333,6 +348,7 @@ async def cmd_watch(args: argparse.Namespace) -> int:
     table.add_column("持続率", justify="right")
     table.add_column("出現率", justify="right")
     table.add_column("net中央値\n(bps)", justify="right")
+    table.add_column("上限手数料\n(bps)", justify="right")
     table.add_column("板の厚み\n中央値", justify="right")
     table.add_column("板のぶれ\n(観測全体)", justify="right")
 
@@ -344,6 +360,7 @@ async def cmd_watch(args: argparse.Namespace) -> int:
             f"[{style}]{p.persistence:.0%}[/{style}]",
             f"[dim]{p.presence:.0%}[/dim]",
             f"{p.median_net_bps:+,.2f}",
+            _fee_cell(p.breakeven_fee_bps(filters.maker_bps)),
             f"{p.median_depth:,.0f}",
             _swing_cell(p.depth_swing),
         )
@@ -351,11 +368,25 @@ async def cmd_watch(args: argparse.Namespace) -> int:
     console.print()
     console.print(table)
 
-    reliable = [p for p in ranked if p.persistence >= 0.8]
+    reliable = [p for p in ranked if p.persistence >= 0.75]
     console.print(
         f"\n  一度でも手数料を超えた銘柄 [bold]{len(ranked)}[/bold] 件のうち、"
-        f"8割以上の回で注文が置けたのは [bold]{len(reliable)}[/bold] 件"
+        f"75%以上の回で注文が置けたのは [bold]{len(reliable)}[/bold] 件"
     )
+    if reliable:
+        console.print("\n  [yellow]どの手数料まで成立するか[/yellow]")
+        for fee, tier in BINANCE_MAKER_TIERS:
+            passing = [p.symbol for p in reliable if p.breakeven_fee_bps(filters.maker_bps) >= fee]
+            mark = "green" if passing else "dim"
+            console.print(
+                f"  [dim]{tier:<6} {fee:>5.1f}bps →[/dim] "
+                f"[{mark}]{len(passing)}件[/{mark}] "
+                f"[dim]{', '.join(passing[:6]) if passing else ''}[/dim]"
+            )
+        console.print(
+            "\n  [dim]「上限手数料」は スプレッド÷2。これを下回る手数料が取れれば成立します。\n"
+            "  手数料は交渉やVIP昇格で動かせますが、スプレッドは動かせません。[/dim]"
+        )
     if not reliable:
         console.print(
             "\n  [yellow]継続して成立する銘柄はありませんでした。[/yellow]\n"

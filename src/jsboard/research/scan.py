@@ -364,6 +364,17 @@ class Persistence:
     def median_depth(self) -> float:
         return _median(self.depth)
 
+    def breakeven_fee_bps(self, maker_bps: float) -> float:
+        """The highest maker fee at which this symbol still clears its costs.
+
+        Half the spread, because the fee is charged on both legs of a round
+        trip. This is the number that actually decides things: running the
+        scan at one fee answers only whether *that* fee works, while this
+        says which fee tier would be needed — and a fee tier is negotiable
+        in a way the spread is not.
+        """
+        return (self.median_net_bps + 2.0 * maker_bps) / 2.0
+
     @property
     def depth_swing(self) -> float:
         usable = [d for d in self.depth if d > 0]
