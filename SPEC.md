@@ -1,0 +1,571 @@
+# jsboard 仕様
+
+現時点の実装をすべて記述したもの。設計判断の *理由* は各ソースの docstring に、
+経緯と実測結果は README にある。ここは「何がどう動くか」の一次資料。
+
+- 対象: Binance spot、単一取引所
+- 実装: Python 3.11+、6,925 行（src 2,560 / tests 2,129 / tools 358）
+- テスト: 225 件
+- **実発注の経路は存在しない。** API キーを受け取る箇所も、取引所へ注文を
+  送る関数も無い。全コマンドは公開データの読み取りのみ。
+
+---
+
+## 1. データフロー
+
+```
+  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+  │ BinanceFeed │   │SyntheticFeed│   │ ReplayFeed  │   Feed 実装（差し替え可）
+  │ WS + REST   │   │  合成生成    │   │ JSONL 再生  │
+  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+         └─────────────────┼─────────────────┘
+                           ▼   DepthSnapshot / DepthDelta / TradeTick / FeedStatus
+                    ┌──────────────┐
+                    │  MarketView  │  OrderBook + 歩み値 + RollingVol + FlowImbalance
+                    └──────┬───────┘
+                           ▼
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+  ┌───────────┐     ┌───────────┐      ┌───────────┐
+  │FairValue  │────▶│  Quoter   │◀─────│RiskManager│
+  │Estimator  │     │ QuoteSet  │      │ 4値判定    │
+  └───────────┘     └─────┬─────┘      └───────────┘
+                          ▼  MarketMaker._reconcile（差分のみ発注）
+                   ┌─────────────┐     ┌───────────┐
+                   │ PaperVenue  │────▶│ Position  │
+                   │ キュー位置   │ Fill│ 平均原価   │
+                   └─────────────┘     └───────────┘
+                          ▼
+                   ┌─────────────┐
+                   │    Board    │  rich
+                   └─────────────┘
+
+  研究系（上のパイプラインとは独立）
+  ┌─────────────┐
+  │ research/   │  全銘柄の最良気配を走査し、成立可能性を判定
+  │ scan.py     │  scan（1回）/ watch（繰り返して持続性を測る）
+  └─────────────┘
+```
+
+---
+
+## 2. 中核の型（`core/types.py`, 229行）
+
+### 単位の扱い
+
+**エンジン内部では価格を tick 単位の整数、数量を lot 単位の整数で持つ。**
+浮動小数点が板に入らないので、価格レベルの比較とハッシュが厳密に一致する。
+人間向け単位との変換は `Instrument` だけが行う。
+
+| 型 | 内容 |
+|---|---|
+| `Side` | `BUY=1` / `SELL=-1`。`.opposite` と `.sign` を持つ IntEnum |
+| `TimeInForce` | `GTC` / `IOC` / `FOK` / `POST_ONLY` |
+| `OrderStatus` | `NEW` / `PARTIALLY_FILLED` / `FILLED` / `CANCELLED` / `REJECTED` |
+| `Instrument` | `symbol`, `tick_size`, `lot_size`, `base`, `quote`（Decimal） |
+| `Order` | side, qty, price(ticks or None=成行), tif, owner, seq, remaining, status |
+| `Fill` | price, qty, maker_id/owner, taker_id/owner, aggressor, ts_ns |
+| `Level` | price, qty, orders（L2 の1段） |
+| `BookSnapshot` | bids/asks タプル + 派生値 |
+
+### 変換規則
+
+- `to_ticks(price)` — **四捨五入**（ROUND_HALF_UP）
+- `to_lots(qty)` — **切り捨て**（ROUND_DOWN）。数量を勝手に増やさないため
+
+### `BookSnapshot` の派生値
+
+- `mid` — `(best_bid + best_ask) / 2`
+- `spread` — tick 数
+- `microprice` — `(bid_px·ask_qty + ask_px·bid_qty) / (bid_qty + ask_qty)`
+  サイズ加重の仲値。**薄い側に寄る**。買いが厚い＝買い手が並んでいる＝
+  次の約定は売り板を食う確率が高い、という理屈
+- `imbalance(depth)` — `(Σbid_qty − Σask_qty) / Σ` で `[-1, 1]`
+
+---
+
+## 3. マッチングエンジン（`core/book.py`, 293行）
+
+価格-時間優先の指値板。片側ごとに `SortedDict[price_ticks → PriceLevel]`。
+ベスト気配は `peekitem(0)` / `peekitem(-1)` で O(1)。レベル内は `deque` で到着順。
+
+### キャンセルの実装
+
+中間要素を抜かず、注文を死んだ状態にしてレベル合計から差し引く。
+死んだ注文はキュー先頭に来た時点で捨てる。**キャンセルが O(1)** になる代わりに、
+浮上するまでオブジェクトが残る。この形の板では標準的な取引。
+
+### API
+
+| メソッド | 動作 |
+|---|---|
+| `submit(order)` | マッチ → 残りを板に置くか破棄。`MatchResult` を返す |
+| `cancel(order_id)` | 冪等。既に消えていれば `None` |
+| `cancel_all(owner)` | owner 単位で全取消 |
+| `amend(id, price, qty)` | **サイズ減のみキュー位置を維持**。価格変更・サイズ増は cancel/replace |
+| `snapshot(depth)` | 上位 N 段の L2 |
+| `replace_l2(bids, asks, owner)` | L2 画像で market 由来の板を総入れ替え。自分の注文は残す |
+| `apply_l2_delta(side, price, qty, owner)` | 1段だけ更新。`qty=0` で削除 |
+
+### TIF の意味
+
+- `GTC` — 約定しなかった分は板に残る
+- `IOC` — 即時約定分以外は破棄
+- `FOK` — **全量約定できなければ何もせず REJECTED**（事前に約定可能量を計算）
+- `POST_ONLY` — 板を食う位置なら REJECTED
+- 成行（`price=None`）— GTC/POST_ONLY との組み合わせは `ValueError`
+
+### 自己約定防止（STP）
+
+| ポリシー | 動作 |
+|---|---|
+| `NONE` | 自己約定を許す（テスト用） |
+| `CANCEL_MAKER`（既定） | 板側の自分の注文を取り消して攻撃を続行 |
+| `CANCEL_TAKER` | 攻撃側を止める |
+
+---
+
+## 4. マーケットビュー（`core/market.py`）
+
+フィードイベントを板に反映し、派生シグナルを保持する。
+
+| 要素 | 内容 |
+|---|---|
+| `book` | `OrderBook`。market 由来の注文は `owner="market"` |
+| `tape` | 直近の約定（既定 500 件の `deque`） |
+| `vol` | `RollingVol` — 対数収益の二乗の EWMA。halflife 60 サンプル |
+| `flow` | `FlowImbalance` — 符号付き約定量の指数減衰。halflife 40 |
+| `clock` | 「今」の供給元。**バックテストでは仮想時計に差し替える** |
+
+`age_ms` は `clock() - last_update_ns`。リスクゲートのステール判定に使う。
+
+---
+
+## 5. フィード（`feed/`）
+
+### 共通イベント型（`base.py`）
+
+`DepthSnapshot` / `DepthDelta` / `TradeTick` / `FeedStatus`。
+全アダプタがこの4種に正規化するので、下流は取引所を知らない。
+
+### Binance（`binance.py`, 225行）
+
+**このファイルの主眼はスナップショットと差分の継ぎ目。** 公式手順どおり：
+
+1. 差分ストリームを開いてバッファリング開始
+2. REST スナップショットを取得し `lastUpdateId` を記録
+3. `u <= lastUpdateId` のイベントを破棄
+4. 最初に適用するイベントは `U <= lastUpdateId+1 <= u` を満たすこと
+5. 以降すべて `U == 前回の u + 1`。ギャップ検出時は再同期
+
+**4 と 5 を省いても例外は出ない。静かに数レベルずれた板が延々と出来上がる。**
+この失敗モードを守るため、結合条件とギャップ条件を直接テストしている。
+
+エンドポイント:
+- `GET /api/v3/depth?limit=1000` — スナップショット
+- `wss://stream.binance.com:9443/stream?streams=<sym>@depth@100ms/<sym>@aggTrade`
+
+`aggTrade` の `m` は「買い手がメイカーか」なので、`m=true` → 攻めたのは**売り手**。
+
+切断時は指数バックオフ（2,4,8,16,32秒、上限30秒）で再接続。
+
+### 合成・リプレイ（`replay.py`, 302行）
+
+**`SyntheticFeed`** — ネットワーク不要。ランダムウォークの仲値、
+距離に応じて減衰する板、板の偏りに応じたポアソン約定。シードで再現可能。
+
+デフォルト値は個別に現実的というより**相互に整合**するよう選んである
+（100ms あたり 0.1bps ≒ 日次1%、8 tick スプレッド、2万 lot のレベル）。
+
+**仮想時計を持つ。** 実時間モードでは実時計を読み、遅延なしモードでは
+公称間隔を加算する。前者を怠ると描画時間ぶんの遅れが蓄積し、
+ステール判定が誤作動して建値が止まる（実際に起きた）。
+
+**`JsonlRecorder` / `ReplayFeed`** — イベントを JSONL で記録・再生。
+`--speed 0` で待ちなし。`.meta.json` に銘柄仕様を併記する。
+
+---
+
+## 6. マーケットメイク（`mm/`）
+
+### フェアバリュー（`fair_value.py`, 88行）
+
+**仲値ではなく microprice を起点**にする。仲値の周りに対称に建値を置く
+マーケットメイカーは逆選択される。
+
+```
+fair = microprice + half_spread × (imbalance_weight·imbalance + flow_weight·flow)
+```
+
+EWMA で平滑化し、**最良買い/売りの外には出さない**（外に出たら市場がタダ金という主張になる）。
+
+> **未検証の前提**: `imbalance_weight=0.35` と `flow_weight=0.25` は
+> それらしい値を置いただけで、実データで予測力を測っていない。
+> 予測力がゼロならこの補正は単なるノイズの混入。
+
+### クォーター（`quoter.py`, 254行）
+
+Avellaneda–Stoikov の2つの発想（在庫と逆にずらすリザベーション価格、
+ボラと板の薄さで広がるハーフスプレッド）に従うが、**パラメータ化は論文どおりではない**。
+
+原論文の γ は次元を持ち、`γ·σ²·T` が価格になるのは γ が 1/(価格·数量) の
+単位を担っているから。tick 空間へ素朴に移すと全パラメータが銘柄依存になる。
+
+そこで同じ構造を、銘柄が変わっても意味が保たれる形にした：
+
+```
+skew_ticks  = (inventory_skew_ticks + gamma·σ_ticks) · q_norm
+half_spread = max(下限, min(上限, vol_multiplier·σ_ticks + liquidity_premium/κ))
+下限        = max(min_half_spread_ticks, min_edge_bps/10000 · mid_ticks)
+```
+
+`q_norm` は建玉上限に対する比率で `[-1, 1]`。γ・`vol_multiplier`・κ は無次元。
+
+**手数料下限が最も重要。** メイカー手数料 `f` bps を払う以上、片側あたり
+最低 `f` bps 稼がねば round trip が成立しない。`min_edge_bps` は
+**上限クランプより優先**する（自分の手数料の内側に建値を出さないため）。
+
+その他:
+- **非クロス不変条件** — bid < best_ask、ask > best_bid を常に強制
+- `allow_price_improvement` — スプレッド内側に置けるか。**キュー位置の源泉**
+- 段数 `levels`、間隔 `level_step_ticks`、サイズ減衰 `level_size_decay`
+- 建玉上限に近づくと、積み増す側のサイズを `inventory_taper` で絞る
+- 上限到達側は建値を出さない
+- 丸めで同じ tick に落ちた段はマージ
+
+### 在庫と損益（`inventory.py`, 160行）
+
+**平均原価法**。積み増しで平均を更新、減少で実現損益を計上、ドテンは
+ゼロを跨いで旧建玉を閉じてから新建玉を約定値で開く。
+
+手数料は notional の bps。**負の値でリベート**を表せる。
+`PnLTracker` が高値更新と最大ドローダウンを追う。
+
+### リスク（`risk.py`, 142行）
+
+全クォートサイクルは発注前にゲートを通る。
+
+| 判定 | 意味 |
+|---|---|
+| `QUOTE` | 両建て継続 |
+| `ONE_SIDED` | 建玉を減らす側のみ |
+| `PULL` | 全取消。ただし次ティックで再評価 |
+| `HALT` | **ラッチする停止**。明示的リセットまで解除されない |
+
+チェック順:
+1. 既に HALT ならそのまま（ラッチ）
+2. ドローダウン超過 → HALT
+3. フィード不通 / 板がステール / 段数不足 / スプレッド乖離 / ボラ過大 → PULL
+4. 建玉 notional 超過 / lot 上限 → ONE_SIDED
+
+**ステール判定は見た目より重要。** 10秒前に更新が止まった板に建値を出すのは、
+下落相場で唯一の買い手になる典型的な経路。
+
+### ストラテジ（`strategy.py`, 215行）
+
+**リクォートは差分適用であって総入れ替えではない。** 毎回全取消して置き直すと、
+動いていない段のキュー位置まで捨てることになる。キュー位置はマーケットメイカーの
+利益の大半なので、希望する建値と現在の注文を突き合わせ、**差分だけを触る**。
+サイズのわずかなズレは `size_tolerance` の範囲で許容して並び直さない。
+
+`should_requote` は**時計の逆行に耐える**。リプレイの初回で実時計から
+記録時刻に切り替わると経過が負になり、そのままだと二度と発注しなくなる。
+
+---
+
+## 7. ペーパー約定（`sim/paper.py`, 230行）
+
+面白いのはキュー位置。**指値は自分の価格で約定が起きたから約定するのではなく、
+先に並んでいた全員を市場が食い破ったから約定する。**
+各注文は置いた時点の前方サイズを記憶し、歩み値がそれを消化して初めて自分に届く。
+
+**モデル化しているもの**
+- 板の見えている厚みから決まる FIFO キュー位置
+- 価格改善（内側に置けば最前列）
+- 部分約定、レベル枯渇のより良い価格への波及
+- 発注レイテンシ（既定 5ms）
+
+**していないもの — 結果が甘くなる方向**
+- マーケットインパクト
+- 見えない板（アイスバーグ等）
+- 到着後に追い抜く、より速い参加者
+- **ギャップスルー** — 歩み値を挟まず板が指値を飛び越えた場合、現実なら
+  通り過ぎざまに取られているが、ここでは約定しない。**モデル最大の楽観**であり、
+  マーケットメイカーが最も恐れる逆選択を過小評価する
+
+> **P&L は推定値ではなく上限として読むこと。**
+
+`cancel_ahead_ratio` は最大の不確実性に対する唯一の正直なつまみ。
+歩み値なしに厚みが減ったとき、自分の前で消えたか後ろかは観測できない。
+0.0 は悲観（全部後ろ）、1.0 は楽観（全部前）、既定 0.5。
+
+---
+
+## 8. 銘柄スキャン（`research/scan.py`, 436行）
+
+上のパイプラインとは独立。**戦略が成立しうる銘柄が存在するか**を判定する。
+
+### 判定の段階
+
+```
+全銘柄
+  ↓ 建て通貨 / 24h出来高 / 24h約定数 / 両建て / レバレッジトークン除外
+流動性条件を満たす
+  ↓ spread_bps > 2 × maker_fee_bps
+手数料を超える
+  ↓ 板の厚み ÷ 注文サイズ が [thin_ratio, crowded_ratio] に収まる
+注文が置ける
+```
+
+**手数料を超えることは必要条件であって、十分条件からは程遠い。**
+残った銘柄が落ちる罠は正反対の2方向:
+
+| 判定 | 意味 |
+|---|---|
+| `行列が長い` | 自分の前に並ぶ金額が大きすぎて順番が回らない |
+| `板が薄い` | 自分の注文が板の大半を占める。並ぶ相手がおらず、抜けられない |
+
+閾値（既定 5倍 / 50倍）は**判断であって法則ではない**。だから引数にしてある。
+
+### サンプリング
+
+**薄い板は1回の観測では判定できない。** 既定で板を5回（2秒間隔）観測して
+中央値で判定し、`板のぶれ`（最大÷最小）を併記する。
+
+### 持続性（`watch`）
+
+10秒窓のノイズを消しても、**答えそのものが持続しない**。
+`watch` はスキャンを繰り返し、**全ラウンドを分母として**持続率を出す。
+途中から現れた銘柄が有利にならないよう、登場した回だけで割らない
+（条件から外れて消えることが、まさに測りたい不安定さなので）。
+
+### 上限手数料
+
+```
+上限手数料 = スプレッド ÷ 2
+```
+
+固定の手数料でスキャンしても「その手数料で成立するか」しか分からない。
+**手数料は交渉やVIP昇格で動かせるが、スプレッドは動かせない。**
+だから「どの手数料が必要か」を出すほうが判断に使える。
+
+### 使用エンドポイント
+
+- `GET /api/v3/ticker/bookTicker` — 全銘柄の最良気配（1リクエスト）
+- `GET /api/v3/ticker/24hr` — 全銘柄の出来高・約定数（1リクエスト）
+
+> **制約: 最良気配1段しか見ていない。** 全銘柄の深い板を取るには
+> `/api/v3/depth` を数百回叩く必要があり非現実的。よって `板の厚み` は
+> 最前列のみで、2段目以降が厚い可能性は判定に入っていない。
+
+---
+
+## 9. 板表示（`ui/board.py`, 336行）
+
+rich による端末ダッシュボード。同じ描画が live / replay / sim で動く。
+
+| 区画 | 内容 |
+|---|---|
+| header | 銘柄、mid、スプレッド、接続状態、板の鮮度、イベント数 |
+| 板 | 売り（上）と買い（下）の梯子。厚みバー、**自分の建値とキュー位置** |
+| position | 建玉、平均原価、実現/評価損益、手数料、約定数、出来高 |
+| signals | microprice、板の偏り、フロー、σ、ハーフスプレッド、発注数 |
+| tape | 直近の約定。**自分の約定は `◆`** |
+| footer | リスク判定と理由、発注/取消/維持/約定の累計 |
+
+**スプレッド内側の自分の建値も行として描く。** 板情報が無い価格でも、
+そこは自分がキュー最前列にいる最重要の建値なので。
+
+---
+
+## 10. 通信（`net.py`, 67行）
+
+全アウトバウンドを1箇所に集約。**certifi 同梱のルート証明書で検証する。**
+
+ホストの OpenSSL 設定に依存すると、Homebrew Python の macOS のように
+`/opt/homebrew/etc/openssl@3/cert.pem` が存在せずルート証明書ゼロになり、
+正規の DigiCert 証明書でも `self-signed certificate in certificate chain` で
+落ちる（実際に踏んだ）。同じホストの `curl` はキーチェーンを使うので通り、
+ネットワーク障害に見える設定問題になる。
+
+**TLS 検証はどこでも無効化しない。** 証明書エラーは相手の身元が確認できない
+という意味で、切っても直らず、見えなくなるだけ。代わりに次に試すことを表示する。
+
+---
+
+## 11. CLI
+
+| コマンド | 通信 | 動作 |
+|---|---|---|
+| `sim` | なし | 合成市場 + ライブ板 |
+| `backtest` | なし | 合成市場をヘッドレスで実行、P&L サマリ |
+| `live` | REST + WS | Binance の実板、約定はペーパー |
+| `record` | REST + WS | ライブセッションを JSONL に記録 |
+| `replay` | なし | 記録を再生 |
+| `scan` | REST ×2+ | 全銘柄を1回走査 |
+| `watch` | REST 反復 | スキャンを繰り返し持続性を測る |
+
+### 共通フラグ（sim / live / record / replay / backtest）
+
+| フラグ | 既定 | 意味 |
+|---|---|---|
+| `--symbol` | BTCUSDT | 銘柄 |
+| `--tick-size` / `--lot-size` | 自動 | 銘柄仕様の上書き |
+| `--depth` | 12 | 板の表示段数 |
+| `--duration` / `--max-events` | なし | 停止条件 |
+| `--headless` | off | 板を描かずレポートのみ |
+| `--gamma` | 0.6 | 在庫リスク回避度 |
+| `--kappa` | 1.4 | 注文到着強度（小さいほど広く建値） |
+| `--levels` | 3 | 片側の段数 |
+| `--level-step` | 2 | 段の間隔（tick） |
+| `--size` | 0.01 | 1段あたりの建値サイズ |
+| `--max-position` | 0.10 | 建玉上限 |
+| `--min-half-spread` | 1 | ハーフスプレッド下限（tick） |
+| `--min-edge-bps` | maker-bps と同値 | ハーフスプレッド下限（bps） |
+| `--requote-ms` | 250 | リクォート間隔 |
+| `--max-notional` | 250,000 | 建玉 notional 上限 |
+| `--max-drawdown` | 2,000 | ドローダウン上限（超過で HALT） |
+| `--latency-ms` | 5 | 発注レイテンシ |
+| `--cancel-ahead` | 0.5 | 前方キャンセル比率 |
+| `--maker-bps` | **0.0** | メイカー手数料 |
+| `--taker-bps` | 4.0 | テイカー手数料 |
+
+コマンド固有: `sim`/`backtest` は `--start-price --interval --volatility --seed`、
+`live`/`record` は `--depth-ms {100,1000}`、`record` は `--out`、`replay` は `--speed`。
+
+### scan / watch
+
+| フラグ | 既定 | 意味 |
+|---|---|---|
+| `--quote` | USDT | 建て通貨 |
+| `--maker-bps` | 10.0 | 自分のメイカー手数料 |
+| `--min-volume` | 1,000,000 | 24h出来高の下限 |
+| `--min-trades` | 1,000 | 24h約定数の下限 |
+| `--size-quote` | 1,000 | 1回の注文金額 |
+| `--thin-ratio` | 5.0 | これ未満なら「板が薄い」 |
+| `--crowded-ratio` | 50.0 | これ超なら「行列が長い」 |
+| `--samples` | 5 | 板の観測回数 |
+| `--sample-interval` | 2.0 | 観測間隔（秒） |
+| `--top` | 25 | 表示件数 |
+| `--rounds` | 12 | （watch）スキャン回数 |
+| `--every` | 300 | （watch）スキャン間隔（秒） |
+
+---
+
+## 12. 設定の全デフォルト値
+
+```
+QuoterConfig                      RiskLimits
+  gamma                    0.6      max_position_lots       1000
+  kappa                    1.4      max_notional        250000.0
+  inventory_skew_ticks     1.0      max_drawdown          2000.0
+  vol_multiplier          0.05      max_book_age_ms       2000.0
+  liquidity_premium_ticks  1.0      max_spread_ticks         100
+  vol_floor_ticks          0.5      max_sigma_bps           25.0
+  min_half_spread_ticks      1      min_book_levels            2
+  max_half_spread_ticks    200
+  max_skew_ticks           400    StrategyConfig
+  min_edge_bps             0.0      requote_interval_ms    250.0
+  allow_price_improvement True      size_tolerance          0.25
+  levels                     3      max_orders_per_cycle      12
+  level_step_ticks           2
+  level_size_decay         0.7    FairValueConfig
+  base_size_lots           100      depth_levels               5
+  min_size_lots              1      imbalance_weight        0.35
+  max_position_lots       1000      flow_weight             0.25
+  inventory_taper          1.0      smoothing_halflife       3.0
+                                    max_adjust_ticks         0.0
+PaperConfig
+  latency_ms               5.0    ScanFilters
+  cancel_ahead_ratio       0.5      maker_bps               10.0
+  allow_price_improvement True      min_quote_volume   1000000.0
+                                    min_trades              1000
+RollingVol   halflife     60.0      size_quote            1000.0
+FlowImbalance halflife    40.0      thin_ratio               5.0
+BoardConfig  depth          12      crowded_ratio           50.0
+             tape_rows       8      samples                    5
+             show_queue   True      sample_interval          2.0
+```
+
+`FeeSchedule` の既定は `maker_bps=1.0 / taker_bps=4.0` だが、
+CLI は常に `--maker-bps`（既定 0.0）で上書きするので実効値は 0.0。
+
+---
+
+## 13. 実測結果
+
+同じ1時間の `watch` を手数料 10bps と 0bps で回した結果（USDT建て 671銘柄）。
+
+| | 10 bps | 0 bps |
+|---|---|---|
+| 一度でも手数料を超えた | 24件 | 131件 |
+| 75%以上の回で置けた | **0件** | 13件 |
+
+**壁は手数料。** 10bps で条件を満たすのは板が100〜900倍ぶれる薄い銘柄ばかりで、
+利ざや最大の LAZIOUSDT（+37.72bps）は12回中1度も置けていない。
+
+上限手数料（スプレッド÷2）:
+
+| 銘柄 | 持続率 | 上限手数料 | 板の厚み | ぶれ |
+|---|---|---|---|---|
+| BONKUSDT | 75% | 17.95 bps | 9,963 | 6.6x |
+| RUNEUSDT | 83% | 11.46 bps | 11,000 | 8.2x |
+| WLFIUSDT | 92% | 9.13 bps | 11,344 | 3.8x |
+| ASTERUSDT | 100% | 8.32 bps | 24,118 | 2.0x |
+| SOLUSDT | 100% | 0.69 bps | 19,648 | 1.8x |
+| BTCUSDT | 17% | 0.00 bps | 125,799 | 52.1x |
+
+BTC・ETH・XRP・BNB は板が厚く安定しているが、スプレッドが1tick しかなく
+上限手数料がほぼゼロ。**0bps でなければ成立しない。**
+
+---
+
+## 14. テスト（225件）
+
+| ファイル | 件数 | 対象 |
+|---|---|---|
+| `test_scan.py` | 52 | 手数料判定、フィルタ、容量判定、サンプリング、持続性 |
+| `test_book.py` | 31 | 価格/時間優先、TIF、STP、L2 適用、microprice |
+| `test_market.py` | 27 | フィード取り込み、σ / フロー、合成・リプレイ、時刻ドリフト |
+| `test_quoter.py` | 24 | スキュー方向、スプレッド下限/上限、サイズ、非クロス不変条件 |
+| `test_paper.py` | 22 | キュー位置、レイテンシ、部分約定、価格ヒット判定 |
+| `test_inventory.py` | 18 | 平均原価、実現/評価損益、ドテン、手数料、ドローダウン |
+| `test_integration.py` | 15 | エンドツーエンド、リプレイ再現性、**不変条件** |
+| `test_risk.py` | 14 | ステール、乖離、建玉限度、ラッチする停止 |
+| `test_binance_sync.py` | 13 | スナップショット結合、ギャップ検出、再同期、パーサ |
+| `test_net.py` | 9 | TLS 検証、certifi、証明書エラーの説明 |
+
+**統合テストが P&L の数値ではなく不変条件を検証しているのは意図的。**
+合成市場はドリフトなしのランダムウォークなので、そこで再現的に儲かる主張は
+シミュレータのバグの証拠になる。
+
+---
+
+## 15. 既知の欠落・未実装
+
+### モデルの限界
+
+- **ギャップスルー約定を模擬していない**（§7）。P&L は上限
+- スキャンは**最良気配1段のみ**（§8）。2段目以降は見ていない
+- 単一銘柄。クロス銘柄のヘッジや相関リスクを扱わない
+- σ は1更新あたりの実現ボラで、日中の季節性を持たない
+- 板が動かない前提の在庫評価。急変時の評価損益は楽観的
+
+### 未検証
+
+- **フェアバリューの重み**（`imbalance_weight` / `flow_weight`）が
+  実データで予測力を測られていない（§6）
+- `live` の正常系（実データで板が正しく組み上がるか）。同期ロジック自体は
+  フェイクソケットでテスト済みだが、実データ特有の挙動は未確認
+- リプレイでの約定率。板の形しか見ておらず、順番が回るかは未検証
+
+### 実装上の不備
+
+- `PaperConfig.allow_price_improvement` が**宣言されているが未使用**。
+  価格改善は `QuoterConfig` 側でしか制御されていない
+- CLI から届かない設定がある: `vol_multiplier`、`liquidity_premium_ticks`、
+  `inventory_skew_ticks`、`max_half_spread_ticks`、`max_skew_ticks`、
+  `inventory_taper`、`allow_price_improvement`、FairValue の全重み、
+  `max_book_age_ms`、`max_spread_ticks`、`max_sigma_bps`、`size_tolerance`。
+  変えるにはコード編集が必要
+- 発注はペーパーのみ。実発注パスは無い（これは設計意図であって不備ではない）
