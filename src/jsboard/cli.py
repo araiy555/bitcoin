@@ -42,6 +42,14 @@ from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
 from .research.archive import days_ending, fetch_day, load_seconds
 from .research.horizon import analyse, round_trip_cost_bps
+from .research.predict import (
+    Series,
+    always_long,
+    candidates,
+    evaluate,
+    split,
+    volatility_threshold,
+)
 from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
 from .sim.capture import MultiCapture, write_meta
 from .sim.paper import PaperConfig, PaperVenue
@@ -790,6 +798,149 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_predict(args: argparse.Namespace) -> int:
+    """Measure whether any signal reaches the accuracy the fee demands."""
+    last = (
+        date.fromisoformat(args.end)
+        if args.end
+        else date.today() - timedelta(days=1 if args.product == "spot" else 2)
+    )
+    wanted = days_ending(last, args.days)
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} {args.product} — 予測できるか")
+    console.print(
+        f"  対象   : {wanted[0]} 〜 {wanted[-1]}（{len(wanted)}日）  "
+        f"保有 {args.horizon}秒\n"
+        "  [dim]前半で信号を選び、後半で一度だけ答え合わせします。\n"
+        "  同じデータで選んで測ると、選び方の上手さを測ることになります。[/dim]\n"
+    )
+
+    bars: list = []
+    session = make_session()
+    try:
+        for day in wanted:
+            path = await fetch_day(args.product, "aggTrades", args.symbol, day, session=session)
+            if path is None:
+                console.print(f"  [yellow]{day} は公開されていません[/yellow]")
+                continue
+            bars.extend(load_seconds(path))
+    finally:
+        await session.close()
+
+    if not bars:
+        console.print("[red]データが取れませんでした。[/red]")
+        return 1
+    bars.sort(key=lambda b: b.sec)
+
+    train_bars, test_bars = split(bars, args.train_fraction)
+    if not train_bars or not test_bars:
+        console.print("[red]分割できるだけの期間がありません。[/red]")
+        return 1
+    train, test = Series.build(train_bars), Series.build(test_bars)
+
+    tick_bps = float(args.tick_size) / bars[-1].last * 10_000.0
+    cost = round_trip_cost_bps(args.taker_bps, args.slippage_ticks, tick_bps)
+    threshold = (
+        volatility_threshold(train, args.vol_window, args.vol_quantile)
+        if args.vol_quantile > 0
+        else None
+    )
+
+    console.print(
+        f"  往復コスト : [bold]{cost:.2f} bps[/bold]\n"
+        f"  学習期間   : {len(train_bars):,} 秒   検証期間 : {len(test_bars):,} 秒"
+    )
+    if threshold is not None:
+        console.print(
+            f"  出動条件   : 直近{args.vol_window}秒の変動が {threshold:.2f} bps 以上"
+            f"（学習期間の上位{(1 - args.vol_quantile):.0%}）"
+        )
+
+    scored = []
+    for name, kind, window, sign in candidates():
+        s_train = evaluate(
+            train, name, kind, window, sign,
+            horizon_s=args.horizon, cost_bps=cost,
+            vol_window=args.vol_window, vol_threshold=threshold,
+        )
+        if s_train.samples < args.min_samples:
+            continue
+        scored.append((s_train, kind, window, sign, name))
+
+    if not scored:
+        console.print("[red]十分な標本のある信号がありませんでした。[/red]")
+        return 1
+
+    scored.sort(key=lambda row: row[0].accuracy, reverse=True)
+    best_train, kind, window, sign, name = scored[0]
+
+    best_test = evaluate(
+        test, name, kind, window, sign,
+        horizon_s=args.horizon, cost_bps=cost,
+        vol_window=args.vol_window, vol_threshold=threshold,
+    )
+    base = always_long(test, horizon_s=args.horizon, cost_bps=cost)
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("信号", style="cyan")
+    table.add_column("学習\n的中率", justify="right")
+    for label in ("検証\n的中率", "回数", "平均変動\n(bps)", "1回あたり\n損益(bps)"):
+        table.add_column(label, justify="right")
+
+    for s_train, _k, _w, _s, label in scored[:8]:
+        mark = "bold" if label == name else "dim"
+        table.add_row(f"[{mark}]{label}[/{mark}]", f"{s_train.accuracy:.1%}", "", "", "", "")
+
+    console.print()
+    console.print("  [dim]学習期間での順位[/dim]")
+    console.print(table)
+
+    result = Table(box=None, header_style="bold dim", padding=(0, 1))
+    result.add_column("", style="cyan")
+    result.add_column("検証 的中率", justify="right")
+    result.add_column("回数", justify="right")
+    result.add_column("平均変動", justify="right")
+    result.add_column("1回あたり損益", justify="right")
+    for label, sc in (("選ばれた信号", best_test), ("常に買い（基準）", base)):
+        colour = "green" if sc.edge_bps > 0 else "red"
+        result.add_row(
+            f"{label}  {sc.name if label.startswith('選') else ''}",
+            f"{sc.accuracy:.2%}",
+            f"{sc.samples:,}",
+            f"{sc.mean_move_bps:.2f}",
+            f"[{colour}]{sc.edge_bps:+.2f}[/{colour}]",
+        )
+
+    console.print("\n  [dim]検証期間での答え合わせ（1回のみ）[/dim]")
+    console.print(result)
+
+    margin = best_test.accuracy - base.accuracy
+    console.print()
+    if best_test.edge_bps > 0 and margin > 0:
+        console.print(
+            f"  [green]{name} は検証期間で手数料を上回りました。[/green]\n"
+            f"  基準（常に買い）との差は [bold]{margin:+.2%}[/bold]。\n"
+            "  [dim]ただし7日程度では偶然の範囲を出ません。期間を延ばし、\n"
+            "  複数の期間で再現するかを見る必要があります。[/dim]"
+        )
+    elif best_test.edge_bps > 0:
+        console.print(
+            f"  [yellow]{name} は利益が出ていますが、常に買うだけの基準を"
+            f"超えていません（差 {margin:+.2%}）。[/yellow]\n"
+            "  [dim]上昇相場を捉えただけで、信号が効いた証拠にはなりません。[/dim]"
+        )
+    else:
+        console.print(
+            f"  [red]{name} は検証期間で手数料を超えませんでした"
+            f"（1回あたり {best_test.edge_bps:+.2f} bps）。[/red]\n"
+            f"  [dim]必要だった的中率は "
+            f"{(1 + cost / best_test.mean_move_bps) / 2:.1%}、実際は "
+            f"{best_test.accuracy:.1%}。[/dim]"
+        )
+    console.rule()
+    return 0
+
+
 def _spec_dict(inst: Instrument, market: str) -> dict:
     return {
         "symbol": inst.symbol,
@@ -919,6 +1070,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_hz.add_argument("--slippage-ticks", type=float, default=1.0, help="片道の想定滑り")
     p_hz.add_argument("--tick-size", default="0.1", help="価格の刻み")
     p_hz.set_defaults(func=cmd_horizon)
+
+    p_pr = sub.add_parser("predict", help="信号が手数料を超える的中率に届くか測る")
+    p_pr.add_argument("--symbol", default="BTCUSDT")
+    p_pr.add_argument("--product", default="perp", choices=("perp", "spot"))
+    p_pr.add_argument("--days", type=int, default=14)
+    p_pr.add_argument("--end", default=None, help="最終日 YYYY-MM-DD")
+    p_pr.add_argument("--horizon", type=int, default=3600, help="保有秒数")
+    p_pr.add_argument("--train-fraction", type=float, default=0.6, help="学習に使う割合")
+    p_pr.add_argument("--vol-window", type=int, default=900, help="出動条件の観測窓（秒）")
+    p_pr.add_argument(
+        "--vol-quantile", type=float, default=0.9, help="この分位を超えたときだけ売買。0で常時"
+    )
+    p_pr.add_argument("--min-samples", type=int, default=200)
+    p_pr.add_argument("--taker-bps", type=float, default=4.5)
+    p_pr.add_argument("--slippage-ticks", type=float, default=1.0)
+    p_pr.add_argument("--tick-size", default="0.1")
+    p_pr.set_defaults(func=cmd_predict)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")
