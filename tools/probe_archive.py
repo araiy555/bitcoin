@@ -1,21 +1,19 @@
 """What history is downloadable, rather than what we remember being there.
 
-The live recorder accumulates from now onwards, which means waiting days
-before there is anything to analyse. Binance also publishes daily archives,
-and if BTCUSDT is in there the analysis can start today against years of
-data instead.
+The live recorder only accumulates from now on. Binance also publishes daily
+archives, and what is in them decides whether analysis can start today or has
+to wait for a recording to fill up.
 
-Two things matter and neither should be taken on faith:
+Two questions decide the plan, and neither should be taken on faith:
 
-  which datasets exist   trades are certainly there; whether book depth,
-                         liquidations and open interest are is the question,
-                         and liquidations in particular are the one thing the
-                         live feed cannot get at all
-  what a file contains   the archive ships headerless CSV in places, so the
-                         columns get printed rather than assumed
+  how far back and how recent   a dataset that stops in 2024 cannot be used
+                                to study today's market
+  what a row contains           the archive ships headerless CSV, so the
+                                columns get printed rather than assumed
 
-Listing comes from the bucket's XML index; one small file is then fetched and
-its first rows shown, so the answer is the data itself.
+The bucket lists at most 1000 keys per request, and each day contributes both
+a .zip and a .zip.CHECKSUM — so an unpaginated listing silently stops at 500
+days and reports a "newest" file from years ago. This walks every page.
 
     python tools/probe_archive.py              # inventory for BTCUSDT
     python tools/probe_archive.py ETHUSDT
@@ -37,111 +35,115 @@ BUCKET = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 DOWNLOAD = "https://data.binance.vision"
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
-# Where each product's daily files live.
 ROOTS = {
     "spot": "data/spot/daily",
-    "perp (USDⓈ-M)": "data/futures/um/daily",
+    "perp": "data/futures/um/daily",
 }
 
+# Small enough to fetch just to read the header. aggTrades and bookTicker run
+# to hundreds of megabytes a day, and their shape can wait until they are
+# actually being ingested.
+SAMPLE = ("bookDepth", "metrics")
 
-async def listing(session: aiohttp.ClientSession, prefix: str) -> tuple[list[str], list[str]]:
-    """Sub-directories and file keys directly under `prefix`."""
+
+async def page(session: aiohttp.ClientSession, prefix: str, marker: str | None):
+    params = {"delimiter": "/", "prefix": prefix}
+    if marker:
+        params["marker"] = marker
     async with session.get(
-        BUCKET,
-        params={"delimiter": "/", "prefix": prefix},
-        timeout=aiohttp.ClientTimeout(total=30),
+        BUCKET, params=params, timeout=aiohttp.ClientTimeout(total=30)
     ) as resp:
         resp.raise_for_status()
-        body = await resp.text()
-
-    root = ElementTree.fromstring(body)
-    dirs = [
-        node.text.rstrip("/").rsplit("/", 1)[-1]
-        for node in root.iter(f"{NS}Prefix")
-        if node.text and node.text != prefix
-    ]
-    files = [
-        node.text
-        for node in root.iter(f"{NS}Key")
-        if node.text and node.text.endswith(".zip")
-    ]
-    return sorted(set(dirs)), files
+        return ElementTree.fromstring(await resp.text())
 
 
-async def inventory(session: aiohttp.ClientSession, symbol: str) -> list[tuple[str, str, str]]:
-    """(product, dataset, newest file) for every dataset carrying `symbol`."""
-    found = []
-    for product, root in ROOTS.items():
-        datasets, _ = await listing(session, f"{root}/")
-        print(f"\n=== {product}   {root}/")
-        if not datasets:
-            print("    (nothing listed)")
-            continue
-        print(f"    datasets: {', '.join(datasets)}")
-
-        for dataset in datasets:
-            try:
-                _, files = await listing(session, f"{root}/{dataset}/{symbol}/")
-            except Exception:  # noqa: BLE001 - a missing symbol is an answer
-                continue
-            if not files:
-                continue
-            newest = sorted(files)[-1]
-            oldest = sorted(files)[0]
-            print(
-                f"      {dataset:<22} {len(files):>5,} days   "
-                f"{oldest.rsplit('-', 3)[-3:][0]}… → {newest.rsplit('/', 1)[-1]}"
-            )
-            found.append((product, dataset, newest))
-    return found
+async def list_dirs(session: aiohttp.ClientSession, prefix: str) -> list[str]:
+    root = await page(session, prefix, None)
+    return sorted(
+        {
+            node.text.rstrip("/").rsplit("/", 1)[-1]
+            for node in root.iter(f"{NS}Prefix")
+            if node.text and node.text != prefix
+        }
+    )
 
 
-async def peek(session: aiohttp.ClientSession, key: str) -> None:
-    """Download one archive and show what its rows actually look like."""
-    url = f"{DOWNLOAD}/{key}"
-    print(f"\n=== sample: {key.rsplit('/', 1)[-1]}")
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-            resp.raise_for_status()
-            blob = await resp.read()
-    except Exception as exc:  # noqa: BLE001
-        print(f"    FAILED: {type(exc).__name__}: {exc}")
-        return
+async def list_files(session: aiohttp.ClientSession, prefix: str) -> list[tuple[str, int]]:
+    """Every .zip under `prefix`, following pagination to the end."""
+    out: list[tuple[str, int]] = []
+    marker: str | None = None
+    while True:
+        root = await page(session, prefix, marker)
+        keys = list(root.iter(f"{NS}Contents"))
+        if not keys:
+            break
+        for node in keys:
+            key = node.findtext(f"{NS}Key") or ""
+            if key.endswith(".zip"):
+                out.append((key, int(node.findtext(f"{NS}Size") or 0)))
+        truncated = (root.findtext(f"{NS}IsTruncated") or "false") == "true"
+        if not truncated:
+            break
+        marker = root.findtext(f"{NS}NextMarker") or (
+            keys[-1].findtext(f"{NS}Key") or ""
+        )
+        if not marker:
+            break
+    return sorted(out)
 
-    print(f"    {len(blob) / 1e6:,.1f} MB compressed")
-    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        name = zf.namelist()[0]
-        with zf.open(name) as fh:
-            head = fh.read(600).decode("utf-8", "replace").splitlines()
-        size = zf.getinfo(name).file_size
-    print(f"    {name}  →  {size / 1e6:,.1f} MB uncompressed")
-    for line in head[:4]:
-        print(f"      {line[:150]}")
+
+def day_of(key: str) -> str:
+    return key.rsplit("-", 3)[-3:] and "-".join(key.rsplit(".zip", 1)[0].rsplit("-", 3)[-3:])
 
 
 async def main() -> None:
     symbol = (sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT").upper()
     session = make_session()
+    samples: list[str] = []
     try:
-        print(f"Looking for {symbol} in the Binance daily archive.")
-        found = await inventory(session, symbol)
-        if not found:
-            print("\nNothing found — the archive layout may have moved.")
-            return
+        print(f"{symbol} in the Binance daily archive (paginated).\n")
+        for product, root in ROOTS.items():
+            datasets = await list_dirs(session, f"{root}/")
+            print(f"=== {product}   {root}/")
+            print(f"    published: {', '.join(datasets)}")
+            if "liquidationSnapshot" not in datasets:
+                print("    NOTE: no liquidationSnapshot here")
 
-        # Trades are the dataset every plan depends on, so sample that one.
-        pick = next(
-            (k for p, d, k in found if "perp" in p and d == "aggTrades"),
-            found[0][2],
-        )
-        await peek(session, pick)
+            for dataset in datasets:
+                try:
+                    files = await list_files(session, f"{root}/{dataset}/{symbol}/")
+                except Exception:  # noqa: BLE001 - a missing symbol is an answer
+                    continue
+                if not files:
+                    continue
+                total_gb = sum(size for _, size in files) / 1e9
+                recent = files[-1][1] / 1e6
+                print(
+                    f"      {dataset:<20} {len(files):>5,} days  "
+                    f"{day_of(files[0][0])} → {day_of(files[-1][0])}  "
+                    f"{recent:>7,.1f} MB/day   {total_gb:>6,.1f} GB total"
+                )
+                if dataset in SAMPLE:
+                    samples.append(files[-1][0])
+            print()
 
-        print(
-            "\nWhat to look for: liquidationSnapshot and bookDepth under perp.\n"
-            "Liquidations are the one thing the live feed cannot get here, and\n"
-            "book depth decides whether order-book features can be built from\n"
-            "history or only from a live recording."
-        )
+        for key in samples:
+            print(f"=== columns: {key.rsplit('/', 1)[-1]}")
+            try:
+                async with session.get(
+                    f"{DOWNLOAD}/{key}", timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
+                    resp.raise_for_status()
+                    blob = await resp.read()
+                with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                    name = zf.namelist()[0]
+                    with zf.open(name) as fh:
+                        head = fh.read(500).decode("utf-8", "replace").splitlines()
+                for line in head[:3]:
+                    print(f"      {line[:140]}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"      FAILED: {type(exc).__name__}: {exc}")
+            print()
     finally:
         await session.close()
 
