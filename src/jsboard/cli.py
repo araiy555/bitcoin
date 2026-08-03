@@ -725,19 +725,24 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
     table.add_column("上位10%", justify="right")
     table.add_column("上位1%", justify="right")
     table.add_column("手数料超\nの割合", justify="right")
-    table.add_column("必要な\n的中率", justify="right")
-    table.add_column("完璧な予測\nでの利益", justify="right")
+    table.add_column("必要な的中率\n（全場面）", justify="right")
+    table.add_column("必要な的中率\n（上位10%）", justify="right")
+    table.add_column("上位10%の\n平均変動", justify="right")
 
     verdicts = []
     for h in args.horizons:
         st = analyse(bars, h, cost)
         verdicts.append(st)
-        if st.is_possible:
-            acc = f"[green]{st.required_accuracy:.1%}[/green]"
-            edge = f"[green]{st.perfect_foresight_bps:+.2f}[/green]"
-        else:
-            acc = "[red]不可能[/red]"
-            edge = f"[red]{st.perfect_foresight_bps:+.2f}[/red]"
+        acc = (
+            f"[green]{st.required_accuracy:.1%}[/green]"
+            if st.is_possible
+            else "[red]不可能[/red]"
+        )
+        sel = (
+            f"[green]{st.required_accuracy_top10:.1%}[/green]"
+            if st.selective_is_possible
+            else "[red]不可能[/red]"
+        )
         table.add_row(
             f"{h}秒",
             f"{st.mean_abs_bps:.2f}",
@@ -746,28 +751,40 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
             f"{st.p99_abs_bps:.2f}",
             f"{st.tradeable_fraction:.1%}",
             acc,
-            edge,
+            sel,
+            f"{st.mean_top10_bps:.2f}",
         )
 
     console.print()
     console.print(table)
 
     possible = [v for v in verdicts if v.is_possible]
+    selective = [v for v in verdicts if v.selective_is_possible]
     console.print()
-    if not possible:
-        console.print(
-            "  [red]どの保有時間でも、平均的な値動きが往復コストに届きません。[/red]\n"
-            "  [dim]完璧に当て続けても負けます。テイカーで数秒を狙う前提そのものを\n"
-            "  変える必要があります（手数料の交渉、メイカー執行、保有時間を伸ばす）。[/dim]"
-        )
-    else:
+    if possible:
         best = min(possible, key=lambda v: v.required_accuracy)
         console.print(
-            f"  成立の余地があるのは {', '.join(f'{v.horizon_s}秒' for v in possible)}。\n"
-            f"  最も条件が緩いのは [bold]{best.horizon_s}秒[/bold] で、"
-            f"必要な的中率は [bold]{best.required_accuracy:.1%}[/bold]。\n"
-            "  [dim]これは平均的な値動きに対する数字です。大きく動く場面だけを\n"
-            "  選べるなら要求は下がりますが、選べること自体が予測の一部です。[/dim]"
+            f"  常時売買でも余地があるのは {', '.join(f'{v.horizon_s}秒' for v in possible)}。\n"
+            f"  最も条件が緩いのは [bold]{best.horizon_s}秒[/bold]、"
+            f"必要な的中率 [bold]{best.required_accuracy:.1%}[/bold]。"
+        )
+    elif selective:
+        best = min(selective, key=lambda v: v.required_accuracy_top10)
+        console.print(
+            "  [yellow]平均的な値動きでは、どの保有時間もコストに届きません。[/yellow]\n"
+            f"  ただし[bold]大きく動く場面だけ[/bold]に絞れば "
+            f"{', '.join(f'{v.horizon_s}秒' for v in selective)} に余地があります。\n"
+            f"  最良は [bold]{best.horizon_s}秒[/bold]で、上位10%の場面だけを売買して\n"
+            f"  的中率 [bold]{best.required_accuracy_top10:.1%}[/bold]。\n\n"
+            "  [dim]ただしこれは条件付きの話です。「これから大きく動く」と事前に\n"
+            "  当てること自体が、方向を当てるより難しい予測問題です。\n"
+            "  算数として不可能ではない、というだけの意味しかありません。[/dim]"
+        )
+    else:
+        console.print(
+            "  [red]常時売買でも、大きく動く場面に絞っても、コストに届きません。[/red]\n"
+            "  [dim]テイカーで短時間、という前提そのものが成立しません。\n"
+            "  手数料の交渉、メイカー執行、保有時間を伸ばす、のいずれかが要ります。[/dim]"
         )
     console.rule()
     return 0

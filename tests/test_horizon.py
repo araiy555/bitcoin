@@ -253,3 +253,43 @@ class TestRoundTripCost:
 
     def test_a_free_venue_with_no_slippage_costs_nothing(self):
         assert round_trip_cost_bps(0.0, 0.0, 0.16) == 0.0
+
+
+class TestSelectiveTrading:
+    def test_the_top_decile_earns_more_than_its_boundary(self):
+        # A strategy trading the top 10% earns that decile's *average*, which
+        # sits above the p90 line, not on it. Using the boundary would
+        # understate the one escape route left when the average move loses.
+        prices = [100.0]
+        for i in range(200):
+            prices.append(prices[-1] * (1.0 + (0.02 if i % 20 == 0 else 0.0001)))
+
+        st = analyse(bars(prices), 1, cost_bps=0.0)
+
+        assert st.mean_top10_bps >= st.p90_abs_bps
+        assert st.mean_top1_bps >= st.mean_top10_bps
+
+    def test_selectivity_can_rescue_a_horizon_the_average_loses(self):
+        # Nineteen tiny moves and one large one: the average is far below the
+        # fee while the tail clears it comfortably.
+        prices = [100.0]
+        for i in range(400):
+            prices.append(prices[-1] * (1.0 + (0.01 if i % 20 == 0 else 0.000001)))
+
+        st = analyse(bars(prices), 1, cost_bps=20.0)
+
+        assert not st.is_possible
+        assert st.selective_is_possible
+        assert st.required_accuracy_top10 < st.required_accuracy
+
+    def test_a_fee_above_even_the_tail_closes_the_last_door(self):
+        st = analyse(bars([100.0, 100.05, 100.0, 100.05] * 50), 1, cost_bps=200.0)
+
+        assert not st.is_possible
+        assert not st.selective_is_possible
+
+    def test_a_motionless_market_has_no_tail_to_select(self):
+        st = analyse(bars([100.0] * 50), 1, cost_bps=5.0)
+
+        assert st.mean_top10_bps == 0.0
+        assert not st.selective_is_possible

@@ -49,13 +49,38 @@ class HorizonStats:
     p90_abs_bps: float
     p99_abs_bps: float
     cost_bps: float
+    mean_top10_bps: float = 0.0
+    mean_top1_bps: float = 0.0
 
     @property
     def required_accuracy(self) -> float:
         """Direction accuracy needed to break even on an average move."""
-        if self.mean_abs_bps <= 0:
+        return self._accuracy_for(self.mean_abs_bps)
+
+    def _accuracy_for(self, move_bps: float) -> float:
+        if move_bps <= 0:
             return math.inf
-        return (1.0 + self.cost_bps / self.mean_abs_bps) / 2.0
+        return (1.0 + self.cost_bps / move_bps) / 2.0
+
+    @property
+    def required_accuracy_top10(self) -> float:
+        """Same, if only the largest tenth of moves were ever traded."""
+        return self._accuracy_for(self.mean_top10_bps)
+
+    @property
+    def required_accuracy_top1(self) -> float:
+        return self._accuracy_for(self.mean_top1_bps)
+
+    @property
+    def selective_is_possible(self) -> bool:
+        """Whether trading only the big moves escapes the fee at all.
+
+        This is the last door left when the average move loses. It does not
+        say the selection is achievable — knowing in advance which seconds
+        are about to move is its own prediction problem, and a harder one
+        than direction. It says only whether the arithmetic permits it.
+        """
+        return self.required_accuracy_top10 < 1.0
 
     @property
     def is_possible(self) -> bool:
@@ -122,6 +147,11 @@ def analyse(bars: list[SecondBar], horizon_s: int, cost_bps: float) -> HorizonSt
     n = len(moves)
     mean = sum(moves) / n if n else 0.0
     over = sum(1 for m in moves if m > cost_bps) / n if n else 0.0
+    # Conditional means, not the percentile itself: a strategy that trades
+    # the top decile earns the average of that decile, which sits well above
+    # the number at its boundary.
+    top10 = moves[int(n * 0.9) :]
+    top1 = moves[int(n * 0.99) :]
     return HorizonStats(
         horizon_s=horizon_s,
         samples=n,
@@ -131,6 +161,8 @@ def analyse(bars: list[SecondBar], horizon_s: int, cost_bps: float) -> HorizonSt
         p90_abs_bps=_percentile(moves, 0.90),
         p99_abs_bps=_percentile(moves, 0.99),
         cost_bps=cost_bps,
+        mean_top10_bps=sum(top10) / len(top10) if top10 else 0.0,
+        mean_top1_bps=sum(top1) / len(top1) if top1 else 0.0,
         _fraction_over=over,
     )
 
