@@ -673,6 +673,27 @@ async def cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _no_data_hint(symbol: str, product: str, missing: int, total: int) -> None:
+    """Say what is actually wrong when nothing downloaded.
+
+    Every day 404ing almost always means the symbol is not listed on that
+    product, not that a week of history went missing — so say that, rather
+    than repeating "not published" once per day and leaving the reader to
+    infer it.
+    """
+    if missing < total:
+        console.print("[red]データが1日も取れませんでした。[/red]")
+        return
+    other = "spot" if product == "perp" else "perp"
+    console.print(
+        f"\n  [red]{symbol.upper()} は {product} のアーカイブに1日もありません。[/red]\n"
+        f"  [dim]銘柄名の綴り、または製品の選択を確認してください。\n"
+        f"  現物にしか無い銘柄なら --product {other} で通ります。\n"
+        f"  何が公開されているかは次で一覧できます:\n"
+        f"    python tools/probe_archive.py {symbol.upper()}[/dim]"
+    )
+
+
 async def cmd_horizon(args: argparse.Namespace) -> int:
     """Ask whether the moves are bigger than the fee, before modelling them."""
     last = (
@@ -690,6 +711,7 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
     )
 
     bars: list = []
+    missing = 0
     session = make_session()
     try:
         for day in wanted:
@@ -701,7 +723,7 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
                 console.print(f"  [yellow]{day} 取得失敗: {exc}[/yellow]")
                 continue
             if path is None:
-                console.print(f"  [yellow]{day} は公開されていません[/yellow]")
+                missing += 1
                 continue
             day_bars = load_seconds(path)
             bars.extend(day_bars)
@@ -713,7 +735,7 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
         await session.close()
 
     if not bars:
-        console.print("[red]データが1日も取れませんでした。[/red]")
+        _no_data_hint(args.symbol, args.product, missing, len(wanted))
         return 1
 
     bars.sort(key=lambda b: b.sec)
@@ -816,19 +838,20 @@ async def cmd_predict(args: argparse.Namespace) -> int:
     )
 
     bars: list = []
+    missing = 0
     session = make_session()
     try:
         for day in wanted:
             path = await fetch_day(args.product, "aggTrades", args.symbol, day, session=session)
             if path is None:
-                console.print(f"  [yellow]{day} は公開されていません[/yellow]")
+                missing += 1
                 continue
             bars.extend(load_seconds(path))
     finally:
         await session.close()
 
     if not bars:
-        console.print("[red]データが取れませんでした。[/red]")
+        _no_data_hint(args.symbol, args.product, missing, len(wanted))
         return 1
     bars.sort(key=lambda b: b.sec)
 
