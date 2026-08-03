@@ -20,6 +20,7 @@ import json
 import logging
 import sys
 import time
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -39,6 +40,8 @@ from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
+from .research.archive import days_ending, fetch_day, load_seconds
+from .research.horizon import analyse, round_trip_cost_bps
 from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
 from .sim.capture import MultiCapture, write_meta
 from .sim.paper import PaperConfig, PaperVenue
@@ -662,6 +665,114 @@ async def cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_horizon(args: argparse.Namespace) -> int:
+    """Ask whether the moves are bigger than the fee, before modelling them."""
+    last = (
+        date.fromisoformat(args.end)
+        if args.end
+        else date.today() - timedelta(days=1 if args.product == "spot" else 2)
+    )
+    wanted = days_ending(last, args.days)
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} {args.product} — 値動きと手数料")
+    console.print(
+        f"  対象   : {wanted[0]} 〜 {wanted[-1]}（{len(wanted)}日）\n"
+        "  [dim]予測モデルの前に、そもそも動きが手数料を超えているかを見ます。\n"
+        "  超えていなければ、どんな精度でも勝てません。[/dim]\n"
+    )
+
+    bars: list = []
+    session = make_session()
+    try:
+        for day in wanted:
+            try:
+                path = await fetch_day(
+                    args.product, "aggTrades", args.symbol, day, session=session
+                )
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"  [yellow]{day} 取得失敗: {exc}[/yellow]")
+                continue
+            if path is None:
+                console.print(f"  [yellow]{day} は公開されていません[/yellow]")
+                continue
+            day_bars = load_seconds(path)
+            bars.extend(day_bars)
+            console.print(
+                f"  [dim]{day}  {len(day_bars):,} 秒  "
+                f"{path.stat().st_size / 1e6:,.1f} MB[/dim]"
+            )
+    finally:
+        await session.close()
+
+    if not bars:
+        console.print("[red]データが1日も取れませんでした。[/red]")
+        return 1
+
+    bars.sort(key=lambda b: b.sec)
+    tick_bps = float(args.tick_size) / bars[-1].last * 10_000.0
+    cost = round_trip_cost_bps(args.taker_bps, args.slippage_ticks, tick_bps)
+
+    console.print(
+        f"\n  往復コスト : [bold]{cost:.2f} bps[/bold]  "
+        f"[dim](手数料 {args.taker_bps} × 2 + スリッページ {args.slippage_ticks} tick × 2 "
+        f"= {tick_bps:.4f} bps/tick)[/dim]"
+    )
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("保有", justify="right")
+    table.add_column("平均\n変動(bps)", justify="right")
+    table.add_column("中央値", justify="right")
+    table.add_column("上位10%", justify="right")
+    table.add_column("上位1%", justify="right")
+    table.add_column("手数料超\nの割合", justify="right")
+    table.add_column("必要な\n的中率", justify="right")
+    table.add_column("完璧な予測\nでの利益", justify="right")
+
+    verdicts = []
+    for h in args.horizons:
+        st = analyse(bars, h, cost)
+        verdicts.append(st)
+        if st.is_possible:
+            acc = f"[green]{st.required_accuracy:.1%}[/green]"
+            edge = f"[green]{st.perfect_foresight_bps:+.2f}[/green]"
+        else:
+            acc = "[red]不可能[/red]"
+            edge = f"[red]{st.perfect_foresight_bps:+.2f}[/red]"
+        table.add_row(
+            f"{h}秒",
+            f"{st.mean_abs_bps:.2f}",
+            f"{st.median_abs_bps:.2f}",
+            f"{st.p90_abs_bps:.2f}",
+            f"{st.p99_abs_bps:.2f}",
+            f"{st.tradeable_fraction:.1%}",
+            acc,
+            edge,
+        )
+
+    console.print()
+    console.print(table)
+
+    possible = [v for v in verdicts if v.is_possible]
+    console.print()
+    if not possible:
+        console.print(
+            "  [red]どの保有時間でも、平均的な値動きが往復コストに届きません。[/red]\n"
+            "  [dim]完璧に当て続けても負けます。テイカーで数秒を狙う前提そのものを\n"
+            "  変える必要があります（手数料の交渉、メイカー執行、保有時間を伸ばす）。[/dim]"
+        )
+    else:
+        best = min(possible, key=lambda v: v.required_accuracy)
+        console.print(
+            f"  成立の余地があるのは {', '.join(f'{v.horizon_s}秒' for v in possible)}。\n"
+            f"  最も条件が緩いのは [bold]{best.horizon_s}秒[/bold] で、"
+            f"必要な的中率は [bold]{best.required_accuracy:.1%}[/bold]。\n"
+            "  [dim]これは平均的な値動きに対する数字です。大きく動く場面だけを\n"
+            "  選べるなら要求は下がりますが、選べること自体が予測の一部です。[/dim]"
+        )
+    console.rule()
+    return 0
+
+
 def _spec_dict(inst: Instrument, market: str) -> dict:
     return {
         "symbol": inst.symbol,
@@ -778,6 +889,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--rounds", type=int, default=12, help="スキャンの回数")
     p_watch.add_argument("--every", type=float, default=300.0, help="スキャンの間隔（秒）")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_hz = sub.add_parser("horizon", help="値動きが手数料を超えるかを過去データで測る")
+    p_hz.add_argument("--symbol", default="BTCUSDT")
+    p_hz.add_argument("--product", default="perp", choices=("perp", "spot"))
+    p_hz.add_argument("--days", type=int, default=7, help="さかのぼる日数")
+    p_hz.add_argument("--end", default=None, help="最終日 YYYY-MM-DD。既定は直近")
+    p_hz.add_argument(
+        "--horizons", type=int, nargs="+", default=[1, 2, 5, 10, 30, 60], help="保有秒数"
+    )
+    p_hz.add_argument("--taker-bps", type=float, default=4.5, help="片道テイカー手数料")
+    p_hz.add_argument("--slippage-ticks", type=float, default=1.0, help="片道の想定滑り")
+    p_hz.add_argument("--tick-size", default="0.1", help="価格の刻み")
+    p_hz.set_defaults(func=cmd_horizon)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")
