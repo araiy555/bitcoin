@@ -31,7 +31,7 @@ from .core.market import MarketView
 from .core.types import Instrument
 from .feed.base import Feed
 from .feed.binance import BinanceFeed
-from .feed.binance_futures import BinanceFuturesFeed
+from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
 from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
@@ -595,7 +595,13 @@ async def cmd_capture(args: argparse.Namespace) -> int:
                 console.print(f"[yellow]{hint}[/yellow]")
             return 1
         sources["perp"] = BinanceFuturesFeed(
-            perp, depth_ms=args.perp_depth_ms, open_interest_interval=args.oi_interval
+            perp,
+            depth_ms=args.perp_depth_ms,
+            open_interest_interval=args.oi_interval,
+            rest_fallback=args.perp_fallback,
+            fallback_after_s=args.fallback_after,
+            trade_poll_interval=args.trade_poll,
+            mark_poll_interval=args.mark_poll,
         )
         specs["perp"] = _spec_dict(perp, "perp")
         console.print(f"[dim]perp  tick={perp.tick_size} lot={perp.lot_size}[/dim]")
@@ -783,6 +789,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--oi-interval", type=float, default=15.0, help="建玉残高の取得間隔（秒）")
     p_cap.add_argument("--spot-only", action="store_true")
     p_cap.add_argument("--perp-only", action="store_true")
+    p_cap.add_argument(
+        "--perp-fallback",
+        default="auto",
+        choices=FALLBACK_MODES,
+        help="先物の約定・マークをRESTで取るか。auto は無音を10秒待って切替",
+    )
+    p_cap.add_argument("--fallback-after", type=float, default=10.0, help="auto の待ち時間（秒）")
+    p_cap.add_argument("--trade-poll", type=float, default=1.0, help="REST約定の取得間隔（秒）")
+    p_cap.add_argument("--mark-poll", type=float, default=1.0, help="RESTマークの取得間隔（秒）")
     p_cap.set_defaults(func=cmd_capture)
 
     return parser

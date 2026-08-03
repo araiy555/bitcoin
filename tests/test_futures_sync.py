@@ -10,6 +10,7 @@ would silently get wrong.
 """
 
 import asyncio
+import contextlib
 import json
 from decimal import Decimal
 
@@ -332,9 +333,257 @@ class TestNonBookStreams:
 
     async def test_queued_open_interest_is_emitted(self, monkeypatch):
         feed = make_feed([100], monkeypatch)
-        feed._oi_queue.put_nowait(OpenInterest(lots=123_456))
+        feed._rest_queue.put_nowait(OpenInterest(lots=123_456))
 
         events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
 
         oi = [e for e in events if isinstance(e, OpenInterest)]
         assert oi and oi[0].lots == 123_456
+
+
+# --------------------------------------------------------------- REST fallback
+#
+# Measured behaviour this stands in for: fstream.binance.com accepts a
+# subscription for aggTrade and markPrice, lists both as active, and sends
+# neither, while depth keeps arriving. The feed has to notice that from
+# silence alone — there is no error to key on.
+
+
+def premium_index(mark, index, rate, next_funding=1_700_000_600_000, ts=1_700_000_000_000):
+    return {
+        "symbol": "BTCUSDT",
+        "markPrice": str(mark),
+        "indexPrice": str(index),
+        "lastFundingRate": str(rate),
+        "nextFundingTime": next_funding,
+        "time": ts,
+    }
+
+
+def rest_trade(agg_id, price, qty, buyer_is_maker, ts=1_700_000_000_000):
+    """The REST spelling of an aggregated trade — same field names as the
+    stream, which is why one parser serves both."""
+    return {"a": agg_id, "p": str(price), "q": str(qty), "T": ts, "m": buyer_is_maker}
+
+
+def fallback_feed(monkeypatch, **kwargs):
+    feed = make_feed([100], monkeypatch)
+    started: list[str] = []
+
+    async def fake_trades():
+        started.append("trades")
+        await asyncio.Event().wait()
+
+    async def fake_mark():
+        started.append("mark")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(feed, "_poll_agg_trades", fake_trades)
+    monkeypatch.setattr(feed, "_poll_mark_price", fake_mark)
+    for key, value in kwargs.items():
+        setattr(feed, key, value)
+    return feed, started
+
+
+class TestFallbackConstruction:
+    def test_rejects_an_unknown_mode(self):
+        with pytest.raises(ValueError, match="rest_fallback"):
+            BinanceFuturesFeed(PERP, rest_fallback="sometimes")
+
+    def test_defaults_to_auto(self):
+        assert BinanceFuturesFeed(PERP).rest_fallback == "auto"
+
+    def test_accepts_every_documented_mode(self):
+        for mode in ("auto", "always", "never"):
+            assert BinanceFuturesFeed(PERP, rest_fallback=mode).rest_fallback == mode
+
+
+class TestFallbackEngagement:
+    async def test_auto_starts_polling_when_the_socket_stays_silent(self, monkeypatch):
+        feed, started = fallback_feed(monkeypatch, rest_fallback="auto", fallback_after_s=0.0)
+
+        events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
+
+        assert sorted(started) == ["mark", "trades"]
+        degraded = [e for e in events if isinstance(e, FeedStatus) and e.state == "degraded"]
+        assert degraded, "the switch to polling has to be recorded, not silent"
+
+    async def test_auto_stays_on_the_socket_when_the_socket_delivers(self, monkeypatch):
+        # A trade before the deadline proves the stream works; polling then
+        # would duplicate a source that is already healthy.
+        feed, started = fallback_feed(monkeypatch, rest_fallback="auto", fallback_after_s=0.05)
+
+        events = await collect(
+            feed, [depth(95, 100, 90), agg_trade(64_000.0, 1.5, False), depth(101, 105, 100)]
+        )
+
+        assert started == []
+        assert any(isinstance(e, TradeTick) for e in events)
+        assert not [e for e in events if isinstance(e, FeedStatus) and e.state == "degraded"]
+
+    async def test_never_accepts_the_silence(self, monkeypatch):
+        feed, started = fallback_feed(monkeypatch, rest_fallback="never", fallback_after_s=0.0)
+
+        events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
+
+        assert started == []
+        assert not [e for e in events if isinstance(e, FeedStatus) and e.state == "degraded"]
+
+    async def test_always_polls_without_waiting(self, monkeypatch):
+        feed, started = fallback_feed(monkeypatch, rest_fallback="always", fallback_after_s=999.0)
+
+        await collect(feed, [depth(95, 100, 90)])
+
+        assert sorted(started) == ["mark", "trades"]
+
+    async def test_socket_trades_are_dropped_once_polling(self, monkeypatch):
+        # Both sources carry the same trades, so relaying both would double
+        # every print in the recording.
+        feed, _ = fallback_feed(monkeypatch, rest_fallback="always")
+
+        events = await collect(
+            feed, [depth(95, 100, 90), agg_trade(64_000.0, 1.0, False), mark_price(1, 1, 0.0)]
+        )
+
+        assert not [e for e in events if isinstance(e, (TradeTick, MarkPrice))]
+
+    async def test_liquidations_still_come_through_while_polling(self, monkeypatch):
+        # forceOrder has no REST equivalent, so it is the one stream the
+        # fallback must not suppress.
+        feed, _ = fallback_feed(monkeypatch, rest_fallback="always")
+
+        events = await collect(
+            feed, [depth(95, 100, 90), force_order(64_000.0, 2.0, "SELL", avg=63_999.0)]
+        )
+
+        assert any(isinstance(e, Liquidation) for e in events)
+
+    async def test_depth_is_unaffected_by_the_fallback(self, monkeypatch):
+        feed, _ = fallback_feed(monkeypatch, rest_fallback="always")
+
+        events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
+
+        assert len([e for e in events if isinstance(e, DepthDelta)]) == 2
+        assert any(isinstance(e, DepthSnapshot) for e in events)
+
+
+class TestAggTradePolling:
+    async def test_the_first_poll_does_not_replay_history(self, monkeypatch):
+        # An unanchored poll returns up to 1000 past trades. Emitting them
+        # would date-stamp the recording with prints from minutes earlier.
+        feed = BinanceFuturesFeed(PERP)
+        calls = []
+
+        async def fake(from_id=None, limit=1000):
+            calls.append(from_id)
+            if from_id is None:
+                return [rest_trade(i, 64_000.0, 1.0, False) for i in range(500, 600)]
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(feed, "fetch_agg_trades", fake)
+        monkeypatch.setattr(feed, "trade_poll_interval", 0.0)
+        with contextlib.suppress(asyncio.CancelledError):
+            await feed._poll_agg_trades()
+
+        emitted = []
+        while not feed._rest_queue.empty():
+            emitted.append(feed._rest_queue.get_nowait())
+        assert len(emitted) == 1
+        assert calls == [None, 600]
+
+    async def test_later_polls_chain_by_id(self, monkeypatch):
+        feed = BinanceFuturesFeed(PERP)
+        calls = []
+
+        async def fake(from_id=None, limit=1000):
+            calls.append(from_id)
+            if from_id is None:
+                return [rest_trade(10, 64_000.0, 1.0, False)]
+            if from_id == 11:
+                return [rest_trade(11, 64_001.0, 2.0, True), rest_trade(12, 64_002.0, 3.0, False)]
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(feed, "fetch_agg_trades", fake)
+        monkeypatch.setattr(feed, "trade_poll_interval", 0.0)
+        with contextlib.suppress(asyncio.CancelledError):
+            await feed._poll_agg_trades()
+
+        assert calls == [None, 11, 13]
+
+    async def test_an_empty_poll_keeps_the_resume_point(self, monkeypatch):
+        # A quiet second must not reset the cursor to "latest", which would
+        # silently skip whatever arrives during the next gap.
+        feed = BinanceFuturesFeed(PERP)
+        calls = []
+
+        async def fake(from_id=None, limit=1000):
+            calls.append(from_id)
+            if from_id is None:
+                return [rest_trade(10, 64_000.0, 1.0, False)]
+            if from_id == 11 and calls.count(11) == 1:
+                return []
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(feed, "fetch_agg_trades", fake)
+        monkeypatch.setattr(feed, "trade_poll_interval", 0.0)
+        with contextlib.suppress(asyncio.CancelledError):
+            await feed._poll_agg_trades()
+
+        assert calls == [None, 11, 11]
+
+    async def test_a_failed_poll_is_survivable(self, monkeypatch):
+        feed = BinanceFuturesFeed(PERP)
+        calls = []
+
+        async def fake(from_id=None, limit=1000):
+            calls.append(from_id)
+            if len(calls) == 1:
+                raise RuntimeError("503")
+            if len(calls) == 2:
+                return [rest_trade(10, 64_000.0, 1.0, False)]
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(feed, "fetch_agg_trades", fake)
+        monkeypatch.setattr(feed, "trade_poll_interval", 0.0)
+        with contextlib.suppress(asyncio.CancelledError):
+            await feed._poll_agg_trades()
+
+        assert calls == [None, None, 11]
+
+    async def test_rest_and_stream_trades_parse_identically(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        from_rest = feed._parse_trade(rest_trade(7, 64_000.0, 1.5, False))
+        from_ws = feed._parse_trade(agg_trade(64_000.0, 1.5, False)["data"])
+
+        assert from_rest == from_ws
+
+
+class TestPremiumIndexParsing:
+    def test_it_becomes_a_mark_price_event(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_premium_index(premium_index(64_000.0, 64_010.0, 0.0001))
+
+        assert mp.mark == PERP.to_ticks("64000.0")
+        assert mp.index == PERP.to_ticks("64010.0")
+        assert mp.funding_rate == pytest.approx(0.0001)
+
+    def test_timestamps_are_nanoseconds(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_premium_index(
+            premium_index(1.0, 1.0, 0.0, next_funding=1_700_000_600_000, ts=1_700_000_000_000)
+        )
+
+        assert mp.ts_ns == 1_700_000_000_000 * 1_000_000
+        assert mp.next_funding_ns == 1_700_000_600_000 * 1_000_000
+
+    def test_a_negative_funding_rate_survives(self):
+        # Negative funding is shorts paying longs; dropping the sign would
+        # invert what the basis signal means.
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_premium_index(premium_index(1.0, 1.0, -0.000375))
+
+        assert mp.funding_rate == pytest.approx(-0.000375)
