@@ -1,31 +1,37 @@
 """Is there room to be right in, before asking whether we can be right.
 
-A direction prediction pays `move` when correct and costs `move` when wrong,
-and pays the round-trip taker fee either way. So with accuracy `p` on a move
-of typical size `m`:
+A direction trade earns its move when right, loses its move when wrong, and
+pays the round-trip fee either way. In general:
 
-    expected = (2p - 1) · m − cost
+    expected = p · win − (1 − p) · loss − cost
+    p*       = (loss + cost) / (win + loss)
 
-Setting that to zero gives the accuracy the strategy would need:
+`win` and `loss` are the average move on the trades taken, split by outcome —
+they are *not* the same quantity, and a strategy with a stop or a target makes
+them deliberately different.
 
-    p* = (1 + cost / m) / 2
+**What this module reports is the symmetric special case**, `win == loss ==
+mean|move|`, which collapses to `p* = (1 + cost/m) / 2`. That is the right
+number for exactly one strategy: enter at every timepoint, hold a fixed
+duration, exit regardless. It is the cheapest thing to check first and it
+settles that one design, but it does not generalise. `required_accuracy_for`
+takes the two magnitudes separately for anything that does.
 
-That single number decides whether the idea is worth pursuing at a given
-horizon, and it needs no model — only the size of the moves and the fee. When
-`cost` exceeds `m`, `p*` exceeds 1 and **no predictor of any quality wins**,
-because being right every single time still does not cover the fee. That is
-not a hard problem, it is an impossible one, and it is cheap to check first.
+The scope of a `p* > 1` verdict is therefore narrow and worth stating
+precisely: **at every timepoint, taker in and taker out, fixed horizon, no
+predictor of any quality wins.** It says nothing about a strategy that trades
+only on some condition. Conditioning on a large print, a side of the book
+vanishing, spot and perp diverging, a liquidation, or a jump in volatility
+gives a conditional mean move that can be far above the unconditional one —
+which is a different question, and this module does not answer it.
 
-The scan reached the same conclusion from the other side: symbols failed on
-the fee rather than on the book. This asks whether the direction idea meets
-the same wall at 1–10 seconds, using years of real trades instead of an
-argument.
+The scan reached the same wall from the other side: symbols failed on the fee
+rather than on the book. This asks whether the fixed-horizon direction idea
+meets it too, using years of real trades instead of an argument.
 
-`mean_abs_move` is deliberately the mean, not the median. A strategy that
-trades only when it expects a large move sees something closer to an upper
-tail than to the middle, so the median would understate what a selective
-strategy can reach — and the mean is already generous enough to be a fair
-ceiling.
+`mean_abs_move` is the mean rather than the median on purpose. A selective
+strategy sees something closer to an upper tail than to the middle, so the
+median would understate what selection can reach.
 """
 
 from __future__ import annotations
@@ -54,7 +60,12 @@ class HorizonStats:
 
     @property
     def required_accuracy(self) -> float:
-        """Direction accuracy needed to break even on an average move."""
+        """Break-even accuracy **assuming wins and losses are the same size**.
+
+        True for entering at every timepoint and exiting on a timer, which is
+        what this module measures. A strategy with a target or a stop breaks
+        that assumption — use `required_accuracy_for` there.
+        """
         return self._accuracy_for(self.mean_abs_bps)
 
     def _accuracy_for(self, move_bps: float) -> float:
@@ -165,6 +176,31 @@ def analyse(bars: list[SecondBar], horizon_s: int, cost_bps: float) -> HorizonSt
         mean_top1_bps=sum(top1) / len(top1) if top1 else 0.0,
         _fraction_over=over,
     )
+
+
+def required_accuracy_for(win_bps: float, loss_bps: float, cost_bps: float) -> float:
+    """Break-even accuracy when a win and a loss are different sizes.
+
+        p* = (loss + cost) / (win + loss)
+
+    A target-and-stop strategy sets these deliberately: taking +20bps and
+    cutting at −10bps needs 63.3% at a 9bps cost, where the symmetric reading
+    of the same 15bps average move demands 80%. Reporting only the symmetric
+    number would rule out designs that are not actually ruled out.
+
+    Returns infinity when neither side can move, since no accuracy helps.
+    """
+    total = win_bps + loss_bps
+    if total <= 0:
+        return math.inf
+    return (loss_bps + cost_bps) / total
+
+
+def expected_bps(
+    accuracy: float, win_bps: float, loss_bps: float, cost_bps: float
+) -> float:
+    """Expected result per round trip. Negative means the design loses."""
+    return accuracy * win_bps - (1.0 - accuracy) * loss_bps - cost_bps
 
 
 def round_trip_cost_bps(taker_bps: float, slippage_ticks: float, tick_bps: float) -> float:

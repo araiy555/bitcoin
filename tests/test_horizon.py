@@ -22,7 +22,9 @@ from jsboard.research.archive import (
 )
 from jsboard.research.horizon import (
     analyse,
+    expected_bps,
     forward_returns,
+    required_accuracy_for,
     round_trip_cost_bps,
 )
 
@@ -293,3 +295,52 @@ class TestSelectiveTrading:
 
         assert st.mean_top10_bps == 0.0
         assert not st.selective_is_possible
+
+
+class TestAsymmetricPayoff:
+    """The symmetric formula is a special case, and saying so matters.
+
+    A target-and-stop design deliberately makes wins and losses different
+    sizes. Judging it by the symmetric number rules out strategies that are
+    not actually ruled out — which is the error these pin against.
+    """
+
+    def test_equal_win_and_loss_reproduces_the_symmetric_formula(self):
+        move, cost = 15.0, 9.0
+
+        assert required_accuracy_for(move, move, cost) == pytest.approx(
+            (1 + cost / move) / 2
+        )
+
+    def test_a_wide_target_with_a_tight_stop_needs_far_less_accuracy(self):
+        # Same 15bps of movement, split +20 / −10 instead of ±15.
+        symmetric = required_accuracy_for(15.0, 15.0, 9.0)
+        skewed = required_accuracy_for(20.0, 10.0, 9.0)
+
+        assert symmetric == pytest.approx(0.80)
+        assert skewed == pytest.approx(19 / 30)
+        assert skewed < symmetric
+
+    def test_a_tight_target_with_a_wide_stop_needs_more(self):
+        assert required_accuracy_for(10.0, 20.0, 9.0) > required_accuracy_for(
+            20.0, 10.0, 9.0
+        )
+
+    def test_a_free_symmetric_market_is_a_coin_flip(self):
+        assert required_accuracy_for(10.0, 10.0, 0.0) == pytest.approx(0.5)
+
+    def test_a_motionless_market_is_impossible_rather_than_undefined(self):
+        assert required_accuracy_for(0.0, 0.0, 5.0) == float("inf")
+
+    def test_expected_value_is_zero_at_the_break_even_accuracy(self):
+        win, loss, cost = 20.0, 10.0, 9.0
+        p = required_accuracy_for(win, loss, cost)
+
+        assert expected_bps(p, win, loss, cost) == pytest.approx(0.0)
+
+    def test_expected_value_rises_with_accuracy(self):
+        win, loss, cost = 20.0, 10.0, 9.0
+        p = required_accuracy_for(win, loss, cost)
+
+        assert expected_bps(p + 0.05, win, loss, cost) > 0
+        assert expected_bps(p - 0.05, win, loss, cost) < 0
