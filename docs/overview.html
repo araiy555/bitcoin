@@ -1,0 +1,631 @@
+<title>jsboard 仕様と測定結果</title>
+<style>
+  :root {
+    --paper:      #f6f7f9;
+    --card:       #ffffff;
+    --ink:        #141a21;
+    --ink-soft:   #4d5866;
+    --ink-faint:  #8b95a2;
+    --rule:       #dfe4ea;
+    --rule-soft:  #eceff3;
+    --accent:     #a8681c;
+    --accent-bg:  #f7efe2;
+    --bid:        #2c7a53;
+    --ask:        #b03f2c;
+    --bid-bg:     #e6f2eb;
+    --ask-bg:     #f9e8e4;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --gothic: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP",
+              system-ui, sans-serif;
+    --mincho: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", Georgia, serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:     #10141a;
+      --card:      #171d25;
+      --ink:       #e4e9ef;
+      --ink-soft:  #a3aeba;
+      --ink-faint: #6b7684;
+      --rule:      #2a333e;
+      --rule-soft: #1f2731;
+      --accent:    #e0a349;
+      --accent-bg: #2a2317;
+      --bid:       #52c088;
+      --ask:       #e8735c;
+      --bid-bg:    #16281f;
+      --ask-bg:    #2c1b17;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:     #10141a;  --card:      #171d25;
+    --ink:       #e4e9ef;  --ink-soft:  #a3aeba;
+    --ink-faint: #6b7684;  --rule:      #2a333e;
+    --rule-soft: #1f2731;  --accent:    #e0a349;
+    --accent-bg: #2a2317;  --bid:       #52c088;
+    --ask:       #e8735c;  --bid-bg:    #16281f;
+    --ask-bg:    #2c1b17;
+  }
+  :root[data-theme="light"] {
+    --paper:     #f6f7f9;  --card:      #ffffff;
+    --ink:       #141a21;  --ink-soft:  #4d5866;
+    --ink-faint: #8b95a2;  --rule:      #dfe4ea;
+    --rule-soft: #eceff3;  --accent:    #a8681c;
+    --accent-bg: #f7efe2;  --bid:       #2c7a53;
+    --ask:       #b03f2c;  --bid-bg:    #e6f2eb;
+    --ask-bg:    #f9e8e4;
+  }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--gothic);
+    font-size: 16px;
+    line-height: 1.85;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 4rem 1.5rem 7rem; }
+
+  /* ---------------------------------------------------------- masthead */
+  .masthead { border-bottom: 2px solid var(--ink); padding-bottom: 1.75rem; margin-bottom: 3rem; }
+  .kicker {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: .9rem;
+  }
+  h1 {
+    font-family: var(--mincho); font-size: clamp(2rem, 5vw, 2.9rem);
+    line-height: 1.25; font-weight: 600; text-wrap: balance; margin-bottom: .9rem;
+  }
+  .standfirst { color: var(--ink-soft); font-size: 1.02rem; max-width: 62ch; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 1.5rem; margin-top: 1.6rem;
+    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
+  }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  /* ----------------------------------------------------------- sections */
+  section { margin-top: 3.5rem; }
+  h2 {
+    font-family: var(--mincho); font-size: 1.5rem; font-weight: 600;
+    padding-bottom: .5rem; border-bottom: 1px solid var(--rule);
+    margin-bottom: 1.5rem; text-wrap: balance;
+  }
+  h3 {
+    font-size: 1.02rem; font-weight: 700; margin: 2.2rem 0 .7rem;
+    letter-spacing: .01em;
+  }
+  h3:first-child { margin-top: 0; }
+  p { margin-bottom: 1.1rem; max-width: 66ch; }
+  p:last-child { margin-bottom: 0; }
+  strong { font-weight: 700; }
+  em { font-style: normal; background: var(--accent-bg); padding: 0 .25em; border-radius: 2px; }
+  ul { margin: 0 0 1.1rem 1.3rem; max-width: 66ch; }
+  li { margin-bottom: .45rem; }
+  code {
+    font-family: var(--mono); font-size: .86em;
+    background: var(--rule-soft); padding: .12em .38em; border-radius: 3px;
+  }
+  a { color: var(--accent); }
+
+  /* -------------------------------------------------------------- cards */
+  .card {
+    background: var(--card); border: 1px solid var(--rule);
+    border-radius: 6px; padding: 1.4rem 1.5rem; margin-bottom: 1.2rem;
+  }
+  .verdict {
+    background: var(--card); border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent); border-radius: 4px;
+    padding: 1.1rem 1.4rem; margin: 1.4rem 0;
+  }
+  .verdict p { margin-bottom: .5rem; }
+  .verdict p:last-child { margin-bottom: 0; }
+
+  /* ------------------------------------------------------------- tables */
+  .scroll { overflow-x: auto; margin-bottom: 1.4rem; }
+  table {
+    border-collapse: collapse; width: 100%; font-size: .88rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    text-align: left; font-family: var(--mono); font-size: .7rem;
+    letter-spacing: .09em; text-transform: uppercase; color: var(--ink-faint);
+    font-weight: 500; padding: .5rem .8rem .5rem 0;
+    border-bottom: 1px solid var(--rule); white-space: nowrap;
+  }
+  td {
+    padding: .58rem .8rem .58rem 0; border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  .fail { color: var(--ask); font-weight: 600; }
+  .pass { color: var(--bid); font-weight: 600; }
+  .cmd { font-family: var(--mono); font-size: .84rem; white-space: nowrap; }
+
+  /* ------------------------------------------------------------ the wall */
+  .wall { margin: 1.6rem 0 1.2rem; }
+  .wall-row {
+    display: grid; grid-template-columns: 3.6rem 1fr 5.2rem;
+    align-items: center; gap: .8rem; margin-bottom: .5rem;
+    font-family: var(--mono); font-size: .78rem;
+  }
+  .wall-label { color: var(--ink-soft); text-align: right; }
+  .wall-track {
+    position: relative; height: 20px; background: var(--rule-soft); border-radius: 2px;
+  }
+  .wall-bar { height: 100%; background: var(--bid); border-radius: 2px; opacity: .85; }
+  .wall-cost {
+    position: absolute; top: -5px; bottom: -5px; width: 2px;
+    background: var(--ask);
+  }
+  .wall-val { color: var(--ink); }
+  .wall-key {
+    display: flex; flex-wrap: wrap; gap: 1.4rem; margin-top: 1rem;
+    font-family: var(--mono); font-size: .74rem; color: var(--ink-faint);
+  }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+            margin-right: .4rem; vertical-align: baseline; }
+
+  /* ------------------------------------------------------------ pre/code */
+  pre {
+    font-family: var(--mono); font-size: .8rem; line-height: 1.65;
+    background: var(--card); border: 1px solid var(--rule); border-radius: 5px;
+    padding: 1rem 1.2rem; overflow-x: auto; margin-bottom: 1.3rem;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  .note {
+    font-size: .88rem; color: var(--ink-soft);
+    border-top: 1px solid var(--rule-soft); padding-top: .9rem; margin-top: 1.2rem;
+  }
+  footer {
+    margin-top: 4.5rem; padding-top: 1.5rem; border-top: 2px solid var(--ink);
+    font-family: var(--mono); font-size: .76rem; color: var(--ink-faint);
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <div class="kicker">jsboard — 仕様と測定結果</div>
+  <h1>作ったもの、測ったこと、そして止まった場所</h1>
+  <p class="standfirst">
+    Binance の板を取り込んでマーケットメイクと方向予測を検証するために書いたコードの全体像と、
+    実データで出た結論。3つの独立した測定が、いずれも同じ場所で止まった。
+  </p>
+  <div class="meta">
+    <span>実装 <b>Python 3.11+</b></span>
+    <span>本体 <b>4,855 行</b></span>
+    <span>テスト <b>3,821 行 / 325 件</b></span>
+    <span>実発注 <b>無し</b></span>
+  </div>
+</header>
+
+<section>
+  <h2>1. これは何か</h2>
+  <p>
+    仮想通貨で自動売買をするために、まず<strong>そもそも儲かる余地があるのか</strong>を測る道具です。
+    順番としては、板を読む仕組みを作り、成立しそうな銘柄を探し、値動きと手数料を比べ、
+    信号が当たるかを検証する、という流れになっています。
+  </p>
+  <p>
+    結果として<em>売買の仕組みは一通り動きますが、儲かる余地は見つかりませんでした。</em>
+    その経緯と数字を以下に全部書きます。
+  </p>
+</section>
+
+<section>
+  <h2>2. コマンド一覧</h2>
+  <p>すべて <code>jsboard &lt;コマンド&gt;</code> で動きます。通信欄が「なし」のものはオフラインで動きます。</p>
+  <div class="scroll">
+  <table>
+    <thead>
+      <tr><th>コマンド</th><th>通信</th><th>何をするか</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="cmd">horizon</td><td>過去データ</td>
+          <td><strong>値動きが手数料を超えるか測る。</strong>保有時間ごとに、平均の値動きと往復コストを比べ、必要な的中率を出す</td></tr>
+      <tr><td class="cmd">predict</td><td>過去データ</td>
+          <td><strong>信号がその的中率に届くか測る。</strong>前半で12個の信号から選び、後半で一度だけ答え合わせ</td></tr>
+      <tr><td class="cmd">scan</td><td>REST</td>
+          <td>全銘柄の最良気配を1回走査し、手数料を超えるスプレッドがあるか判定</td></tr>
+      <tr><td class="cmd">watch</td><td>REST 反復</td>
+          <td>scan を繰り返し、同じ銘柄が残り続けるか（持続率）を測る</td></tr>
+      <tr><td class="cmd">live</td><td>REST + WS</td>
+          <td>本物の板でマーケットメイクを動かす。<strong>約定判定は自前（ペーパー）</strong></td></tr>
+      <tr><td class="cmd">capture</td><td>REST + WS ×2</td>
+          <td>現物と無期限先物を、起きた順のまま1本のファイルに記録</td></tr>
+      <tr><td class="cmd">record / replay</td><td>WS / なし</td>
+          <td>ライブを記録し、あとで再生する</td></tr>
+      <tr><td class="cmd">sim / backtest</td><td>なし</td>
+          <td>合成した架空の市場で動かす。ネットワーク不要</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">
+    調べるなら <code>horizon</code> → <code>predict</code> の順が最短です。
+    この2つは銘柄名と手数料を変えれば別の市場でもそのまま使えます。
+  </p>
+</section>
+
+<section>
+  <h2>3. 測定 ①　マーケットメイクは成立するか</h2>
+  <p>
+    建値を出して稼げるのは1往復あたり最大でスプレッド1回分、対して手数料は買いと売りの両方にかかります。
+    つまり <code>スプレッド &gt; 手数料 × 2</code> でなければ、1回売買するごとに必ず損をします。
+  </p>
+  <p>
+    1時間（5分間隔×12回）の走査を、手数料10bps と 0bps の2条件で回しました。
+  </p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th></th><th class="num">手数料 10 bps</th><th class="num">手数料 0 bps</th></tr></thead>
+    <tbody>
+      <tr><td>一度でも手数料を超えた銘柄</td><td class="num">24 件</td><td class="num">131 件</td></tr>
+      <tr><td><strong>75%以上の回で注文が置けた</strong></td>
+          <td class="num fail">1 件</td><td class="num">13 件</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="verdict">
+    <p><strong>拘束条件は板の薄さではなく手数料でした。</strong>
+    手数料をゼロにすると通る銘柄が13倍に増えます。</p>
+  </div>
+  <h3>BTC がここで落ちた理由</h3>
+  <p>
+    BTCUSDT は板が厚く安定していますが、<strong>スプレッドが1 tick しかありません。</strong>
+    上限手数料（＝スプレッド÷2、これを下回る手数料が取れれば成立する水準）は 0.00 bps。
+    板の厚みは 95,041 で、他の銘柄の4〜19倍あります。
+  </p>
+  <p>
+    これは「BTC は予測できない」という判定ではありません。<em>「BTC ではメイカーとして立てない」という判定です。</em>
+    行列が9万5千あるところに 0.01 の注文を置いても、順番は回ってきません。
+  </p>
+  <p class="note">
+    実際、ASTERUSDT で <code>live</code> を走らせたところ、434回の判断サイクルで約定 0 件でした。
+    自分の注文の前に 75,274 個並んでいて、スプレッドは1 tick。動作は正常で、成果がゼロという状態です。
+  </p>
+</section>
+
+<section>
+  <h2>4. 測定 ②　数秒先の方向は当てられるか</h2>
+  <p>
+    方向を当てる取引は、当たれば値動きぶん儲かり、外せば値動きぶん損して、どちらでも手数料を払います。
+    必要な的中率は式1本で出ます。
+  </p>
+  <pre><code>必要な的中率 = (1 + 往復コスト ÷ 平均の値動き) ÷ 2</code></pre>
+  <p>
+    モデルは要りません。<strong>値動きの大きさと手数料だけ</strong>で決まります。
+    そして往復コストが平均の値動きを超えていれば、この数字は100%を超えます。
+    <em>毎回完璧に当てても手数料で負ける、という意味です。</em>
+  </p>
+
+  <h3>BTCUSDT 無期限・7日間・全約定</h3>
+  <p>往復コスト 9.03 bps（テイカー手数料 4.5 × 2 ＋ スリッページ 1 tick × 2）に対して：</p>
+
+  <div class="wall">
+    <div class="wall-row">
+      <span class="wall-label">1秒</span>
+      <span class="wall-track"><span class="wall-bar" style="width:0.7%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">0.16 bps</span>
+    </div>
+    <div class="wall-row">
+      <span class="wall-label">10秒</span>
+      <span class="wall-track"><span class="wall-bar" style="width:4.1%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">0.95 bps</span>
+    </div>
+    <div class="wall-row">
+      <span class="wall-label">60秒</span>
+      <span class="wall-track"><span class="wall-bar" style="width:12.1%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">2.77 bps</span>
+    </div>
+    <div class="wall-row">
+      <span class="wall-label">5分</span>
+      <span class="wall-track"><span class="wall-bar" style="width:27.8%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">6.39 bps</span>
+    </div>
+    <div class="wall-row">
+      <span class="wall-label">15分</span>
+      <span class="wall-track"><span class="wall-bar" style="width:48.4%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">11.12 bps</span>
+    </div>
+    <div class="wall-row">
+      <span class="wall-label">1時間</span>
+      <span class="wall-track"><span class="wall-bar" style="width:99.8%"></span><span class="wall-cost" style="left:39.3%"></span></span>
+      <span class="wall-val">22.93 bps</span>
+    </div>
+    <div class="wall-key">
+      <span><span class="swatch" style="background:var(--bid)"></span>平均の値動き</span>
+      <span><span class="swatch" style="background:var(--ask)"></span>往復コスト 9.03 bps</span>
+    </div>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead>
+      <tr><th>保有</th><th class="num">平均変動</th><th class="num">上位1%</th>
+          <th class="num">必要な的中率</th><th class="num">完璧な予測での損益</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1秒</td><td class="num">0.16</td><td class="num">2.07</td>
+          <td class="num fail">不可能</td><td class="num fail">−8.87</td></tr>
+      <tr><td>10秒</td><td class="num">0.95</td><td class="num">6.30</td>
+          <td class="num fail">不可能</td><td class="num fail">−8.08</td></tr>
+      <tr><td>60秒</td><td class="num">2.77</td><td class="num">15.26</td>
+          <td class="num fail">不可能</td><td class="num fail">−6.26</td></tr>
+      <tr><td>5分</td><td class="num">6.39</td><td class="num">33.90</td>
+          <td class="num fail">不可能</td><td class="num fail">−2.64</td></tr>
+      <tr><td>15分</td><td class="num">11.12</td><td class="num">62.76</td>
+          <td class="num">90.6%</td><td class="num pass">+2.09</td></tr>
+      <tr><td>1時間</td><td class="num">22.93</td><td class="num">128.58</td>
+          <td class="num">69.7%</td><td class="num pass">+13.90</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="verdict">
+    <p><strong>BTC は10秒で平均 0.95 bps しか動きません。往復コストは 9.03 bps。9.5倍の差があります。</strong></p>
+    <p>これは予測精度の問題ではなく、動く幅より手数料のほうが大きいという算数です。
+    当初の構想だった「板の歪みを見て1〜10秒の方向を当てて成行で入る」は、ここで閉じました。</p>
+  </div>
+
+  <p>
+    ETHUSDT でも同じ形でした。10秒の平均変動 1.51 bps に対し往復コスト約 9.1 bps。
+    BTC より1.6倍よく動きますが、まだ6.7倍足りません。
+  </p>
+</section>
+
+<section>
+  <h2>5. 測定 ③　1時間先なら信号は届くか</h2>
+  <p>
+    上の表で唯一余地があったのが1時間です。しかも「大きく動く場面だけ」に絞れば、
+    必要な的中率は 55.4% まで下がります。そこで、実際に届くのかを測りました。
+  </p>
+  <p>
+    14日ぶんの全約定を、<strong>前半8日で12個の信号から1つを選び、後半6日で一度だけ答え合わせ</strong>しました。
+    同じデータで選んで測ると、信号の良さではなく「選び方の上手さ」を測ることになるためです。
+  </p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th></th><th class="num">学習期間</th><th class="num">検証期間</th><th class="num">1回あたり損益</th></tr></thead>
+    <tbody>
+      <tr><td>mom_900s（逆張り）</td><td class="num">57.8%</td>
+          <td class="num fail">47.56%</td><td class="num fail">−11.08 bps</td></tr>
+      <tr><td>常に買い（基準）</td><td class="num">—</td>
+          <td class="num">46.88%</td><td class="num fail">−10.59 bps</td></tr>
+      <tr><td>必要だった的中率</td><td class="num">—</td><td class="num">60.8%</td><td class="num">—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="verdict">
+    <p><strong>学習期間で最良だった信号が、検証期間ではコイン投げ以下でした。</strong>
+    57.8% → 47.6%。必要だった 60.8% には13ポイント足りません。</p>
+    <p>これは「調整すれば良くなる」ではなく、信号が実在せず前半の相場にたまたま合っていただけ、という典型的な形です。
+    <em>同じデータで測っていたら「的中率57.8%の信号を発見」と報告するところでした。</em></p>
+  </div>
+  <h3>学習期間の順位も、今見ると症状</h3>
+  <p>
+    逆張りが上位を独占し、窓が長いほど成績が良い（900秒 57.8% ＞ 300秒 53.5% ＞ 60秒 50.1%）。
+    きれいすぎます。前半がレンジ相場だっただけです。
+    検証期間は「常に買い」の基準が 46.88%、つまり下落局面で、相場つきの変化とともに信号が壊れました。
+  </p>
+  <p class="note">
+    基準を50%ではなく「常に買い」に置いているのは、上げ相場では何も考えずに買い続けるだけで
+    的中率が50%を大きく超えるからです。見るべきは水準ではなく、基準との差です。
+  </p>
+</section>
+
+<section>
+  <h2>6. コードの中身</h2>
+
+  <h3>板とマッチングエンジン</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>ファイル</th><th class="num">行</th><th>役割</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd">core/book.py</td><td class="num">414</td>
+          <td>価格-時間優先の指値板。GTC / IOC / FOK / POST_ONLY、成行、部分約定、自己約定防止。キャンセルは遅延削除で O(1)</td></tr>
+      <tr><td class="cmd">core/types.py</td><td class="num">229</td>
+          <td>価格は tick 単位の整数、数量は lot 単位の整数。<strong>浮動小数点が板に入らない</strong>ので比較とハッシュが厳密に一致する</td></tr>
+      <tr><td class="cmd">core/market.py</td><td class="num">184</td>
+          <td>フィードを板に反映し、歩み値・ボラティリティ・フロー不均衡を保持</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>取引所との接続</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>ファイル</th><th class="num">行</th><th>役割</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd">feed/binance.py</td><td class="num">225</td>
+          <td>現物。<strong>スナップショットと差分の継ぎ目</strong>が主眼。手順を省いても例外は出ず、静かにずれた板が出来上がる</td></tr>
+      <tr><td class="cmd">feed/binance_futures.py</td><td class="num">492</td>
+          <td>無期限先物。<strong>継ぎ目の規則が現物と違う</strong>（下記）。マーク価格・funding・建玉・清算も扱う</td></tr>
+      <tr><td class="cmd">feed/replay.py</td><td class="num">334</td>
+          <td>合成市場と記録の再生。合成はシード固定で再現可能</td></tr>
+      <tr><td class="cmd">net.py</td><td class="num">67</td>
+          <td>certifi 同梱の証明書を使う。macOS の Homebrew Python は証明書ストアが空で接続できないことがある</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>現物と先物で、板の差分をつなぐ規則が違います。</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th></th><th>現物</th><th>先物</th></tr></thead>
+    <tbody>
+      <tr><td>最初に適用する条件</td><td class="cmd">U ≤ lastUpdateId+1 ≤ u</td><td class="cmd">U ≤ lastUpdateId ≤ u</td></tr>
+      <tr><td>継続性の判定</td><td class="cmd">U == 前回の u + 1</td><td class="cmd">pu == 前回の u</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <em>現物の規則を先物に当てても「だいたい」動きます。だから危ない。</em>
+    片方の規則だけを満たす差分列を作って、両方向のテストを置いてあります。
+  </p>
+
+  <h3>マーケットメイク</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>ファイル</th><th class="num">行</th><th>役割</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd">mm/fair_value.py</td><td class="num">88</td>
+          <td>microprice（サイズ加重の仲値）を起点に、板の偏りと約定フローで補正</td></tr>
+      <tr><td class="cmd">mm/quoter.py</td><td class="num">254</td>
+          <td>建値の価格と幅。在庫を持つと逆側にずらす。ボラが高いほど広く出す</td></tr>
+      <tr><td class="cmd">mm/inventory.py</td><td class="num">160</td>
+          <td>平均原価、実現/評価損益、手数料、ドローダウン</td></tr>
+      <tr><td class="cmd">mm/risk.py</td><td class="num">142</td>
+          <td>建玉限度、乖離、板の鮮度。<strong>停止はラッチする</strong>（数字が戻っても自動解除しない）</td></tr>
+      <tr><td class="cmd">mm/strategy.py</td><td class="num">215</td>
+          <td>上記をつないで、差分だけ発注し直す</td></tr>
+      <tr><td class="cmd">sim/paper.py</td><td class="num">230</td>
+          <td>ペーパー約定。<strong>行列の順番</strong>を模擬する — 自分の前にいた全員が食われて初めて約定する</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>調査</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>ファイル</th><th class="num">行</th><th>役割</th></tr></thead>
+    <tbody>
+      <tr><td class="cmd">research/scan.py</td><td class="num">436</td>
+          <td>全銘柄の走査と持続性の測定。測定 ① を出す</td></tr>
+      <tr><td class="cmd">research/archive.py</td><td class="num">160</td>
+          <td>過去データの取得とキャッシュ。閉じた日は変わらないので再取得しない</td></tr>
+      <tr><td class="cmd">research/horizon.py</td><td class="num">176</td>
+          <td>値動きと手数料の比較。測定 ② を出す</td></tr>
+      <tr><td class="cmd">research/predict.py</td><td class="num">208</td>
+          <td>信号の検証。時系列分割と基準比較。測定 ③ を出す</td></tr>
+      <tr><td class="cmd">sim/capture.py</td><td class="num">178</td>
+          <td>現物と先物を1本のファイルに記録。各行に取引所時刻と受信時刻の両方</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>7. データはどこから来るか</h2>
+  <h3>過去データ（Binance が公開しているもの）</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>種類</th><th>期間</th><th>量</th><th>使えるか</th></tr></thead>
+    <tbody>
+      <tr><td>約定（先物）</td><td>2019-12-31 〜 昨日</td><td class="num">44 GB</td>
+          <td class="pass">◎ 全約定・ミリ秒</td></tr>
+      <tr><td>約定（現物）</td><td>2017-08-17 〜 昨日</td><td class="num">58 GB</td>
+          <td class="pass">◎</td></tr>
+      <tr><td>板の厚み</td><td>2023-01-01 〜 昨日</td><td class="num">0.6 GB</td>
+          <td class="fail">✗ ±1〜5%を1分毎。粗すぎる</td></tr>
+      <tr><td>最良気配</td><td>2023-05-16 〜 <strong>2024-03-30</strong></td><td class="num">53 GB</td>
+          <td class="fail">✗ 2年前に配信終了</td></tr>
+      <tr><td>建玉など</td><td>2020-09-01 〜 昨日</td><td class="num">小</td>
+          <td>△ 5分間隔</td></tr>
+      <tr><td>清算</td><td>—</td><td>—</td>
+          <td class="fail">✗ 存在しない</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    ここが計画に効きました。<strong>板の細かい動き（何段目がいくつキャンセルされたか）は過去データから作れません。</strong>
+    ライブで記録するしかなく、それが <code>capture</code> を作った理由です。清算はライブでも過去でも取れません。
+  </p>
+
+  <h3>ライブデータで分かった落とし穴</h3>
+  <p>
+    先物のソケットは、購読を受理して「有効」と返答しながら、約定・マーク価格・清算を1件も配信しませんでした。
+    板だけは正常に届きます。同じ手順を現物に対して行うと全部返ってきます。
+  </p>
+  <p>
+    それらを配信する別ホストは存在しましたが、<em>テストネットでした。</em>
+    板の通し番号が本番と10.8兆離れ、価格が現物から55 bps 乖離（本物のベーシスは一桁 bps）。
+    <strong>「データが返ってくるから」で切り替えていたら、下流の分析が全部静かに嘘になっていました。</strong>
+  </p>
+  <p>
+    REST は影響を受けていなかったので、約定とマーク価格はポーリングに落としました。
+    <code>fromId</code> で前回の続きから引けるため、間引きではなく全件取得できます。
+    失うのは受信時刻の精度（約1秒）だけで、取引所時刻はそのまま入ります。
+  </p>
+</section>
+
+<section>
+  <h2>8. 実際に注文を出す部分について</h2>
+  <div class="card">
+    <p><strong>この経路は存在しません。意図的に作っていません。</strong></p>
+    <p>
+      API キーを受け取る箇所も、取引所へ注文を送る関数も、コード上にゼロです。
+      全コマンドは公開データの読み取りのみです。<code>live</code> は本物の板を読みますが、
+      約定したかどうかは自分で判定しています。
+    </p>
+  </div>
+  <p>作るとしたら、必要なのはこれだけあります。</p>
+  <ul>
+    <li>署名付きリクエスト（HMAC-SHA256、timestamp、recvWindow）</li>
+    <li>発注・取消・照会</li>
+    <li>ユーザーデータストリーム — <strong>自分の約定を取引所から確認する経路</strong>。これが無いと注文が通ったか分からない</li>
+    <li>安全装置 — 二重発注防止、残高確認、建玉上限、緊急停止、通信断からの復帰</li>
+  </ul>
+  <p>作業量は半日〜1日です。</p>
+  <p>
+    <strong>API キーは会話に貼らないでください。</strong>
+    環境変数に置いて、私が一度も見ない形にします。会話に貼られたものは残り、
+    リポジトリに入れば公開されます。作るときは出金権限をオフ、IP ホワイトリスト、
+    少額の別サブアカウントから始めるのが安全です。
+  </p>
+</section>
+
+<section>
+  <h2>9. 検証していないこと</h2>
+  <p>ここまでの結論は「エッジが存在しない」の証明ではありません。試していないことを正確に書きます。</p>
+  <ul>
+    <li>試したのは<strong>単一特徴・符号だけの12信号</strong>。組み合わせも機械学習も未実施</li>
+    <li><strong>14日ぶん</strong>のみ。複数の相場つきをまたいでいない</li>
+    <li>現物と先物のクロス特徴を使っていない（取得部分はあるが未使用）</li>
+    <li>ペーパー約定は<strong>ギャップスルーを模擬していない</strong>ので、損益は上限として読むべき</li>
+    <li><code>capture</code> の REST 迂回経路は、実装後の長時間記録をまだ取っていない</li>
+  </ul>
+  <p>
+    ただし<strong>板の特徴量が効く時間帯（秒単位）は算術的に閉じています。</strong>
+    そこは何を作っても開きません。残っているのは分単位以上の、まったく別のゲームです。
+  </p>
+</section>
+
+<section>
+  <h2>10. 残っている選択肢</h2>
+  <div class="card">
+    <p><strong>1. 手数料の条件を変える</strong></p>
+    <p>
+      すべての数字がここで決まっています。ただし USDⓈ-M の VIP9（1.7 bps）でも往復 3.4 bps で、
+      10秒の 0.95 bps には届きません。<em>VIP 昇格では短期テイカーは救えません。</em>
+      別の取引所か、メイカーリベートのある場所を探すことになります。
+    </p>
+  </div>
+  <div class="card">
+    <p><strong>2. 保有時間を分〜時間に伸ばす</strong></p>
+    <p>
+      15分と1時間には余地があります。ただしそれは板を見るゲームではなく、
+      資金フローや建玉を見る別の戦略になります。今あるコードの大半は使いません。
+    </p>
+  </div>
+  <div class="card">
+    <p><strong>3. 別の市場で測り直す</strong></p>
+    <p>
+      <code>horizon</code> は銘柄名を変えるだけで数分で答えを出します。
+      作り込む前にこれを通すのが安いやり方です。
+    </p>
+  </div>
+  <div class="card">
+    <p><strong>4. ここで止める</strong></p>
+    <p>
+      3つの独立した測定が、いずれも同じ壁を指しました。手数料の条件が動かないなら、
+      これが最も誠実な選択だと考えています。ただし、それはあなたが決めることです。
+    </p>
+  </div>
+</section>
+
+<footer>
+  ブランチ claude/crypto-jane-street-board-bnf6m1 ／ テスト 325 件すべて通過 ／
+  詳細な数値は SPEC.md、経緯は README.md
+</footer>
+
+</div>
