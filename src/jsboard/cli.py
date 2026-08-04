@@ -673,6 +673,31 @@ async def cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _tick_size_for(symbol: str, product: str, override: str | None) -> tuple[float, str]:
+    """The instrument's real price step, not a default borrowed from BTC.
+
+    Slippage is charged in ticks, so a wrong tick size scales the cost
+    estimate directly — BTCUSDT perp steps by 0.1 and ETHUSDT by 0.01, so a
+    shared default overstates one of them tenfold. It is cheap to ask the
+    venue, and only worth guessing when the venue cannot be reached.
+    """
+    if override is not None:
+        return float(override), "指定値"
+    try:
+        inst = (
+            await fetch_futures_instrument(symbol)
+            if product == "perp"
+            else await fetch_instrument(symbol)
+        )
+        return float(inst.tick_size), "exchangeInfo"
+    except Exception as exc:  # noqa: BLE001 - a guess with a warning beats a crash
+        console.print(
+            f"  [yellow]刻み幅を取得できませんでした（{type(exc).__name__}）。"
+            "0.01 で計算します。--tick-size で上書きできます。[/yellow]"
+        )
+        return 0.01, "推定"
+
+
 def _no_data_hint(symbol: str, product: str, missing: int, total: int) -> None:
     """Say what is actually wrong when nothing downloaded.
 
@@ -739,13 +764,14 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
         return 1
 
     bars.sort(key=lambda b: b.sec)
-    tick_bps = float(args.tick_size) / bars[-1].last * 10_000.0
+    tick, tick_src = await _tick_size_for(args.symbol, args.product, args.tick_size)
+    tick_bps = tick / bars[-1].last * 10_000.0
     cost = round_trip_cost_bps(args.taker_bps, args.slippage_ticks, tick_bps)
 
     console.print(
         f"\n  往復コスト : [bold]{cost:.2f} bps[/bold]  "
-        f"[dim](手数料 {args.taker_bps} × 2 + スリッページ {args.slippage_ticks} tick × 2 "
-        f"= {tick_bps:.4f} bps/tick)[/dim]"
+        f"[dim](手数料 {args.taker_bps} × 2 + スリッページ {args.slippage_ticks} tick × 2、"
+        f"刻み {tick:g}[{tick_src}] = {tick_bps:.4f} bps/tick)[/dim]"
     )
 
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
@@ -861,7 +887,8 @@ async def cmd_predict(args: argparse.Namespace) -> int:
         return 1
     train, test = Series.build(train_bars), Series.build(test_bars)
 
-    tick_bps = float(args.tick_size) / bars[-1].last * 10_000.0
+    tick, _ = await _tick_size_for(args.symbol, args.product, args.tick_size)
+    tick_bps = tick / bars[-1].last * 10_000.0
     cost = round_trip_cost_bps(args.taker_bps, args.slippage_ticks, tick_bps)
     threshold = (
         volatility_threshold(train, args.vol_window, args.vol_quantile)
@@ -1091,7 +1118,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hz.add_argument("--taker-bps", type=float, default=4.5, help="片道テイカー手数料")
     p_hz.add_argument("--slippage-ticks", type=float, default=1.0, help="片道の想定滑り")
-    p_hz.add_argument("--tick-size", default="0.1", help="価格の刻み")
+    p_hz.add_argument("--tick-size", default=None, help="価格の刻み。既定は取引所から取得")
     p_hz.set_defaults(func=cmd_horizon)
 
     p_pr = sub.add_parser("predict", help="信号が手数料を超える的中率に届くか測る")
@@ -1108,7 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--min-samples", type=int, default=200)
     p_pr.add_argument("--taker-bps", type=float, default=4.5)
     p_pr.add_argument("--slippage-ticks", type=float, default=1.0)
-    p_pr.add_argument("--tick-size", default="0.1")
+    p_pr.add_argument("--tick-size", default=None, help="価格の刻み。既定は取引所から取得")
     p_pr.set_defaults(func=cmd_predict)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
