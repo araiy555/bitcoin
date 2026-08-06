@@ -319,6 +319,10 @@ def summarise(results: list[SymbolStats], filters: ScanFilters) -> dict:
         "liquid": len(results),
         "viable": len(viable),
         "tradeable": len(tradeable),
+        # The placeable symbols are the answer, and ranking by edge buries
+        # them: a wide spread nobody can reach outranks a narrow one that is
+        # actually workable. Carry them out by name rather than as a count.
+        "placeable": tradeable,
         "too_deep": sum(1 for s in viable if verdict(s) == "行列が長い"),
         "too_thin": sum(1 for s in viable if verdict(s) == "板が薄い"),
         "best_net_bps": viable[0].net_bps(filters.maker_bps) if viable else 0.0,

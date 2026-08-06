@@ -556,6 +556,35 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             f"1回の観測では判定できません。[/yellow]"
         )
 
+    # Above, symbols are ranked by edge, which pushes the workable ones off
+    # the list — a 22bps spread nobody can reach outranks an 11bps one that
+    # is actually placeable. These are the only rows worth acting on.
+    placeable = stats.get("placeable") or []
+    if placeable:
+        console.print(f"\n  [bold green]注文が置ける {len(placeable)} 件[/bold green]")
+        good = Table(box=None, header_style="bold dim", padding=(0, 1))
+        good.add_column("symbol", style="cyan")
+        for label in ("spread\n(bps)", "net\n(bps)", "板の厚み", "行列/自分", "板のぶれ"):
+            good.add_column(label, justify="right")
+        good.add_column("24h出来高", justify="right")
+        for s_ in sorted(
+            placeable, key=lambda x: x.net_bps(filters.maker_bps), reverse=True
+        ):
+            good.add_row(
+                s_.symbol,
+                f"{s_.spread_bps:,.2f}",
+                f"[green]{s_.net_bps(filters.maker_bps):+,.2f}[/green]",
+                f"{s_.top_of_book_quote:,.0f}",
+                f"{s_.queue_ratio(filters.size_quote):,.1f}x",
+                _swing_cell(s_.depth_swing),
+                f"{s_.quote_volume:,.0f}",
+            )
+        console.print(good)
+        console.print(
+            "  [dim]この一覧は1回の観測です。数分で反転することが実測されているので、\n"
+            "  watch で持続率を測るまで採用しないでください。[/dim]"
+        )
+
     if stats["viable"] == 0:
         console.print(
             "\n  [yellow]この手数料でスプレッドを超える銘柄はありません。[/yellow]\n"

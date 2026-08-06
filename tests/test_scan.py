@@ -548,3 +548,35 @@ class TestProduct:
 
         with pytest.raises(ValueError, match="product"):
             asyncio.run(fetch_market(product="options"))
+
+
+class TestPlaceableAreNamed:
+    """Ranking by edge buries the workable symbols: a wide spread nobody can
+    reach outranks a narrow one that is actually placeable."""
+
+    def test_the_summary_carries_the_placeable_symbols_by_name(self):
+        filters = ScanFilters(maker_bps=2.0, size_quote=1_000.0)
+        reachable = stats("OPUSDT", bid=1.0, ask=1.00115, bid_qty=17_461, ask_qty=17_461)
+        unreachable = stats("THINUSDT", bid=1.0, ask=1.0023, bid_qty=200, ask_qty=200)
+
+        got = summarise([reachable, unreachable], filters)
+
+        names = [s.symbol for s in got["placeable"]]
+        assert "OPUSDT" in names
+        assert "THINUSDT" not in names
+
+    def test_the_count_and_the_list_agree(self):
+        filters = ScanFilters(maker_bps=2.0, size_quote=1_000.0)
+        rows = [
+            stats("AUSDT", bid=1.0, ask=1.00115, bid_qty=17_461, ask_qty=17_461),
+            stats("BUSDT", bid=1.0, ask=1.0009, bid_qty=20_000, ask_qty=20_000),
+        ]
+
+        got = summarise(rows, filters)
+
+        assert got["tradeable"] == len(got["placeable"])
+
+    def test_an_empty_market_yields_an_empty_list(self):
+        got = summarise([], ScanFilters())
+
+        assert got["placeable"] == []
