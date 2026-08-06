@@ -1113,54 +1113,57 @@ async def cmd_events(args: argparse.Namespace) -> int:
         )
     )
 
+    # Every condition is simulated long. A short on the same moments is the
+    # exact mirror, so `|mean_gross| - cost` already says what the better
+    # direction could do — running both to keep the less bad one would answer
+    # nothing and double the chance of picking a winner by luck.
     verdicts = []
-    for name, (direction, specs) in EVENT_CONDITIONS.items():
+    for name, (_direction, specs) in EVENT_CONDITIONS.items():
         cond = combine(*(threshold(f, op, v) for f, op, v in specs)) if specs else (
             lambda f: True
         )
         trades = simulate(
             rows, perp_secs, cond,
-            direction=direction, horizon_min=args.horizon, cost_bps=cost,
+            direction=1, horizon_min=args.horizon, cost_bps=cost,
             target_bps=args.target, stop_bps=args.stop,
         )
-        verdicts.append((score(name, trades), direction))
+        verdicts.append(score(name, trades))
 
-    verdicts.sort(key=lambda row: (row[0].trades > 0, row[0].mean_net_bps), reverse=True)
+    verdicts.sort(
+        key=lambda v: (v.trades > 0, v.best_direction_net_bps), reverse=True
+    )
 
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
     table.add_column("条件", style="cyan")
-    table.add_column("向き", justify="center")
     for label in (
-        "件数", "変動幅\n(bps)", "平均\n(bps)", "中央値", "勝率", "PF",
-        "最大DD", "上位10除く", "手数料1.5倍",
+        "件数", "変動幅", "方向性", "最良方向\nの純益", "上位10除く", "手数料1.5倍",
     ):
         table.add_column(label, justify="right")
+    table.add_column("向き", justify="center")
     table.add_column("判定")
 
-    for v, direction in verdicts:
+    for v in verdicts:
         if v.trades == 0:
-            table.add_row(v.name, "—", "0", *["—"] * 8, "[dim]該当なし[/dim]")
+            table.add_row(v.name, "0", *["—"] * 5, "—", "[dim]該当なし[/dim]")
             continue
-        colour = "green" if v.mean_net_bps > 0 else "red"
+        best = v.best_direction_net_bps
+        colour = "green" if best > 0 else "red"
         table.add_row(
             v.name,
-            "買" if direction > 0 else "売",
             f"{v.trades:,}",
             f"{v.mean_abs_move_bps:.1f}",
-            f"[{colour}]{v.mean_net_bps:+.1f}[/{colour}]",
-            f"{v.median_net_bps:+.1f}",
-            f"{v.win_rate:.0%}",
-            f"{v.profit_factor:.2f}" if v.profit_factor != float("inf") else "∞",
-            f"{v.max_drawdown_bps:,.0f}",
+            f"{v.mean_gross_bps:+.2f}",
+            f"[{colour}]{best:+.2f}[/{colour}]",
             f"{v.mean_without_top10_bps:+.1f}",
             f"{v.mean_at_15x_cost_bps:+.1f}",
+            "買" if v.implied_direction > 0 else "売",
             "[green]合格[/green]" if v.passes else f"[dim]{v.failures()[0]}[/dim]",
         )
 
     console.print()
     console.print(table)
 
-    passed = [v for v, _ in verdicts if v.passes]
+    passed = [v for v in verdicts if v.passes]
     console.print()
     if passed:
         console.print(
@@ -1176,11 +1179,14 @@ async def cmd_events(args: argparse.Namespace) -> int:
             "  平均は黒字だが上位10件を除くと赤なら、少数の大当たりに乗っただけです。[/dim]"
         )
     console.print(
-        "\n  [dim]「変動幅」は方向を無視した平均の値幅です。ここが往復コストを\n"
-        "  下回っていれば、方向を完璧に当てても勝てません（場面選びの失敗）。\n"
-        "  上回っているのに損なら、場面は選べていて方向を外しています。\n"
-        "  板の特徴量（板の偏り・キャンセル・microprice）は未計測です。\n"
-        "  過去データの板は1分毎±1〜5%と粗すぎるため、capture の記録が要ります。[/dim]"
+        f"\n  [dim]「変動幅」は方向を無視した平均の値幅。ここが {cost:.1f} bps を\n"
+        "  下回れば、方向を完璧に当てても勝てません（場面選びの失敗）。\n\n"
+        "  「方向性」は符号付きの平均。同じ場面で買いと売りは鏡像なので、\n"
+        f"  どちらか良いほうでも [bold]|方向性| − {cost:.1f}[/bold] が上限です。\n"
+        "  ここが小さければ、条件は方向の情報を持っていません。\n"
+        "  買いが−10で売りが−8、という並びは「売りのほうがマシ」ではなく\n"
+        "  「情報がゼロで、差は相場のドリフト」という意味です。\n\n"
+        "  板の特徴量（板の偏り・キャンセル・microprice）は未計測です。[/dim]"
     )
     console.rule()
     return 0

@@ -197,6 +197,22 @@ class Verdict:
     mean_at_15x_cost_bps: float
     months_positive: int
     months_total: int
+    mean_gross_bps: float = 0.0
+    """Average *signed* move, before costs, as taken.
+
+    This is the whole answer, and it is separate from the size of the move.
+    For one set of entry moments a long and a short are exact mirrors: the
+    long nets `g − cost` and the short nets `−g − cost`, so the best either
+    direction can do is `|g| − cost`. A condition where long loses 10 and
+    short loses 8 has `|g| = 1` and carries no directional information at
+    all — the gap is the market's drift, not a signal.
+
+    So the test is `|mean_gross| > cost`, and running both directions to see
+    which is less bad answers nothing while doubling the chances of picking a
+    winner by luck.
+    """
+
+    cost_bps: float = 0.0
     mean_abs_move_bps: float = 0.0
     """Average size of the move, direction ignored.
 
@@ -206,6 +222,19 @@ class Verdict:
     amount of directional skill would have helped. The two failures need
     opposite fixes and the net figure alone cannot tell them apart.
     """
+
+    @property
+    def best_direction_net_bps(self) -> float:
+        """What the better of long and short would net per trade.
+
+        `|g| − cost`. Negative means neither direction covers the fee on
+        these moments, however the entries were chosen.
+        """
+        return abs(self.mean_gross_bps) - self.cost_bps
+
+    @property
+    def implied_direction(self) -> int:
+        return 1 if self.mean_gross_bps >= 0 else -1
 
     @property
     def passes(self) -> bool:
@@ -252,7 +281,7 @@ def _month_of(minute: int) -> str:
 
 def score(name: str, trades: list[Trade]) -> Verdict:
     if not trades:
-        return Verdict(name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+        return Verdict(name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0)
 
     nets = [t.net_bps for t in trades]
     wins = [n for n in nets if n > 0]
@@ -278,7 +307,9 @@ def score(name: str, trades: list[Trade]) -> Verdict:
 
     return Verdict(
         name=name,
+        mean_gross_bps=sum(t.gross_bps for t in trades) / len(trades),
         mean_abs_move_bps=sum(abs(t.gross_bps) for t in trades) / len(trades),
+        cost_bps=trades[0].cost_bps,
         trades=len(trades),
         mean_net_bps=sum(nets) / len(nets),
         median_net_bps=ordered[len(ordered) // 2],

@@ -12,6 +12,7 @@ import pytest
 
 from jsboard.research.archive import SecondBar
 from jsboard.research.events import (
+    Trade,
     combine,
     score,
     simulate,
@@ -387,3 +388,55 @@ class TestConditions:
 
         assert both(f)
         assert not neither(f)
+
+
+class TestDirectionalInformation:
+    """A long and a short on the same moments are mirrors, so the size of the
+    signed move — not which direction lost less — is what carries meaning."""
+
+    def test_long_and_short_are_exact_mirrors_before_cost(self):
+        long_v = score("x", fake_trades([20.0, -10.0, 5.0], cost=9.0))
+        shorts = [
+            Trade(
+                entry_minute=t.entry_minute, exit_minute=t.exit_minute,
+                entry_price=t.entry_price, exit_price=t.exit_price,
+                direction=-1, cost_bps=t.cost_bps, reason=t.reason,
+            )
+            for t in fake_trades([20.0, -10.0, 5.0], cost=9.0)
+        ]
+        short_v = score("x", shorts)
+
+        assert short_v.mean_gross_bps == pytest.approx(-long_v.mean_gross_bps)
+        # Both pay the fee, so the two nets sum to minus twice the cost.
+        assert long_v.mean_net_bps + short_v.mean_net_bps == pytest.approx(-18.0)
+
+    def test_the_best_direction_still_loses_when_the_drift_is_small(self):
+        # The measured shape: long nets -10.1 at a 9.03 fee, so the signed
+        # move is -1.07 and a short would net -7.96. Neither covers the fee,
+        # and the gap between them is drift rather than information.
+        v = score("x", fake_trades([-10.1] * 50, cost=9.03))
+
+        assert abs(v.mean_gross_bps) < 2.0
+        assert v.best_direction_net_bps < 0
+
+    def test_a_real_directional_edge_shows_up_in_the_signed_mean(self):
+        v = score("x", fake_trades([21.0] * 50, cost=9.0))
+
+        assert v.mean_gross_bps == pytest.approx(30.0, rel=1e-3)
+        assert v.best_direction_net_bps == pytest.approx(21.0, rel=1e-3)
+
+    def test_the_implied_direction_follows_the_sign(self):
+        up = score("x", fake_trades([21.0] * 20, cost=9.0))
+        down = score("x", fake_trades([-30.0] * 20, cost=9.0))
+
+        assert up.implied_direction == 1
+        assert down.implied_direction == -1
+
+    def test_size_without_direction_is_not_an_edge(self):
+        # Big moves, no net direction: the classic "we found the moments and
+        # cannot call them" result.
+        v = score("x", fake_trades([40.0 - 9.0, -40.0 - 9.0] * 25, cost=9.0))
+
+        assert v.mean_abs_move_bps > 30.0
+        assert abs(v.mean_gross_bps) < 1.0
+        assert v.best_direction_net_bps < 0
