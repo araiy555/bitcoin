@@ -41,6 +41,8 @@ from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
 from .research.archive import days_ending, fetch_day, load_seconds
+from .research.events import combine, score, simulate, threshold
+from .research.features import attach_open_interest, build, load_open_interest, to_minutes
 from .research.horizon import analyse, round_trip_cost_bps
 from .research.predict import (
     Series,
@@ -991,6 +993,186 @@ async def cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+# Conditions are named after what they claim is happening, not after their
+# thresholds, so the ranking reads as a list of hypotheses.
+EVENT_CONDITIONS: dict[str, tuple[int, list[tuple[str, str, float]]]] = {
+    # --- 1. futures-led breakout ------------------------------------------
+    "出来高急増": (1, [("volume_z", ">", 2.0)]),
+    "成行買い優勢": (1, [("perp_buy_ratio", ">", 0.65)]),
+    "先物先行(上)": (1, [("futures_lead_bps", ">", 3.0)]),
+    "OI増加": (1, [("oi_change_5m", ">", 0.3)]),
+    "出来高＋買いフロー": (
+        1, [("volume_z", ">", 2.0), ("perp_buy_ratio", ">", 0.65)]
+    ),
+    "出来高＋OI増加": (1, [("volume_z", ">", 2.0), ("oi_change_5m", ">", 0.3)]),
+    "先物先行＋買いフロー": (
+        1, [("futures_lead_bps", ">", 3.0), ("perp_buy_ratio", ">", 0.65)]
+    ),
+    "出来高＋先物先行＋OI増加": (
+        1,
+        [
+            ("volume_z", ">", 2.0),
+            ("futures_lead_bps", ">", 3.0),
+            ("oi_change_5m", ">", 0.3),
+        ],
+    ),
+    # --- 2. capitulation and reversal -------------------------------------
+    "急落＋OI急減": (
+        1, [("perp_ret_5m", "<", -30.0), ("oi_change_5m", "<", -0.3)]
+    ),
+    "急落＋売り枯れ": (
+        1, [("perp_ret_5m", "<", -30.0), ("perp_buy_ratio", ">", 0.5)]
+    ),
+    "急落＋OI急減＋売り枯れ": (
+        1,
+        [
+            ("perp_ret_5m", "<", -30.0),
+            ("oi_change_5m", "<", -0.3),
+            ("perp_buy_ratio", ">", 0.5),
+        ],
+    ),
+    # --- 3. basis mean reversion ------------------------------------------
+    "ベーシス過熱(売り)": (-1, [("basis_z", ">", 2.0)]),
+    "ベーシス過冷(買い)": (1, [("basis_z", "<", -2.0)]),
+    "ベーシス過熱＋フロー反転": (
+        -1, [("basis_z", ">", 2.0), ("perp_buy_ratio", "<", 0.5)]
+    ),
+    "ベーシス過冷＋フロー反転": (
+        1, [("basis_z", "<", -2.0), ("perp_buy_ratio", ">", 0.5)]
+    ),
+    # --- controls ----------------------------------------------------------
+    "常時ロング(基準)": (1, []),
+    "高ボラのみ": (1, [("volatility_z", ">", 2.0)]),
+}
+
+
+async def cmd_events(args: argparse.Namespace) -> int:
+    """Rank conditions by net money, with every acceptance gate shown."""
+    last = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=2)
+    wanted = days_ending(last, args.days)
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} — 条件別の純損益")
+    console.print(
+        f"  対象   : {wanted[0]} 〜 {wanted[-1]}（{len(wanted)}日）  "
+        f"保有 {args.horizon}分\n"
+        "  [dim]的中率ではなく手数料込みの純損益で並べます。\n"
+        "  重複する取引は数えません（1時間保有の60分ぶんは60件ではなく1件）。[/dim]\n"
+    )
+
+    spot_secs: list = []
+    perp_secs: list = []
+    oi_marks: list = []
+    session = make_session()
+    try:
+        for day in wanted:
+            perp_path = await fetch_day("perp", "aggTrades", args.symbol, day, session=session)
+            spot_path = await fetch_day("spot", "aggTrades", args.symbol, day, session=session)
+            if perp_path is None or spot_path is None:
+                console.print(f"  [yellow]{day} は片側が欠けています[/yellow]")
+                continue
+            perp_secs.extend(load_seconds(perp_path))
+            spot_secs.extend(load_seconds(spot_path))
+            metrics = await fetch_day("perp", "metrics", args.symbol, day, session=session)
+            if metrics is not None:
+                oi_marks.extend(load_open_interest(metrics))
+            console.print(f"  [dim]{day}[/dim]")
+    finally:
+        await session.close()
+
+    if not perp_secs or not spot_secs:
+        _no_data_hint(args.symbol, "perp", len(wanted), len(wanted))
+        return 1
+
+    perp_secs.sort(key=lambda b: b.sec)
+    spot_secs.sort(key=lambda b: b.sec)
+    oi_marks.sort()
+
+    bars = to_minutes(spot_secs, perp_secs)
+    attach_open_interest(bars, oi_marks)
+    rows = build(bars, z_window=args.z_window)
+    if not rows:
+        console.print("[red]両方の製品が揃った分が足りません。[/red]")
+        return 1
+
+    tick, _ = await _tick_size_for(args.symbol, "perp", args.tick_size)
+    tick_bps = tick / perp_secs[-1].last * 10_000.0
+    cost = round_trip_cost_bps(args.taker_bps, args.slippage_ticks, tick_bps)
+
+    console.print(
+        f"\n  分足 {len(rows):,} 本   往復コスト [bold]{cost:.2f} bps[/bold]"
+        + (
+            f"   利確 +{args.target}bps / 損切 −{args.stop}bps"
+            if args.target and args.stop
+            else "   利確・損切なし（時間で手仕舞い）"
+        )
+    )
+
+    verdicts = []
+    for name, (direction, specs) in EVENT_CONDITIONS.items():
+        cond = combine(*(threshold(f, op, v) for f, op, v in specs)) if specs else (
+            lambda f: True
+        )
+        trades = simulate(
+            rows, perp_secs, cond,
+            direction=direction, horizon_min=args.horizon, cost_bps=cost,
+            target_bps=args.target, stop_bps=args.stop,
+        )
+        verdicts.append((score(name, trades), direction))
+
+    verdicts.sort(key=lambda row: (row[0].trades > 0, row[0].mean_net_bps), reverse=True)
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("条件", style="cyan")
+    table.add_column("向き", justify="center")
+    for label in ("件数", "平均\n(bps)", "中央値", "勝率", "PF", "最大DD", "上位10除く", "手数料1.5倍"):
+        table.add_column(label, justify="right")
+    table.add_column("判定")
+
+    for v, direction in verdicts:
+        if v.trades == 0:
+            table.add_row(v.name, "—", "0", *["—"] * 7, "[dim]該当なし[/dim]")
+            continue
+        colour = "green" if v.mean_net_bps > 0 else "red"
+        table.add_row(
+            v.name,
+            "買" if direction > 0 else "売",
+            f"{v.trades:,}",
+            f"[{colour}]{v.mean_net_bps:+.1f}[/{colour}]",
+            f"{v.median_net_bps:+.1f}",
+            f"{v.win_rate:.0%}",
+            f"{v.profit_factor:.2f}" if v.profit_factor != float("inf") else "∞",
+            f"{v.max_drawdown_bps:,.0f}",
+            f"{v.mean_without_top10_bps:+.1f}",
+            f"{v.mean_at_15x_cost_bps:+.1f}",
+            "[green]合格[/green]" if v.passes else f"[dim]{v.failures()[0]}[/dim]",
+        )
+
+    console.print()
+    console.print(table)
+
+    passed = [v for v, _ in verdicts if v.passes]
+    console.print()
+    if passed:
+        console.print(
+            f"  [green]全基準を満たした条件: {len(passed)}件[/green] — "
+            + "、".join(v.name for v in passed)
+            + "\n  [dim]ただしこれは選定と検証が同じ期間です。別期間で再現するまで\n"
+            "  採用しないでください。[/dim]"
+        )
+    else:
+        console.print(
+            "  [yellow]全基準を満たした条件はありません。[/yellow]\n"
+            "  [dim]「判定」列は最初に落ちた基準を示します。件数不足なら閾値を緩め、\n"
+            "  平均は黒字だが上位10件を除くと赤なら、少数の大当たりに乗っただけです。[/dim]"
+        )
+    console.print(
+        "\n  [dim]板の特徴量（板の偏り・キャンセル・microprice）はこの表に含まれません。\n"
+        "  過去データの板は1分毎±1〜5%と粗すぎるため、capture の記録が要ります。[/dim]"
+    )
+    console.rule()
+    return 0
+
+
 def _spec_dict(inst: Instrument, market: str) -> dict:
     return {
         "symbol": inst.symbol,
@@ -1137,6 +1319,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--slippage-ticks", type=float, default=1.0)
     p_pr.add_argument("--tick-size", default=None, help="価格の刻み。既定は取引所から取得")
     p_pr.set_defaults(func=cmd_predict)
+
+    p_ev = sub.add_parser("events", help="条件別の純損益を並べる")
+    p_ev.add_argument("--symbol", default="BTCUSDT")
+    p_ev.add_argument("--days", type=int, default=14)
+    p_ev.add_argument("--end", default=None, help="最終日 YYYY-MM-DD")
+    p_ev.add_argument("--horizon", type=int, default=30, help="保有分数")
+    p_ev.add_argument("--target", type=float, default=None, help="利確 bps")
+    p_ev.add_argument("--stop", type=float, default=None, help="損切 bps")
+    p_ev.add_argument("--z-window", type=int, default=1440, help="z値の観測窓（分）")
+    p_ev.add_argument("--taker-bps", type=float, default=4.5)
+    p_ev.add_argument("--slippage-ticks", type=float, default=1.0)
+    p_ev.add_argument("--tick-size", default=None)
+    p_ev.set_defaults(func=cmd_events)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")
