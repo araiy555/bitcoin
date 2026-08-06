@@ -32,9 +32,27 @@ import aiohttp
 
 from ..net import make_session
 
-REST_BASE = "https://api.binance.com"
-BOOK_TICKER = "/api/v3/ticker/bookTicker"
-DAY_TICKER = "/api/v3/ticker/24hr"
+# Spot and USDⓈ-M futures answer the same two questions at different hosts
+# and paths. Keeping them side by side rather than behind a flag deep in the
+# code makes it obvious which market a result came from — and the fee that
+# applies differs between them by roughly a factor of five, which is the
+# whole reason for scanning the second one.
+VENUES = {
+    "spot": (
+        "https://api.binance.com",
+        "/api/v3/ticker/bookTicker",
+        "/api/v3/ticker/24hr",
+    ),
+    "perp": (
+        "https://fapi.binance.com",
+        "/fapi/v1/ticker/bookTicker",
+        "/fapi/v1/ticker/24hr",
+    ),
+}
+
+REST_BASE = VENUES["spot"][0]
+BOOK_TICKER = VENUES["spot"][1]
+DAY_TICKER = VENUES["spot"][2]
 
 
 @dataclass(slots=True)
@@ -141,6 +159,9 @@ class SymbolStats:
 @dataclass(slots=True)
 class ScanFilters:
     quote_asset: str = "USDT"
+    product: str = "spot"
+    """Which market to look at. The maker fee differs between them, and a
+    spot fee applied to a futures book answers a question nobody asked."""
     maker_bps: float = 10.0
     min_quote_volume: float = 1_000_000.0
     min_trades: int = 1_000
@@ -210,9 +231,9 @@ def rank(candidates: list[SymbolStats], maker_bps: float) -> list[SymbolStats]:
     return sorted(candidates, key=lambda s: s.net_bps(maker_bps), reverse=True)
 
 
-async def _get_json(session, path):
+async def _get_json(session, path, base=REST_BASE):
     timeout = aiohttp.ClientTimeout(total=30)
-    async with session.get(REST_BASE + path, timeout=timeout) as resp:
+    async with session.get(base + path, timeout=timeout) as resp:
         resp.raise_for_status()
         return await resp.json()
 
@@ -233,17 +254,22 @@ async def fetch_market(
     samples: int = 1,
     interval: float = 2.0,
     on_sample=None,
+    product: str = "spot",
 ) -> dict[str, SymbolStats]:
-    """The whole spot market, optionally sampled several times.
+    """The whole market for one product, optionally sampled several times.
 
     Volume and trade counts come from a single 24h call; only the touch is
     re-polled, since that is the part that moves between one look and the next.
     """
+    if product not in VENUES:
+        raise ValueError(f"product must be one of {tuple(VENUES)}")
+    base, book_path, day_path = VENUES[product]
+
     owns = session is None
     session = session or make_session()
     try:
-        book_rows = await _get_json(session, BOOK_TICKER)
-        day_rows = await _get_json(session, DAY_TICKER)
+        book_rows = await _get_json(session, book_path, base)
+        day_rows = await _get_json(session, day_path, base)
         book = merge_day_tickers(parse_book_tickers(book_rows), day_rows)
 
         add_sample(book, book_rows)
@@ -252,7 +278,7 @@ async def fetch_market(
 
         for i in range(1, max(1, samples)):
             await asyncio.sleep(interval)
-            add_sample(book, await _get_json(session, BOOK_TICKER))
+            add_sample(book, await _get_json(session, book_path, base))
             if on_sample:
                 on_sample(i + 1, samples)
     finally:
@@ -265,7 +291,10 @@ async def fetch_market(
 async def scan(filters: ScanFilters, *, on_sample=None) -> tuple[list[SymbolStats], int]:
     """Returns (ranked survivors, how many symbols were considered)."""
     market = await fetch_market(
-        samples=filters.samples, interval=filters.sample_interval, on_sample=on_sample
+        samples=filters.samples,
+        interval=filters.sample_interval,
+        on_sample=on_sample,
+        product=filters.product,
     )
     considered = sum(
         1

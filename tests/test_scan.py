@@ -521,3 +521,30 @@ class TestPersistence:
         tally["BTCUSDT"].total_rounds = 1
 
         assert tally["BTCUSDT"].breakeven_fee_bps(0.0) < 0.01
+
+
+class TestProduct:
+    """Spot and perp are different books with different fees. A spot fee
+    applied to a futures book answers a question nobody asked."""
+
+    def test_the_two_venues_use_different_hosts_and_paths(self):
+        from jsboard.research.scan import VENUES
+
+        spot_base, spot_book, spot_day = VENUES["spot"]
+        perp_base, perp_book, perp_day = VENUES["perp"]
+
+        assert "api.binance.com" in spot_base
+        assert "fapi.binance.com" in perp_base
+        assert spot_book != perp_book
+        assert spot_day != perp_day
+
+    def test_the_default_product_is_spot(self):
+        assert ScanFilters().product == "spot"
+
+    def test_an_unknown_product_is_refused(self):
+        import asyncio
+
+        from jsboard.research.scan import fetch_market
+
+        with pytest.raises(ValueError, match="product"):
+            asyncio.run(fetch_market(product="options"))

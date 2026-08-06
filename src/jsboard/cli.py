@@ -456,6 +456,7 @@ async def cmd_watch(args: argparse.Namespace) -> int:
 def _scan_filters(args: argparse.Namespace) -> ScanFilters:
     return ScanFilters(
         quote_asset=args.quote.upper(),
+        product=args.product,
         maker_bps=args.maker_bps,
         min_quote_volume=args.min_volume,
         min_trades=args.min_trades,
@@ -1247,6 +1248,10 @@ def add_common(p: argparse.ArgumentParser) -> None:
 def add_scan_args(p: argparse.ArgumentParser) -> None:
     """Arguments shared by `scan` and `watch` — watch is scan, repeated."""
     p.add_argument("--quote", default="USDT", help="建て通貨")
+    p.add_argument(
+        "--product", default="spot", choices=("spot", "perp"),
+        help="どちらの板を見るか。先物はメイカー手数料が現物より低い",
+    )
     p.add_argument("--maker-bps", type=float, default=10.0, help="自分のメイカー手数料")
     p.add_argument("--min-volume", type=float, default=1_000_000.0, help="24h出来高の下限")
     p.add_argument("--min-trades", type=int, default=1_000, help="24h約定数の下限")
