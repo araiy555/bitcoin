@@ -253,25 +253,48 @@ async def cmd_sim(args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_live(args: argparse.Namespace) -> int:
+async def _market_feed(args: argparse.Namespace) -> tuple[Instrument, Feed]:
+    """The instrument and its live feed, for whichever product was asked for.
+
+    Spot and perp differ in tick and lot for the same ticker — BTCUSDT steps
+    by 0.01 on spot and 0.1 on the perp — so the spec has to come from the
+    matching exchangeInfo. Quoting a perp against spot's tick would place
+    every order at a price the venue rejects.
+    """
+    perp = getattr(args, "product", "spot") == "perp"
     try:
-        instrument = await fetch_instrument(args.symbol)
+        instrument = (
+            await fetch_futures_instrument(args.symbol)
+            if perp
+            else await fetch_instrument(args.symbol)
+        )
         console.print(
-            f"[dim]exchangeInfo: tick={instrument.tick_size} lot={instrument.lot_size}[/dim]"
+            f"[dim]{'perp' if perp else 'spot'} exchangeInfo: "
+            f"tick={instrument.tick_size} lot={instrument.lot_size}[/dim]"
         )
     except Exception as exc:  # noqa: BLE001
+        if perp:
+            # No built-in perp specs exist, and spot's would be wrong. Better
+            # to stop than to quote against a tick size from the other book.
+            raise
         console.print(f"[yellow]exchangeInfo unavailable ({exc}); using built-in spec[/yellow]")
         instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
 
-    feed = BinanceFeed(instrument, depth_ms=args.depth_ms)
+    if perp:
+        depth_ms = args.depth_ms if args.depth_ms in (100, 250, 500) else 100
+        return instrument, BinanceFuturesFeed(instrument, depth_ms=depth_ms)
+    return instrument, BinanceFeed(instrument, depth_ms=args.depth_ms)
+
+
+async def cmd_live(args: argparse.Namespace) -> int:
+    instrument, feed = await _market_feed(args)
     mm = build_maker(instrument, args)
     await drive(feed, mm, args, headless=args.headless)
     return 0
 
 
 async def cmd_record(args: argparse.Namespace) -> int:
-    instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
-    feed = BinanceFeed(instrument, depth_ms=args.depth_ms)
+    instrument, feed = await _market_feed(args)
     out = Path(args.out)
     count = 0
 
@@ -1310,13 +1333,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_live = sub.add_parser("live", help="live Binance depth, paper fills")
     add_common(p_live)
-    p_live.add_argument("--depth-ms", type=int, default=100, choices=(100, 1000))
+    p_live.add_argument(
+        "--product", default="spot", choices=("spot", "perp"),
+        help="どちらの板で動かすか",
+    )
+    p_live.add_argument(
+        "--depth-ms", type=int, default=100, choices=(100, 250, 500, 1000),
+        help="現物は100/1000、先物は100/250/500",
+    )
     p_live.set_defaults(func=cmd_live)
 
     p_rec = sub.add_parser("record", help="capture a live session to JSONL")
     add_common(p_rec)
     p_rec.add_argument("--out", required=True)
-    p_rec.add_argument("--depth-ms", type=int, default=100, choices=(100, 1000))
+    p_rec.add_argument(
+        "--product", default="spot", choices=("spot", "perp"),
+        help="どちらの板で動かすか",
+    )
+    p_rec.add_argument(
+        "--depth-ms", type=int, default=100, choices=(100, 250, 500, 1000),
+        help="現物は100/1000、先物は100/250/500",
+    )
     p_rec.set_defaults(func=cmd_record)
 
     p_rep = sub.add_parser("replay", help="replay a capture")

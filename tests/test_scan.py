@@ -580,3 +580,39 @@ class TestPlaceableAreNamed:
         got = summarise([], ScanFilters())
 
         assert got["placeable"] == []
+
+
+class TestLiveProductRouting:
+    """Spot and perp differ in tick and lot for the same ticker. Quoting a
+    perp against spot's tick places every order at a price the venue
+    rejects, so the spec has to come from the matching exchangeInfo."""
+
+    def test_spot_and_perp_specs_differ_for_the_same_ticker(self):
+        from decimal import Decimal
+
+        from jsboard.core.types import Instrument
+
+        spot = Instrument("BTCUSDT", tick_size=Decimal("0.01"), lot_size=Decimal("0.00001"))
+        perp = Instrument("BTCUSDT", tick_size=Decimal("0.1"), lot_size=Decimal("0.001"))
+
+        assert spot.tick_size != perp.tick_size
+        assert spot.to_ticks("64000.05") != perp.to_ticks("64000.05")
+
+    async def test_a_perp_run_refuses_to_fall_back_to_a_built_in_spec(self, monkeypatch):
+        # The built-in specs are spot's. Falling back to them on the perp
+        # would look like a successful start and quote at rejected prices.
+        import argparse
+
+        from jsboard import cli
+
+        async def unavailable(_symbol):
+            raise RuntimeError("exchangeInfo down")
+
+        monkeypatch.setattr(cli, "fetch_futures_instrument", unavailable)
+        args = argparse.Namespace(
+            symbol="BTCUSDT", product="perp", depth_ms=100,
+            tick_size=None, lot_size=None,
+        )
+
+        with pytest.raises(RuntimeError, match="exchangeInfo"):
+            await cli._market_feed(args)
