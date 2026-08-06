@@ -197,6 +197,15 @@ class Verdict:
     mean_at_15x_cost_bps: float
     months_positive: int
     months_total: int
+    mean_abs_move_bps: float = 0.0
+    """Average size of the move, direction ignored.
+
+    The single most useful diagnostic when a rule loses. A rule whose moves
+    average 30bps against a 9bps cost found the right moments and called the
+    direction wrong; one whose moves average 6bps never found them, and no
+    amount of directional skill would have helped. The two failures need
+    opposite fixes and the net figure alone cannot tell them apart.
+    """
 
     @property
     def passes(self) -> bool:
@@ -243,7 +252,7 @@ def _month_of(minute: int) -> str:
 
 def score(name: str, trades: list[Trade]) -> Verdict:
     if not trades:
-        return Verdict(name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return Verdict(name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
 
     nets = [t.net_bps for t in trades]
     wins = [n for n in nets if n > 0]
@@ -269,6 +278,7 @@ def score(name: str, trades: list[Trade]) -> Verdict:
 
     return Verdict(
         name=name,
+        mean_abs_move_bps=sum(abs(t.gross_bps) for t in trades) / len(trades),
         trades=len(trades),
         mean_net_bps=sum(nets) / len(nets),
         median_net_bps=ordered[len(ordered) // 2],

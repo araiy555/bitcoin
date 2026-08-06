@@ -197,6 +197,11 @@ class Features:
     basis_bps: float = 0.0
     basis_z: float = 0.0
     futures_lead_bps: float = 0.0
+    # Thresholds on the raw value have to be guessed, and a guessed absolute
+    # is how a condition ends up never firing — spot and perp do not diverge
+    # by whole basis points in a minute on BTC. The z-score says "unusual for
+    # this market lately", which is what the condition actually means.
+    futures_lead_z: float = 0.0
 
     volume_z: float = 0.0
     trade_count_z: float = 0.0
@@ -204,6 +209,7 @@ class Features:
 
     oi_change_1m: float = 0.0
     oi_change_5m: float = 0.0
+    oi_change_z: float = 0.0
 
     # Reserved for a live capture recording; the archive cannot supply these.
     book_imbalance_5: float = field(default=math.nan)
@@ -257,6 +263,8 @@ def build(bars: list[MinuteBar], *, z_window: int = 1440) -> list[Features]:
 
     # Per-minute absolute move, as the raw material for the volatility score.
     moves = [0.0] + [abs(ret(perp, i, 1)) for i in range(1, len(bars))]
+    leads = [ret(perp, i, 1) - ret(spot, i, 1) for i in range(len(bars))]
+    oi_moves = [_pct_change(oi, i, 5) for i in range(len(bars))]
 
     out: list[Features] = []
     for i, bar in enumerate(bars):
@@ -278,11 +286,13 @@ def build(bars: list[MinuteBar], *, z_window: int = 1440) -> list[Features]:
                 # moved this minute. A real lead needs sub-second alignment,
                 # which is what a live capture is for.
                 futures_lead_bps=perp_1m - spot_1m,
+                futures_lead_z=_z(leads, i, z_window),
                 volume_z=_z(volume, i, z_window),
                 trade_count_z=_z(counts, i, z_window),
                 volatility_z=_z(moves, i, z_window),
                 oi_change_1m=_pct_change(oi, i, 1),
                 oi_change_5m=_pct_change(oi, i, 5),
+                oi_change_z=_z(oi_moves, i, z_window),
             )
         )
     return out

@@ -996,53 +996,59 @@ async def cmd_predict(args: argparse.Namespace) -> int:
 # Conditions are named after what they claim is happening, not after their
 # thresholds, so the ranking reads as a list of hypotheses.
 EVENT_CONDITIONS: dict[str, tuple[int, list[tuple[str, str, float]]]] = {
+    # Thresholds are z-scores, not raw values. A guessed absolute is how a
+    # condition ends up firing zero times and being read as "tested and
+    # failed" — `futures_lead_bps > 3.0` never fired on BTC, because spot and
+    # perp do not diverge by whole basis points in a minute. z > 1.65 means
+    # "top ~5% relative to the last day", which is what the rule intends and
+    # fires by construction.
+    #
     # --- 1. futures-led breakout ------------------------------------------
-    "出来高急増": (1, [("volume_z", ">", 2.0)]),
+    "出来高急増": (1, [("volume_z", ">", 1.65)]),
     "成行買い優勢": (1, [("perp_buy_ratio", ">", 0.65)]),
-    "先物先行(上)": (1, [("futures_lead_bps", ">", 3.0)]),
-    "OI増加": (1, [("oi_change_5m", ">", 0.3)]),
+    "先物先行(上)": (1, [("futures_lead_z", ">", 1.65)]),
+    "OI増加": (1, [("oi_change_z", ">", 1.65)]),
     "出来高＋買いフロー": (
-        1, [("volume_z", ">", 2.0), ("perp_buy_ratio", ">", 0.65)]
+        1, [("volume_z", ">", 1.65), ("perp_buy_ratio", ">", 0.65)]
     ),
-    "出来高＋OI増加": (1, [("volume_z", ">", 2.0), ("oi_change_5m", ">", 0.3)]),
+    "出来高＋OI増加": (1, [("volume_z", ">", 1.65), ("oi_change_z", ">", 1.65)]),
     "先物先行＋買いフロー": (
-        1, [("futures_lead_bps", ">", 3.0), ("perp_buy_ratio", ">", 0.65)]
+        1, [("futures_lead_z", ">", 1.65), ("perp_buy_ratio", ">", 0.65)]
     ),
     "出来高＋先物先行＋OI増加": (
         1,
         [
-            ("volume_z", ">", 2.0),
-            ("futures_lead_bps", ">", 3.0),
-            ("oi_change_5m", ">", 0.3),
+            ("volume_z", ">", 1.65),
+            ("futures_lead_z", ">", 1.0),
+            ("oi_change_z", ">", 1.0),
         ],
     ),
     # --- 2. capitulation and reversal -------------------------------------
-    "急落＋OI急減": (
-        1, [("perp_ret_5m", "<", -30.0), ("oi_change_5m", "<", -0.3)]
-    ),
+    "急落": (1, [("perp_ret_5m", "<", -30.0)]),
+    "急落＋OI急減": (1, [("perp_ret_5m", "<", -30.0), ("oi_change_z", "<", -1.65)]),
     "急落＋売り枯れ": (
         1, [("perp_ret_5m", "<", -30.0), ("perp_buy_ratio", ">", 0.5)]
     ),
-    "急落＋OI急減＋売り枯れ": (
+    "急落＋出来高急増＋売り枯れ": (
         1,
         [
             ("perp_ret_5m", "<", -30.0),
-            ("oi_change_5m", "<", -0.3),
+            ("volume_z", ">", 1.0),
             ("perp_buy_ratio", ">", 0.5),
         ],
     ),
     # --- 3. basis mean reversion ------------------------------------------
-    "ベーシス過熱(売り)": (-1, [("basis_z", ">", 2.0)]),
-    "ベーシス過冷(買い)": (1, [("basis_z", "<", -2.0)]),
+    "ベーシス過熱(売り)": (-1, [("basis_z", ">", 1.65)]),
+    "ベーシス過冷(買い)": (1, [("basis_z", "<", -1.65)]),
     "ベーシス過熱＋フロー反転": (
-        -1, [("basis_z", ">", 2.0), ("perp_buy_ratio", "<", 0.5)]
+        -1, [("basis_z", ">", 1.65), ("perp_buy_ratio", "<", 0.5)]
     ),
     "ベーシス過冷＋フロー反転": (
-        1, [("basis_z", "<", -2.0), ("perp_buy_ratio", ">", 0.5)]
+        1, [("basis_z", "<", -1.65), ("perp_buy_ratio", ">", 0.5)]
     ),
     # --- controls ----------------------------------------------------------
     "常時ロング(基準)": (1, []),
-    "高ボラのみ": (1, [("volatility_z", ">", 2.0)]),
+    "高ボラのみ": (1, [("volatility_z", ">", 1.65)]),
 }
 
 
@@ -1124,19 +1130,23 @@ async def cmd_events(args: argparse.Namespace) -> int:
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
     table.add_column("条件", style="cyan")
     table.add_column("向き", justify="center")
-    for label in ("件数", "平均\n(bps)", "中央値", "勝率", "PF", "最大DD", "上位10除く", "手数料1.5倍"):
+    for label in (
+        "件数", "変動幅\n(bps)", "平均\n(bps)", "中央値", "勝率", "PF",
+        "最大DD", "上位10除く", "手数料1.5倍",
+    ):
         table.add_column(label, justify="right")
     table.add_column("判定")
 
     for v, direction in verdicts:
         if v.trades == 0:
-            table.add_row(v.name, "—", "0", *["—"] * 7, "[dim]該当なし[/dim]")
+            table.add_row(v.name, "—", "0", *["—"] * 8, "[dim]該当なし[/dim]")
             continue
         colour = "green" if v.mean_net_bps > 0 else "red"
         table.add_row(
             v.name,
             "買" if direction > 0 else "売",
             f"{v.trades:,}",
+            f"{v.mean_abs_move_bps:.1f}",
             f"[{colour}]{v.mean_net_bps:+.1f}[/{colour}]",
             f"{v.median_net_bps:+.1f}",
             f"{v.win_rate:.0%}",
@@ -1166,7 +1176,10 @@ async def cmd_events(args: argparse.Namespace) -> int:
             "  平均は黒字だが上位10件を除くと赤なら、少数の大当たりに乗っただけです。[/dim]"
         )
     console.print(
-        "\n  [dim]板の特徴量（板の偏り・キャンセル・microprice）はこの表に含まれません。\n"
+        "\n  [dim]「変動幅」は方向を無視した平均の値幅です。ここが往復コストを\n"
+        "  下回っていれば、方向を完璧に当てても勝てません（場面選びの失敗）。\n"
+        "  上回っているのに損なら、場面は選べていて方向を外しています。\n"
+        "  板の特徴量（板の偏り・キャンセル・microprice）は未計測です。\n"
         "  過去データの板は1分毎±1〜5%と粗すぎるため、capture の記録が要ります。[/dim]"
     )
     console.rule()
@@ -1324,7 +1337,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--symbol", default="BTCUSDT")
     p_ev.add_argument("--days", type=int, default=14)
     p_ev.add_argument("--end", default=None, help="最終日 YYYY-MM-DD")
-    p_ev.add_argument("--horizon", type=int, default=30, help="保有分数")
+    # 60 rather than 30: the horizon study measured a 6.39bps average move at
+    # 30 minutes against a 9.03bps round trip, so that horizon is below the
+    # fee before any condition is applied. 60 minutes averages 22.93bps.
+    p_ev.add_argument("--horizon", type=int, default=60, help="保有分数")
     p_ev.add_argument("--target", type=float, default=None, help="利確 bps")
     p_ev.add_argument("--stop", type=float, default=None, help="損切 bps")
     p_ev.add_argument("--z-window", type=int, default=1440, help="z値の観測窓（分）")
