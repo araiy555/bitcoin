@@ -132,7 +132,6 @@ class TestConstruction:
     def test_subscribes_to_all_four_streams(self):
         url = BinanceFuturesFeed(PERP)._stream_url
 
-        assert url.startswith("wss://fstream.binance.com/stream")
         for stream in ("@depth@100ms", "@aggTrade", "@markPrice@1s", "@forceOrder"):
             assert stream in url
 
@@ -587,3 +586,55 @@ class TestPremiumIndexParsing:
         mp = feed._parse_premium_index(premium_index(1.0, 1.0, -0.000375))
 
         assert mp.funding_rate == pytest.approx(-0.000375)
+
+
+class TestStreamPath:
+    """Market data is under /market. The bare path serves depth and nothing
+    else, with no error — which is what made the first diagnosis wrong."""
+
+    def test_the_url_uses_the_market_path(self):
+        url = BinanceFuturesFeed(PERP)._stream_url
+
+        assert url.startswith("wss://fstream.binance.com/market/stream")
+
+    def test_every_stream_is_still_requested(self):
+        url = BinanceFuturesFeed(PERP)._stream_url
+
+        for stream in ("@depth@100ms", "@aggTrade", "@markPrice@1s", "@forceOrder"):
+            assert stream in url
+
+
+class TestMarkPriceParsing:
+    def test_a_missing_index_is_zero_rather_than_the_mark(self):
+        # Copying the mark across would make the mark-index spread read as
+        # exactly zero — a plausible number that really means "not measured".
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_mark_price(
+            {"e": "markPriceUpdate", "E": 1_700_000_000_000, "p": "64000.0"}
+        )
+
+        assert mp.mark == PERP.to_ticks("64000.0")
+        assert mp.index == 0
+
+    def test_a_published_index_is_kept(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_mark_price(
+            {
+                "e": "markPriceUpdate", "E": 1_700_000_000_000,
+                "p": "64000.0", "i": "63990.0", "r": "0.0001", "T": 1_700_000_600_000,
+            }
+        )
+
+        assert mp.index == PERP.to_ticks("63990.0")
+        assert mp.funding_rate == pytest.approx(0.0001)
+
+    def test_a_missing_funding_rate_is_zero_not_a_crash(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        mp = feed._parse_mark_price(
+            {"e": "markPriceUpdate", "E": 1_700_000_000_000, "p": "1.0"}
+        )
+
+        assert mp.funding_rate == 0.0

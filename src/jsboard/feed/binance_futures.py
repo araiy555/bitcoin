@@ -23,32 +23,38 @@ Those are what make the perp lead or lag the spot market, so they are carried
 as first-class events rather than derived later.
 
   ---------------------------------------------------------------------
-  The socket does not always send what it agrees to send
+  The path matters, and a wrong one fails quietly
   ---------------------------------------------------------------------
 
-Measured against fstream.binance.com: the venue accepts a subscription for
-aggTrade, markPrice and forceOrder, echoes all of them back from
-LIST_SUBSCRIPTIONS as active, and then delivers none of them. Depth and
-bookTicker arrive normally throughout. Spot, asked the same way by the same
-client, answers everything. So this is not a malformed request and not a
-quiet market — markPrice is a fixed 1Hz heartbeat, and twelve silent seconds
-of it cannot happen on a live symbol.
+Market data is served from `/market/stream` and `/market/ws`. The bare
+`/stream` and `/ws` paths still deliver depth and bookTicker and silently
+deliver nothing else — no error, no dropped connection, and
+LIST_SUBSCRIPTIONS still echoes every stream back as active.
 
-There is another host that does serve those streams. It is testnet: its depth
-update ids sit 10.8 *trillion* away from production's, and its price runs
-55bps from spot where a real perp basis is a few. Recording it would poison
-every feature downstream while looking perfectly healthy, so it is not used,
-and `probe_same_market.py` exists to keep that conclusion checkable.
+That failure cost a day here. The reading taken from it was that the venue
+withholds trades and mark prices, when in fact the request was going to a
+stale path. Measured on `/market`: aggTrade arrives continuously, markPrice
+lands once a second as its 1Hz heartbeat should, and forceOrder carries
+liquidations. On the old path, in the same fifteen seconds, aggTrade was
+silent while depth ran at 10/s.
 
-REST is unaffected, so trades and mark price fall back to polling.
-`/fapi/v1/aggTrades` takes `fromId`, which makes the fallback lossless rather
-than a sample: chained polls return every trade, with exchange timestamps
-intact. What polling costs is *receive-time* precision — about one poll
-interval. Lead-lag measured on exchange time is unaffected; lead-lag measured
-on arrival is not available for perp trades under fallback.
+Two things follow. A socket that connects, acknowledges and delivers *some*
+streams is not evidence that the rest are unavailable. And the REST fallback
+below is a backup for outages, not the normal route.
 
-Liquidations have no REST equivalent here, so `forceOrder` is simply lost
-while the stream is withheld. That is a real hole, not a papered-over one.
+There is also a host that served everything while the path was wrong —
+`fstream.binancefuture.com`. It is testnet: its depth update ids sit 10.8
+*trillion* away from production's, and its price runs 55bps from spot where a
+real perp basis is a few. Recording it would poison every feature downstream
+while looking perfectly healthy, so it is not used, and
+`probe_same_market.py` keeps that conclusion checkable.
+
+The REST fallback stays because outages happen. `/fapi/v1/aggTrades` takes
+`fromId`, which makes it lossless rather than a sample: chained polls return
+every trade with exchange timestamps intact. What polling costs is
+*receive-time* precision, about one poll interval — lead-lag measured on
+exchange time is unaffected, lead-lag measured on arrival is not available
+for perp trades while it is engaged.
 """
 
 from __future__ import annotations
@@ -80,7 +86,10 @@ from .base import (
 log = logging.getLogger(__name__)
 
 REST_BASE = "https://fapi.binance.com"
-WS_BASE = "wss://fstream.binance.com/stream"
+# Market data lives under /market. The bare /ws and /stream paths still
+# serve depth, which is what made the earlier diagnosis wrong: the socket
+# looked healthy and silently withheld everything else.
+WS_BASE = "wss://fstream.binance.com/market/stream"
 
 VALID_DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
 VALID_DEPTH_MS = (100, 250, 500)
@@ -243,12 +252,21 @@ class BinanceFuturesFeed(Feed):
         )
 
     def _parse_mark_price(self, data: dict) -> MarkPrice:
+        """Mark, index and funding from the stream.
+
+        `index` is 0 when the venue did not send one, rather than being
+        defaulted to the mark. Copying the mark across would make the
+        mark-index spread read as exactly zero — a plausible-looking number
+        that is really "not measured", and the basis features would quietly
+        be about nothing.
+        """
         inst = self.instrument
+        index = data.get("i")
         return MarkPrice(
             mark=inst.to_ticks(data["p"]),
-            index=inst.to_ticks(data["i"]),
-            funding_rate=float(data["r"]),
-            next_funding_ns=int(data["T"]) * 1_000_000,
+            index=inst.to_ticks(index) if index is not None else 0,
+            funding_rate=float(data.get("r", 0.0)),
+            next_funding_ns=int(data.get("T", 0)) * 1_000_000,
             ts_ns=int(data["E"]) * 1_000_000,
         )
 
