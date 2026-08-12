@@ -293,6 +293,38 @@ def _markout_line(s: dict) -> str | None:
     return "  mark-out       : " + "  ".join(parts) if parts else None
 
 
+def _reach_lines(mm: MarketMaker, s: dict) -> list[str]:
+    """Why the fills did or did not happen.
+
+    A session that reports zero fills has said nothing yet: the tape may
+    never have come to our price, or it may have come repeatedly and been
+    eaten by the queue standing in front of us. The first is fixed by
+    quoting tighter, the second only by size, time, or a different symbol.
+    """
+    placement = s.get("placement") or {}
+    total = sum(placement.values())
+    if not total:
+        return []
+
+    inside = sum(n for d, n in placement.items() if d < 0)
+    at_touch = placement.get(0, 0)
+    behind = total - inside - at_touch
+    ratio = s.get("queue_ahead_ratio", math.nan)
+    queue = "—" if math.isnan(ratio) else f"{ratio:,.1f}x our size"
+
+    prints = s.get("prints_seen", 0)
+    reached = s.get("prints_at_our_price", 0)
+    share = f"{reached / prints * 100:.1f}%" if prints else "—"
+
+    return [
+        f"  quote placement: inside {inside / total * 100:.0f}% / "
+        f"at touch {at_touch / total * 100:.0f}% / behind {behind / total * 100:.0f}%"
+        f"   queue ahead at touch: {queue}",
+        f"  tape reach     : {reached:,} of {prints:,} prints ({share}) came to our price, "
+        f"{s.get('queue_absorbed', 0):,.0f} {mm.instrument.base} of it absorbed ahead of us",
+    ]
+
+
 def _print_report(mm: MarketMaker, result) -> None:
     s = mm.summary()
     inst = mm.instrument
@@ -312,7 +344,7 @@ def _print_report(mm: MarketMaker, result) -> None:
         f"  unrealized P&L : {s['unrealized']:+,.2f} {inst.quote}\n"
         f"  [bold]total P&L      : {s['total']:+,.2f} {inst.quote}[/bold]"
     )
-    for line in (_capture_line(mm, s), _markout_line(s)):
+    for line in (_capture_line(mm, s), _markout_line(s), *_reach_lines(mm, s)):
         if line:
             console.print(line)
     console.print(f"  last decision  : {s['decision']}")

@@ -222,3 +222,39 @@ class TestLifecycle:
 
         assert venue.cancel_all() == 2
         assert venue.resting_lots == 0
+
+
+class TestReachCounters:
+    """Zero fills has two causes; the counters have to tell them apart."""
+
+    def test_a_print_away_from_our_price_counts_but_does_not_reach(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+        venue.on_trade(TradeTick(price=99, qty=10, aggressor=Side.BUY, trade_id=1))
+        assert venue.prints_seen == 1
+        assert venue.prints_at_our_price == 0
+        assert venue.filled_lots == 0
+
+    def test_a_print_at_our_price_reaches_even_when_the_queue_eats_it(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=50, best_opposite=101)
+        clock.advance_ms(20)
+        fills = venue.on_trade(TradeTick(price=100, qty=10, aggressor=Side.SELL, trade_id=1))
+        assert fills == []
+        assert venue.prints_at_our_price == 1
+        assert venue.queue_absorbed_lots == 10
+        assert venue.filled_lots == 0
+
+    def test_absorbed_and_filled_are_counted_separately(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=3, best_opposite=101)
+        clock.advance_ms(20)
+        venue.on_trade(TradeTick(price=100, qty=6, aggressor=Side.SELL, trade_id=1))
+        assert venue.queue_absorbed_lots == 3
+        assert venue.filled_lots == 3
+
+    def test_counters_accumulate_across_prints(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+        for i in range(3):
+            venue.on_trade(TradeTick(price=98, qty=1, aggressor=Side.BUY, trade_id=i))
+        assert venue.prints_seen == 3
+        assert venue.prints_at_our_price == 0

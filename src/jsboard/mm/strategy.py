@@ -9,7 +9,9 @@ only the difference, tolerating small size drift rather than re-queuing for it.
 
 from __future__ import annotations
 
+import math
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 from ..core.market import MARKET_OWNER, MarketView
@@ -44,6 +46,21 @@ class StrategyStats:
     fills: int = 0
     last_decision: str = ""
     last_requote_ns: int = 0
+
+    # Where our quotes actually landed relative to the touch, in ticks:
+    # negative improves on the best price, 0 joins it, positive rests behind
+    # it. A maker that never reaches the touch cannot fill however long it
+    # runs, and that is invisible in a placed/cancelled count.
+    placement_ticks: Counter[int] = field(default_factory=Counter)
+    queue_ahead_ratio_sum: float = 0.0
+    queue_ahead_ratio_n: int = 0
+
+    @property
+    def mean_queue_ahead_ratio(self) -> float:
+        """Size resting in front of a touch-joining quote, as a multiple of ours."""
+        if self.queue_ahead_ratio_n == 0:
+            return math.nan
+        return self.queue_ahead_ratio_sum / self.queue_ahead_ratio_n
 
 
 @dataclass(slots=True)
@@ -187,6 +204,22 @@ class MarketMaker:
             if self.venue.place(quote, visible_depth=depth, best_opposite=opposite) is not None:
                 self.stats.orders_placed += 1
                 placed += 1
+                self._record_placement(quote, depth)
+
+    def _record_placement(self, quote: Quote, depth: int) -> None:
+        """Note how far behind the touch this quote landed, and its queue."""
+        best = (
+            self.market.book.best_bid() if quote.side is Side.BUY else self.market.book.best_ask()
+        )
+        if best is None:
+            return
+        distance = best - quote.price if quote.side is Side.BUY else quote.price - best
+        self.stats.placement_ticks[distance] += 1
+        if distance <= 0 and quote.qty > 0:
+            # Only the touch tells us anything about reachability; a quote
+            # three ticks back has a queue we were never going to clear.
+            self.stats.queue_ahead_ratio_sum += depth / quote.qty
+            self.stats.queue_ahead_ratio_n += 1
 
     def _visible_depth(self, quote: Quote) -> int:
         """Public size already resting at this price — our queue to get through."""
@@ -222,6 +255,11 @@ class MarketMaker:
                 "decision": self.stats.last_decision,
                 "halted": self.risk.halted,
                 "markout": self.markout.summary(),
+                "placement": dict(self.stats.placement_ticks),
+                "queue_ahead_ratio": self.stats.mean_queue_ahead_ratio,
+                "prints_seen": self.venue.prints_seen,
+                "prints_at_our_price": self.venue.prints_at_our_price,
+                "queue_absorbed": self.instrument.qty_f(self.venue.queue_absorbed_lots),
             }
         )
         return out

@@ -87,6 +87,15 @@ class PaperVenue:
     fills: list[Fill] = field(default_factory=list)
     rejected: int = 0
 
+    # Why we did or did not fill. A session with no fills has two very
+    # different explanations — the tape never came to our price, or it came
+    # and the queue in front of us swallowed it — and only counting both
+    # tells them apart.
+    prints_seen: int = 0
+    prints_at_our_price: int = 0
+    queue_absorbed_lots: int = 0
+    filled_lots: int = 0
+
     def _now(self) -> int:
         return self.clock()
 
@@ -170,6 +179,10 @@ class PaperVenue:
         # Best-priced first; the tape sweeps in price order.
         candidates.sort(key=lambda o: o.price, reverse=our_side is Side.BUY)
 
+        self.prints_seen += 1
+        if candidates:
+            self.prints_at_our_price += 1
+
         for order in candidates:
             if remaining <= 0:
                 break
@@ -179,6 +192,7 @@ class PaperVenue:
                 eaten = min(order.queue_ahead, remaining)
                 order.queue_ahead -= eaten
                 remaining -= eaten
+                self.queue_absorbed_lots += eaten
                 if remaining <= 0:
                     break
 
@@ -189,6 +203,7 @@ class PaperVenue:
             order.remaining -= fill_qty
             order.filled += fill_qty
             remaining -= fill_qty
+            self.filled_lots += fill_qty
 
             produced.append(
                 Fill(
