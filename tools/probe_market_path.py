@@ -40,13 +40,28 @@ from jsboard.net import ssl_context
 
 HOST = "wss://fstream.binance.com"
 
+SYMBOL = "wifusdt"
+FOUR = "/".join(
+    (
+        f"{SYMBOL}@depth@100ms",
+        f"{SYMBOL}@aggTrade",
+        f"{SYMBOL}@markPrice@1s",
+        f"{SYMBOL}@forceOrder",
+    )
+)
+
+# The first row is the exact URL BinanceFuturesFeed builds. The previous run
+# of this probe tested the /market combined path with aggTrade and markPrice
+# and no depth, then the feed was switched to /market carrying all four — so
+# depth on that path was never actually observed. An hour of live quoting
+# later, no book had been built. Test what the code sends, not a near-miss.
 CASES = [
-    ("market  aggTrade", f"{HOST}/market/ws/btcusdt@aggTrade"),
-    ("market  markPrice", f"{HOST}/market/ws/btcusdt@markPrice@1s"),
-    ("market  forceOrder(all)", f"{HOST}/market/ws/!forceOrder@arr"),
-    ("market  combined", f"{HOST}/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s"),
-    ("ws      aggTrade   [control]", f"{HOST}/ws/btcusdt@aggTrade"),
-    ("ws      depth      [control]", f"{HOST}/ws/btcusdt@depth@100ms"),
+    ("market  combined ALL FOUR", f"{HOST}/market/stream?streams={FOUR}"),
+    ("market  depth alone (ws)", f"{HOST}/market/ws/{SYMBOL}@depth@100ms"),
+    ("market  depth alone (stream)", f"{HOST}/market/stream?streams={SYMBOL}@depth@100ms"),
+    ("market  aggTrade", f"{HOST}/market/ws/{SYMBOL}@aggTrade"),
+    ("ws      depth      [control]", f"{HOST}/ws/{SYMBOL}@depth@100ms"),
+    ("stream  combined   [control]", f"{HOST}/stream?streams={FOUR}"),
 ]
 
 
