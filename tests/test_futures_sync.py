@@ -108,6 +108,8 @@ def make_feed(snapshot_ids, monkeypatch):
 
     monkeypatch.setattr(feed, "fetch_snapshot", fake_snapshot)
     monkeypatch.setattr(feed, "_poll_open_interest", no_polling)
+    # The market socket is a real connection; tests drive the depth loop only.
+    monkeypatch.setattr(feed, "_pump_market", no_polling)
     return feed
 
 
@@ -129,11 +131,13 @@ class TestConstruction:
         with pytest.raises(ValueError, match="snapshot_limit"):
             BinanceFuturesFeed(PERP, snapshot_limit=5000)
 
-    def test_subscribes_to_all_four_streams(self):
-        url = BinanceFuturesFeed(PERP)._stream_url
+    def test_the_two_sockets_between_them_request_all_four_streams(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        both = feed._stream_url + " " + feed._market_url
 
         for stream in ("@depth@100ms", "@aggTrade", "@markPrice@1s", "@forceOrder"):
-            assert stream in url
+            assert stream in both
 
 
 class TestParsers:
@@ -317,9 +321,9 @@ class TestNonBookStreams:
             ],
         )
 
-        assert any(isinstance(e, MarkPrice) for e in events)
-        assert any(isinstance(e, Liquidation) for e in events)
-        assert any(isinstance(e, TradeTick) for e in events)
+        # These now arrive on the market socket and are merged through the
+        # queue, so the depth loop passes them by.
+        assert not any(isinstance(e, (MarkPrice, Liquidation, TradeTick)) for e in events)
 
     async def test_unknown_message_types_are_ignored(self):
         feed = make_feed([100], pytest.MonkeyPatch())
@@ -407,17 +411,15 @@ class TestFallbackEngagement:
         degraded = [e for e in events if isinstance(e, FeedStatus) and e.state == "degraded"]
         assert degraded, "the switch to polling has to be recorded, not silent"
 
-    async def test_auto_stays_on_the_socket_when_the_socket_delivers(self, monkeypatch):
-        # A trade before the deadline proves the stream works; polling then
-        # would duplicate a source that is already healthy.
-        feed, started = fallback_feed(monkeypatch, rest_fallback="auto", fallback_after_s=0.05)
+    async def test_auto_stays_put_once_the_market_socket_has_delivered(self, monkeypatch):
+        # Trades arrive on the other socket now, so the fallback watches the
+        # flag that socket sets rather than the depth loop's own traffic.
+        feed, started = fallback_feed(monkeypatch, rest_fallback="auto", fallback_after_s=0.0)
+        feed._market_seen = True
 
-        events = await collect(
-            feed, [depth(95, 100, 90), agg_trade(64_000.0, 1.5, False), depth(101, 105, 100)]
-        )
+        events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
 
         assert started == []
-        assert any(isinstance(e, TradeTick) for e in events)
         assert not [e for e in events if isinstance(e, FeedStatus) and e.state == "degraded"]
 
     async def test_never_accepts_the_silence(self, monkeypatch):
@@ -446,14 +448,15 @@ class TestFallbackEngagement:
 
         assert not [e for e in events if isinstance(e, (TradeTick, MarkPrice))]
 
-    async def test_liquidations_still_come_through_while_polling(self, monkeypatch):
-        # forceOrder has no REST equivalent, so it is the one stream the
-        # fallback must not suppress.
-        feed, _ = fallback_feed(monkeypatch, rest_fallback="always")
-
-        events = await collect(
-            feed, [depth(95, 100, 90), force_order(64_000.0, 2.0, "SELL", avg=63_999.0)]
+    async def test_queued_events_are_merged_into_the_depth_stream(self, monkeypatch):
+        # Whatever the market socket produces reaches the consumer through the
+        # same queue open interest uses, in the depth loop's ordering.
+        feed, _ = fallback_feed(monkeypatch, rest_fallback="never")
+        feed._rest_queue.put_nowait(
+            Liquidation(price=1, qty=2, side=Side.SELL)
         )
+
+        events = await collect(feed, [depth(95, 100, 90), depth(101, 105, 100)])
 
         assert any(isinstance(e, Liquidation) for e in events)
 
@@ -589,19 +592,33 @@ class TestPremiumIndexParsing:
 
 
 class TestStreamPath:
-    """Market data is under /market. The bare path serves depth and nothing
-    else, with no error — which is what made the first diagnosis wrong."""
+    """The two URL families serve disjoint sets and neither errors on what it
+    declines to send. Measured: /market returns no depth, and the plain path
+    returns no trades. Asking either for both is how an hour of live quoting
+    produced a healthy-looking session with no book."""
 
-    def test_the_url_uses_the_market_path(self):
-        url = BinanceFuturesFeed(PERP)._stream_url
+    def test_depth_goes_to_the_plain_path_and_nothing_else_does(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        url = feed._stream_url
+
+        assert url.startswith("wss://fstream.binance.com/stream")
+        assert "@depth@100ms" in url
+        for other in ("@aggTrade", "@markPrice", "@forceOrder"):
+            assert other not in url
+
+    def test_the_rest_go_to_the_market_path_and_depth_does_not(self):
+        feed = BinanceFuturesFeed(PERP)
+
+        url = feed._market_url
 
         assert url.startswith("wss://fstream.binance.com/market/stream")
-
-    def test_every_stream_is_still_requested(self):
-        url = BinanceFuturesFeed(PERP)._stream_url
-
-        for stream in ("@depth@100ms", "@aggTrade", "@markPrice@1s", "@forceOrder"):
+        for stream in ("@aggTrade", "@markPrice@1s", "@forceOrder"):
             assert stream in url
+        assert "@depth" not in url
+
+    def test_the_depth_interval_follows_the_setting(self):
+        assert "@depth@250ms" in BinanceFuturesFeed(PERP, depth_ms=250)._stream_url
 
 
 class TestMarkPriceParsing:
@@ -695,3 +712,62 @@ class TestSlowBookSync:
         assert any(
             isinstance(e, FeedStatus) and e.state == "resyncing" for e in events
         )
+
+
+class TestMarketSocket:
+    """The second socket carries what the depth path will not send."""
+
+    async def test_it_queues_trades_mark_prices_and_liquidations(self, monkeypatch):
+        feed = BinanceFuturesFeed(PERP)
+        frames = [
+            agg_trade(64_000.0, 1.5, False),
+            mark_price(64_010.0, 64_000.0, 0.0001),
+            force_order(63_900.0, 2.0, "SELL", avg=63_899.0),
+        ]
+
+        monkeypatch.setattr(
+            "jsboard.feed.binance_futures.websockets.connect",
+            lambda *a, **kw: _FakeConnect(frames),
+        )
+        # The pump reconnects forever by design; let it run one round.
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(feed._pump_market(), timeout=0.2)
+
+        queued = []
+        while not feed._rest_queue.empty():
+            queued.append(feed._rest_queue.get_nowait())
+        kinds = {type(e) for e in queued}
+        assert kinds == {TradeTick, MarkPrice, Liquidation}
+        assert feed._market_seen
+
+    async def test_it_ignores_anything_it_did_not_ask_for(self, monkeypatch):
+        feed = BinanceFuturesFeed(PERP)
+        frames = [{"stream": "x", "data": {"e": "depthUpdate", "b": [], "a": []}}]
+
+        monkeypatch.setattr(
+            "jsboard.feed.binance_futures.websockets.connect",
+            lambda *a, **kw: _FakeConnect(frames),
+        )
+        # The pump reconnects forever by design; let it run one round.
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(feed._pump_market(), timeout=0.2)
+
+        assert feed._rest_queue.empty()
+        assert not feed._market_seen
+
+
+class _FakeConnect:
+    """Async-context-manager wrapper around a fixed frame list.
+
+    Yields the frames once, then blocks, so the pump's reconnect loop does not
+    spin the test into a busy wait.
+    """
+
+    def __init__(self, frames):
+        self.frames = frames
+
+    async def __aenter__(self):
+        return FakeSocket(self.frames)
+
+    async def __aexit__(self, *exc):
+        return False

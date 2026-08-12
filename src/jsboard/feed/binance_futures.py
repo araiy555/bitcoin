@@ -23,24 +23,35 @@ Those are what make the perp lead or lag the spot market, so they are carried
 as first-class events rather than derived later.
 
   ---------------------------------------------------------------------
-  The path matters, and a wrong one fails quietly
+  Two paths, each serving what the other will not
   ---------------------------------------------------------------------
 
-Market data is served from `/market/stream` and `/market/ws`. The bare
-`/stream` and `/ws` paths still deliver depth and bookTicker and silently
-deliver nothing else — no error, no dropped connection, and
-LIST_SUBSCRIPTIONS still echoes every stream back as active.
+The market-data streams are split across two URL families that do not
+overlap, and neither errors on the streams it declines to send:
 
-That failure cost a day here. The reading taken from it was that the venue
-withholds trades and mark prices, when in fact the request was going to a
-stale path. Measured on `/market`: aggTrade arrives continuously, markPrice
-lands once a second as its 1Hz heartbeat should, and forceOrder carries
-liquidations. On the old path, in the same fifteen seconds, aggTrade was
-silent while depth ran at 10/s.
+    /stream, /ws            depth        — and nothing else
+    /market/stream, /ws     aggTrade, markPrice, forceOrder — and no depth
 
-Two things follow. A socket that connects, acknowledges and delivers *some*
-streams is not evidence that the rest are unavailable. And the REST fallback
-below is a backup for outages, not the normal route.
+Measured on WIFUSDT, fifteen seconds each, one connection per row:
+
+    /market  all four            markPrice 14, aggTrade 1, depth 0
+    /market  depth alone         silent
+    /stream  all four            depth 58, aggTrade 0, markPrice 0
+    /ws      depth alone         depth 54
+
+So this feed opens both. Depth drives the main loop, because the snapshot
+handshake has to see every diff in order; the other three arrive on a second
+socket and are merged into the same event stream.
+
+Getting here took two wrong readings, both worth remembering. The first was
+that the venue withheld trades — it did not, they were on the other path.
+The second was to conclude "/market is correct" from a probe that tested
+/market with aggTrade and markPrice and *no depth*, then move all four
+streams there. An hour of live quoting followed in which trades and mark
+prices flowed, the session looked healthy, and no book was ever built.
+
+The rule both violate: a socket that connects, acknowledges, and delivers
+*some* streams says nothing about the rest. Test the URL the code sends.
 
 There is also a host that served everything while the path was wrong —
 `fstream.binancefuture.com`. It is testnet: its depth update ids sit 10.8
@@ -86,10 +97,11 @@ from .base import (
 log = logging.getLogger(__name__)
 
 REST_BASE = "https://fapi.binance.com"
-# Market data lives under /market. The bare /ws and /stream paths still
-# serve depth, which is what made the earlier diagnosis wrong: the socket
-# looked healthy and silently withheld everything else.
-WS_BASE = "wss://fstream.binance.com/market/stream"
+# Two hosts' worth of paths on one host. Measured, not assumed — see the
+# module docstring. Sending depth to the market path yields silence, and
+# sending trades to the depth path does the same.
+DEPTH_WS = "wss://fstream.binance.com/stream"
+MARKET_WS = "wss://fstream.binance.com/market/stream"
 
 VALID_DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
 VALID_DEPTH_MS = (100, 250, 500)
@@ -141,6 +153,10 @@ class BinanceFuturesFeed(Feed):
         # the main loop a single ordered sequence regardless of origin.
         self._rest_queue: asyncio.Queue[FeedEvent] = asyncio.Queue()
         self._used_weight: int = 0
+        # Set by the market socket the first time it delivers. The REST
+        # fallback watches this rather than the depth loop, since trades no
+        # longer pass through there.
+        self._market_seen: bool = False
 
     @property
     def _symbol(self) -> str:
@@ -148,16 +164,18 @@ class BinanceFuturesFeed(Feed):
 
     @property
     def _stream_url(self) -> str:
+        """Depth only. It is the one stream the plain path serves."""
+        s = self.instrument.symbol.lower()
+        return f"{DEPTH_WS}?streams={s}@depth@{self.depth_ms}ms"
+
+    @property
+    def _market_url(self) -> str:
+        """Everything the depth path will not send."""
         s = self.instrument.symbol.lower()
         streams = "/".join(
-            (
-                f"{s}@depth@{self.depth_ms}ms",
-                f"{s}@aggTrade",
-                f"{s}@markPrice@1s",
-                f"{s}@forceOrder",
-            )
+            (f"{s}@aggTrade", f"{s}@markPrice@1s", f"{s}@forceOrder")
         )
-        return f"{WS_BASE}?streams={streams}"
+        return f"{MARKET_WS}?streams={streams}"
 
     # ------------------------------------------------------------ transport
 
@@ -353,8 +371,8 @@ class BinanceFuturesFeed(Feed):
         # `ws_extras_seen` records whether the socket ever proved it will send
         # trades or mark prices on this connection.
         opened = time.monotonic()
-        ws_extras_seen = False
         polling = False
+        tasks.append(asyncio.create_task(self._pump_market()))
         if self.rest_fallback == "always":
             tasks += self._start_rest_pollers()
             polling = True
@@ -368,7 +386,7 @@ class BinanceFuturesFeed(Feed):
                 if (
                     not polling
                     and self.rest_fallback == "auto"
-                    and not ws_extras_seen
+                    and not self._market_seen
                     and time.monotonic() - opened >= self.fallback_after_s
                 ):
                     tasks += self._start_rest_pollers()
@@ -382,23 +400,8 @@ class BinanceFuturesFeed(Feed):
                 data = msg.get("data", msg)
                 kind = data.get("e")
 
-                if kind in ("aggTrade", "markPriceUpdate"):
-                    ws_extras_seen = True
-                    # Once polling, the socket's copy is a duplicate of what
-                    # REST already returns. Dropping it here is cheaper than
-                    # de-duplicating two sources downstream.
-                    if polling:
-                        continue
-                    yield (
-                        self._parse_trade(data)
-                        if kind == "aggTrade"
-                        else self._parse_mark_price(data)
-                    )
-                    continue
-                if kind == "forceOrder":
-                    yield self._parse_liquidation(data)
-                    continue
                 if kind != "depthUpdate":
+                    # This socket serves depth alone; anything else is noise.
                     continue
 
                 delta, pu = self._parse_depth_event(data)
@@ -480,6 +483,48 @@ class BinanceFuturesFeed(Feed):
             asyncio.create_task(self._poll_agg_trades()),
             asyncio.create_task(self._poll_mark_price()),
         ]
+
+    async def _pump_market(self) -> None:
+        """The second socket: trades, mark price and liquidations.
+
+        Kept off the main loop deliberately. The depth handshake has to see
+        every diff in the order it arrives, and interleaving another socket's
+        reconnects into that sequence would put gaps in the book rather than
+        in the tape. Events are queued and merged by the depth loop, which
+        already drains the same queue for open interest.
+        """
+        attempt = 0
+        while True:
+            try:
+                async with websockets.connect(
+                    self._market_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_queue=2**16,
+                    ssl=ssl_context(),
+                ) as ws:
+                    attempt = 0
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        data = msg.get("data", msg)
+                        kind = data.get("e")
+                        if kind == "aggTrade":
+                            event = self._parse_trade(data)
+                        elif kind == "markPriceUpdate":
+                            event = self._parse_mark_price(data)
+                        elif kind == "forceOrder":
+                            event = self._parse_liquidation(data)
+                        else:
+                            continue
+                        self._market_seen = True
+                        self._rest_queue.put_nowait(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reconnect, do not stop
+                attempt += 1
+                delay = min(self.max_reconnect_delay, 2.0 ** min(attempt, 5))
+                log.warning("market socket dropped (%s); retry in %.0fs", exc, delay)
+                await asyncio.sleep(delay)
 
     async def _poll_open_interest(self) -> None:
         while True:
