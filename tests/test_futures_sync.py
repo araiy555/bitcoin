@@ -282,7 +282,7 @@ class TestFuturesSync:
         events = await collect(feed, [depth(150, 160, 149), depth(195, 200, 190)])
 
         statuses = [e.detail for e in events if isinstance(e, FeedStatus)]
-        assert any("did not join" in s for s in statuses)
+        assert any("older than the diff stream" in s for s in statuses)
 
     async def test_it_recovers_and_keeps_streaming_after_a_gap(self):
         feed = make_feed([100, 300], pytest.MonkeyPatch())
@@ -638,3 +638,60 @@ class TestMarkPriceParsing:
         )
 
         assert mp.funding_rate == 0.0
+
+
+class TestSlowBookSync:
+    """A book that updates slowly must still sync.
+
+    The REST snapshot can outrun the diff stream: by the time the image
+    arrives, every buffered diff is older than it. Treating that as a failed
+    handshake and refetching starts the race again — on WIFUSDT it repeated
+    for an hour, the feed never reported "live", and the risk gate held every
+    quote back with "feed is connecting".
+    """
+
+    async def test_a_snapshot_ahead_of_the_buffer_waits_instead_of_refetching(
+        self, monkeypatch
+    ):
+        feed = make_feed([100], monkeypatch)
+        fetches = 0
+        original = feed.fetch_snapshot
+
+        async def counted():
+            nonlocal fetches
+            fetches += 1
+            return await original()
+
+        monkeypatch.setattr(feed, "fetch_snapshot", counted)
+
+        # The first diff ends before the image; the second reaches it.
+        events = await collect(feed, [depth(90, 95, 85), depth(96, 105, 95)])
+
+        assert fetches == 1, "the image was thrown away and refetched"
+        assert any(isinstance(e, DepthSnapshot) for e in events)
+        assert any(
+            isinstance(e, FeedStatus) and e.state == "live" for e in events
+        ), "the feed never reported live"
+
+    async def test_diffs_after_the_bracket_flow_normally(self, monkeypatch):
+        feed = make_feed([100], monkeypatch)
+
+        events = await collect(
+            feed, [depth(90, 95, 85), depth(96, 105, 95), depth(106, 110, 105)]
+        )
+
+        deltas = [e for e in events if isinstance(e, DepthDelta)]
+        assert len(deltas) == 2
+
+    async def test_a_stream_that_has_passed_the_snapshot_still_resyncs(
+        self, monkeypatch
+    ):
+        # The other direction: every diff starts after the image, so there is
+        # a hole between them that waiting cannot fill.
+        feed = make_feed([100, 200], monkeypatch)
+
+        events = await collect(feed, [depth(150, 160, 149), depth(161, 170, 160)])
+
+        assert any(
+            isinstance(e, FeedStatus) and e.state == "resyncing" for e in events
+        )

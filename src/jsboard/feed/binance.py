@@ -176,20 +176,30 @@ class BinanceFeed(Feed):
 
                 delta = self._parse_depth_event(data)
 
-                # --- phase 1: buffering until the snapshot lands ------------
-                if snapshot is None:
+                # --- phase 1: waiting for a diff that joins the snapshot ----
+                if prev_u is None:
                     buffer.append(delta)
-                    if not snapshot_task.done():
-                        continue
-                    snapshot = snapshot_task.result()
+                    if snapshot is None:
+                        if not snapshot_task.done():
+                            continue
+                        snapshot = snapshot_task.result()
 
                     # Drop everything the snapshot already accounts for.
                     buffer = [d for d in buffer if d.final_id > snapshot.last_update_id]
                     target = snapshot.last_update_id + 1
-                    if not buffer or not (buffer[0].first_id <= target <= buffer[0].final_id):
-                        # The snapshot is older than our earliest buffered diff:
-                        # there is an unrecoverable hole. Take a fresh image.
-                        yield FeedStatus("resyncing", "snapshot did not join the diff stream")
+
+                    if not buffer:
+                        # The image is newer than every diff seen so far, which
+                        # happens whenever the REST call outruns a slow book.
+                        # Refetching here restarts the same race and can loop
+                        # indefinitely on a quiet symbol; the image is still
+                        # good, so wait for the diff that reaches it.
+                        continue
+
+                    if buffer[0].first_id > target:
+                        # The stream has moved past the image: a hole between
+                        # them that waiting cannot close.
+                        yield FeedStatus("resyncing", "snapshot older than the diff stream")
                         snapshot = None
                         buffer = []
                         snapshot_task = asyncio.create_task(self.fetch_snapshot())
@@ -204,7 +214,7 @@ class BinanceFeed(Feed):
                     continue
 
                 # --- phase 2: steady state, gap-checked ---------------------
-                if prev_u is not None and delta.first_id != prev_u + 1:
+                if delta.first_id != prev_u + 1:
                     log.warning(
                         "depth gap on %s: expected U=%d, got U=%d", self._symbol, prev_u + 1, delta.first_id
                     )

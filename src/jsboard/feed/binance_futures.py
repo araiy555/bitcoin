@@ -403,18 +403,35 @@ class BinanceFuturesFeed(Feed):
 
                 delta, pu = self._parse_depth_event(data)
 
-                # --- phase 1: buffering until the snapshot lands ------------
-                if snapshot is None:
+                # --- phase 1: waiting for a diff that brackets the snapshot --
+                if prev_u is None:
                     buffer.append((delta, pu))
-                    if not snapshot_task.done():
-                        continue
-                    snapshot = snapshot_task.result()
+                    if snapshot is None:
+                        if not snapshot_task.done():
+                            continue
+                        snapshot = snapshot_task.result()
 
                     last = snapshot.last_update_id
+                    # Anything wholly older than the image is already in it.
                     buffer = [(d, p) for d, p in buffer if d.final_id >= last]
+
+                    if not buffer:
+                        # The image is newer than every diff seen so far. That
+                        # is not a failure — it is normal on a symbol whose
+                        # book updates slowly, where the REST call outruns the
+                        # stream. Refetching here was the bug: on WIFUSDT it
+                        # discarded the snapshot and started again roughly once
+                        # a second, so the feed never left "connecting" and no
+                        # quote was placed in an hour. Keep the image and wait
+                        # for the diff that reaches it.
+                        continue
+
                     # Futures brackets lastUpdateId itself, not the one after.
-                    if not buffer or not (buffer[0][0].first_id <= last <= buffer[0][0].final_id):
-                        yield FeedStatus("resyncing", "snapshot did not join the diff stream")
+                    first = buffer[0][0]
+                    if first.first_id > last:
+                        # The stream has moved past the image: there is a hole
+                        # between them that no amount of waiting fills.
+                        yield FeedStatus("resyncing", "snapshot older than the diff stream")
                         snapshot = None
                         buffer = []
                         snapshot_task = asyncio.create_task(self.fetch_snapshot())
@@ -430,7 +447,7 @@ class BinanceFuturesFeed(Feed):
                     continue
 
                 # --- phase 2: steady state, checked against `pu` ------------
-                if prev_u is not None and pu != prev_u:
+                if pu != prev_u:
                     log.warning(
                         "futures depth gap on %s: expected pu=%d, got pu=%d", self._symbol, prev_u, pu
                     )

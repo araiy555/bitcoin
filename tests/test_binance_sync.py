@@ -150,7 +150,7 @@ class TestSync:
         events = await collect(feed, [depth_frame(105, 110), depth_frame(201, 205)])
 
         statuses = [e.detail for e in events if isinstance(e, FeedStatus)]
-        assert any("did not join" in s for s in statuses)
+        assert any("older than the diff stream" in s for s in statuses)
 
     async def test_a_gap_in_the_stream_triggers_resync(self, monkeypatch):
         feed = make_feed([100, 300], monkeypatch)
@@ -221,3 +221,39 @@ class TestSync:
         )
 
         assert len([e for e in events if isinstance(e, DepthDelta)]) == 1
+
+
+class TestSlowBookSync:
+    """The REST image can outrun a slowly-updating book.
+
+    When every buffered diff is older than the snapshot, the handshake has
+    not failed — there is simply nothing new yet. Refetching restarts the
+    same race, and on a quiet symbol it never terminates: the feed stays at
+    "connecting" and the risk gate holds every quote.
+    """
+
+    async def test_a_snapshot_ahead_of_the_buffer_waits_instead_of_refetching(
+        self, monkeypatch
+    ):
+        feed = make_feed([100], monkeypatch)
+        fetches = 0
+        original = feed.fetch_snapshot
+
+        async def counted():
+            nonlocal fetches
+            fetches += 1
+            return await original()
+
+        monkeypatch.setattr(feed, "fetch_snapshot", counted)
+
+        events = await collect(feed, [depth_frame(90, 95), depth_frame(96, 105)])
+
+        assert fetches == 1
+        assert any(isinstance(e, FeedStatus) and e.state == "live" for e in events)
+
+    async def test_a_stream_past_the_snapshot_still_resyncs(self, monkeypatch):
+        feed = make_feed([100, 200], monkeypatch)
+
+        events = await collect(feed, [depth_frame(150, 160), depth_frame(161, 170)])
+
+        assert any(isinstance(e, FeedStatus) and e.state == "resyncing" for e in events)
