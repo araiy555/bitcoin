@@ -150,7 +150,40 @@ async def fetch_futures_instrument(symbol: str) -> Instrument:
     raise RuntimeError(f"{wanted} is not listed on USDⓈ-M futures")
 
 
+class ConfigError(Exception):
+    """A setting that would make the session do nothing, caught at startup."""
+
+
+def _check_sizes(instrument: Instrument, args: argparse.Namespace) -> None:
+    """Refuse sizes that round away to nothing.
+
+    Quantities round *down* to the lot size, so an order smaller than one lot
+    becomes zero and is never placed. The defaults are BTC-shaped: 0.01 is a
+    sensible order there and is below the minimum on WIFUSDT, whose lot is
+    0.1. Left unchecked this runs for as long as it is asked to, reports
+    "QUOTE: ok" every cycle, and places nothing — which is the hardest kind
+    of failure to read.
+    """
+    lot = instrument.lot_size
+    size_lots = instrument.to_lots(args.size)
+    position_lots = instrument.to_lots(args.max_position)
+
+    if size_lots <= 0:
+        suggestion = f"{lot * 100:g}"
+        raise ConfigError(
+            f"--size {args.size} は {instrument.symbol} の最小単位 {lot:g} 未満です。\n"
+            f"  数量は切り捨てられるので、注文は0になり一度も置かれません。\n"
+            f"  --size {suggestion} 以上を指定してください。"
+        )
+    if position_lots < size_lots:
+        raise ConfigError(
+            f"--max-position {args.max_position} が --size {args.size} より小さいため、\n"
+            f"  最初の1枚も建てられません。建玉上限を広げてください。"
+        )
+
+
 def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker:
+    _check_sizes(instrument, args)
     market = MarketView(instrument=instrument, depth=args.depth)
 
     quoter = Quoter(
@@ -288,7 +321,11 @@ async def _market_feed(args: argparse.Namespace) -> tuple[Instrument, Feed]:
 
 async def cmd_live(args: argparse.Namespace) -> int:
     instrument, feed = await _market_feed(args)
-    mm = build_maker(instrument, args)
+    try:
+        mm = build_maker(instrument, args)
+    except ConfigError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
     await drive(feed, mm, args, headless=args.headless)
     return 0
 

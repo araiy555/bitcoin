@@ -616,3 +616,66 @@ class TestLiveProductRouting:
 
         with pytest.raises(RuntimeError, match="exchangeInfo"):
             await cli._market_feed(args)
+
+
+class TestSizeValidation:
+    """A size below one lot rounds to zero and is never placed. Unchecked,
+    the session runs its full duration reporting "QUOTE: ok" every cycle and
+    placing nothing — the hardest failure to read from a report."""
+
+    def _args(self, **kw):
+        import argparse
+
+        base = dict(
+            size="0.01", max_position="0.10", depth=12, gamma=0.6, kappa=1.4,
+            levels=3, level_step=2, min_half_spread=1, min_edge_bps=None,
+            maker_bps=2.0, taker_bps=4.0, max_notional=250_000.0,
+            max_drawdown=2_000.0, latency_ms=5.0, cancel_ahead=0.5,
+            requote_ms=250.0,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_a_size_below_one_lot_is_refused(self):
+        from decimal import Decimal
+
+        from jsboard.cli import ConfigError, build_maker
+        from jsboard.core.types import Instrument
+
+        wif = Instrument("WIFUSDT", tick_size=Decimal("0.0001"), lot_size=Decimal("0.1"))
+
+        with pytest.raises(ConfigError, match="最小単位"):
+            build_maker(wif, self._args(size="0.01"))
+
+    def test_a_size_at_the_lot_size_is_accepted(self):
+        from decimal import Decimal
+
+        from jsboard.cli import build_maker
+        from jsboard.core.types import Instrument
+
+        wif = Instrument("WIFUSDT", tick_size=Decimal("0.0001"), lot_size=Decimal("0.1"))
+
+        mm = build_maker(wif, self._args(size="10", max_position="100"))
+
+        assert mm.instrument.symbol == "WIFUSDT"
+
+    def test_a_position_limit_below_one_order_is_refused(self):
+        from decimal import Decimal
+
+        from jsboard.cli import ConfigError, build_maker
+        from jsboard.core.types import Instrument
+
+        btc = Instrument("BTCUSDT", tick_size=Decimal("0.1"), lot_size=Decimal("0.001"))
+
+        with pytest.raises(ConfigError, match="max-position"):
+            build_maker(btc, self._args(size="1.0", max_position="0.5"))
+
+    def test_the_btc_defaults_still_work(self):
+        from decimal import Decimal
+
+        from jsboard.cli import build_maker
+        from jsboard.core.types import Instrument
+
+        btc = Instrument("BTCUSDT", tick_size=Decimal("0.01"), lot_size=Decimal("0.00001"))
+
+        assert build_maker(btc, self._args()) is not None
