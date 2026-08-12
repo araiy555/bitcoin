@@ -35,6 +35,8 @@ class Position:
     realized_pnl: float = 0.0
     fees_paid: float = 0.0
     volume_lots: int = 0
+    buy_lots: int = 0
+    sell_lots: int = 0
     fill_count: int = 0
     maker_fills: int = 0
     taker_fills: int = 0
@@ -68,6 +70,10 @@ class Position:
         fee = self.fees.cost(notional, is_maker)
         self.fees_paid += fee
         self.volume_lots += qty_lots
+        if side is Side.BUY:
+            self.buy_lots += qty_lots
+        else:
+            self.sell_lots += qty_lots
         self.fill_count += 1
         if is_maker:
             self.maker_fills += 1
@@ -128,10 +134,23 @@ class Position:
     def total_pnl(self, mark_ticks: float | None) -> float:
         return self.realized_pnl + self.unrealized_pnl(mark_ticks)
 
+    @property
+    def gross_pnl(self) -> float:
+        """Realised P&L before fees — the spread we actually captured.
+
+        `realized_pnl` has every fee already subtracted from it, so adding
+        them back recovers the gross figure exactly. Kept as a property
+        rather than a second accumulator so the two can never drift apart.
+        """
+        return self.realized_pnl + self.fees_paid
+
     def summary(self, mark_ticks: float | None) -> dict[str, float]:
         return {
             "position": self.qty,
             "avg_price": self.avg_price,
+            "gross": self.gross_pnl,
+            "bought": self.instrument.qty_f(self.buy_lots),
+            "sold": self.instrument.qty_f(self.sell_lots),
             "realized": self.realized_pnl,
             "unrealized": self.unrealized_pnl(mark_ticks),
             "total": self.total_pnl(mark_ticks),

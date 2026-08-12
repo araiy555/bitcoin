@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import sys
 import time
 from datetime import date, timedelta
@@ -244,9 +245,58 @@ async def drive(feed: Feed, mm: MarketMaker, args: argparse.Namespace, *, headle
     _print_report(mm, result)
 
 
+def _price_decimals(instrument) -> int:
+    """Enough digits to show a tick. A cent default hides most alt prices."""
+    return max(2, -instrument.tick_size.as_tuple().exponent)
+
+
+def _capture_line(mm: MarketMaker, s: dict) -> str | None:
+    """Gross spread capture per round trip, against the fee that eats it.
+
+    This is the number the whole exercise turns on. Total P&L mixes three
+    different things — spread captured, fees paid, and an open position
+    marked to market — and only the first is the edge. Isolating it says
+    whether the strategy loses because it has no edge or because the edge is
+    smaller than the fee, which are not the same problem.
+    """
+    matched = min(s["bought"], s["sold"])
+    mid_ticks = s.get("mid_ticks")
+    if matched <= 0 or not mid_ticks:
+        return None
+    mid = float(mid_ticks) * float(mm.instrument.tick_size)
+    closed_notional = matched * mid
+    if closed_notional <= 0:
+        return None
+
+    gross_bps = s["gross"] / closed_notional * 10_000.0
+    fee_bps = 2.0 * mm.position.fees.maker_bps
+    edge = gross_bps - fee_bps
+    colour = "green" if edge > 0 else "red"
+    return (
+        f"  spread capture : {gross_bps:+.2f} bps gross per round trip "
+        f"vs {fee_bps:.2f} bps of fees  "
+        f"[{colour}]({edge:+.2f} bps)[/{colour}]"
+    )
+
+
+def _markout_line(s: dict) -> str | None:
+    """Adverse selection: where the mid went after our fills matured."""
+    windows = s.get("markout") or []
+    parts = []
+    for w in windows:
+        mean = w["mean_bps"]
+        if math.isnan(mean):
+            parts.append(f"+{w['horizon_s']:.0f}s n/a")
+            continue
+        colour = "green" if mean >= 0 else "red"
+        parts.append(f"+{w['horizon_s']:.0f}s [{colour}]{mean:+.2f}[/{colour}]bps(n={int(w['n'])})")
+    return "  mark-out       : " + "  ".join(parts) if parts else None
+
+
 def _print_report(mm: MarketMaker, result) -> None:
     s = mm.summary()
     inst = mm.instrument
+    dp = _price_decimals(inst)
     console.print()
     console.rule(f"[bold cyan]{inst.symbol} — session report")
     console.print(
@@ -254,14 +304,18 @@ def _print_report(mm: MarketMaker, result) -> None:
         f"  elapsed        : {result.elapsed_s:,.1f}s over {result.events:,} events\n"
         f"  quote cycles   : {s['cycles']:,}  "
         f"(placed {s['placed']:,} / cancelled {s['cancelled']:,} / kept {s['kept']:,})\n"
-        f"  fills          : {int(s['fills']):,}  volume {s['volume']:,.5f} {inst.base}\n"
-        f"  position       : {s['position']:+,.5f} {inst.base} @ {s['avg_price']:,.2f}\n"
-        f"  realized P&L   : {s['realized']:+,.2f} {inst.quote}\n"
+        f"  fills          : {int(s['fills']):,}  volume {s['volume']:,.5f} {inst.base}  "
+        f"(bought {s['bought']:,.5f} / sold {s['sold']:,.5f})\n"
+        f"  position       : {s['position']:+,.5f} {inst.base} @ {s['avg_price']:,.{dp}f}\n"
+        f"  realized P&L   : {s['realized']:+,.2f} {inst.quote}  "
+        f"(gross {s['gross']:+,.2f} less {s['fees']:,.2f} fees)\n"
         f"  unrealized P&L : {s['unrealized']:+,.2f} {inst.quote}\n"
-        f"  fees paid      : {s['fees']:,.2f} {inst.quote}\n"
-        f"  [bold]total P&L      : {s['total']:+,.2f} {inst.quote}[/bold]\n"
-        f"  last decision  : {s['decision']}"
+        f"  [bold]total P&L      : {s['total']:+,.2f} {inst.quote}[/bold]"
     )
+    for line in (_capture_line(mm, s), _markout_line(s)):
+        if line:
+            console.print(line)
+    console.print(f"  last decision  : {s['decision']}")
     console.rule()
 
 

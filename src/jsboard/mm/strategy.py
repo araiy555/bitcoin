@@ -18,6 +18,7 @@ from ..feed.base import DepthDelta, DepthSnapshot, FeedEvent, TradeTick
 from ..sim.paper import PAPER_OWNER, PaperVenue
 from .fair_value import FairValueEstimator
 from .inventory import Position
+from .markout import MarkOutTracker
 from .quoter import Quote, Quoter, QuoteSet
 from .risk import RiskAction, RiskDecision, RiskManager
 
@@ -56,6 +57,7 @@ class MarketMaker:
     risk: RiskManager = field(default_factory=RiskManager)
     config: StrategyConfig = field(default_factory=StrategyConfig)
     stats: StrategyStats = field(default_factory=StrategyStats)
+    markout: MarkOutTracker = field(default_factory=MarkOutTracker)
     clock: object = time.time_ns
     last_quotes: QuoteSet = field(default_factory=QuoteSet)
     last_decision: RiskDecision | None = None
@@ -70,8 +72,16 @@ class MarketMaker:
         fills: list[Fill] = []
         if isinstance(event, TradeTick):
             fills = self.venue.on_trade(event)
+            now = self.clock()
             for fill in fills:
                 self.position.apply(fill, PAPER_OWNER)
+                # Our side of the trade, which is the opposite of the taker's
+                # when we were the maker. Both sides are possible on one fill
+                # only if we somehow traded with ourselves; book each anyway.
+                if fill.maker_owner == PAPER_OWNER:
+                    self.markout.on_fill(now, fill.aggressor.opposite.sign, fill.price, fill.qty)
+                if fill.taker_owner == PAPER_OWNER:
+                    self.markout.on_fill(now, fill.aggressor.sign, fill.price, fill.qty)
             if fills:
                 self.stats.fills += len(fills)
                 self.recent_fills.extend(fills)
@@ -82,6 +92,7 @@ class MarketMaker:
             for price, qty in event.asks:
                 self.venue.on_depth(Side.SELL, price, qty)
 
+        self.markout.poll(self.clock(), self.market.mid)
         return fills
 
     # -------------------------------------------------------------- quoting
@@ -210,6 +221,7 @@ class MarketMaker:
                 "kept": self.stats.orders_kept,
                 "decision": self.stats.last_decision,
                 "halted": self.risk.halted,
+                "markout": self.markout.summary(),
             }
         )
         return out
