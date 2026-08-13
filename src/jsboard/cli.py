@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import math
@@ -529,6 +530,67 @@ def _grid(spec: str, cast):
     return out
 
 
+def _cast_like(current) -> object:
+    """Cast a sweep value the way the parser would have cast the default.
+
+    Sizes are carried as strings so Decimal keeps them exact, floats stay
+    floats, and a setting whose default is None gets the narrowest type its
+    text will support.
+    """
+    if isinstance(current, bool):
+        return lambda s: s.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(current, int):
+        return int
+    if isinstance(current, float):
+        return float
+    if isinstance(current, str):
+        return str
+
+    def guess(s: str):
+        for cast in (int, float):
+            try:
+                return cast(s)
+            except ValueError:
+                continue
+        return s
+
+    return guess
+
+
+def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
+    """Every setting being varied, as {argument name: values to try}.
+
+    `--distances` and `--sizes` are the two axes worth a shorthand; `--axis`
+    reaches the rest. A name that is not an actual setting is refused rather
+    than ignored, since a typo would otherwise run the same configuration N
+    times and read as a result.
+    """
+    axes: dict[str, list] = {}
+    if args.distances:
+        axes["max_distance"] = _grid(args.distances, int)
+    if args.sizes:
+        axes["size"] = _grid(args.sizes, str)
+
+    for spec in args.axis or []:
+        name, sep, values = spec.partition("=")
+        name = name.strip().replace("-", "_")
+        if not sep or not values.strip():
+            raise ConfigError(f"--axis {spec} は name=v1,v2 の形で指定してください。")
+        if not hasattr(args, name):
+            raise ConfigError(
+                f"--axis {name} という設定はありません。"
+                f"  `jsboard sweep --help` で名前を確認してください。"
+            )
+        axes[name] = _grid(values, _cast_like(getattr(args, name)))
+    return axes
+
+
+def _label(name: str, value) -> str:
+    if name == "max_distance":
+        return "touch" if value == 0 else ("none" if value is None else str(value))
+    return "none" if value is None else str(value)
+
+
 def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     """Reduce one replay to the handful of numbers worth comparing."""
     matched = min(s["bought"], s["sold"])
@@ -568,25 +630,31 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         return 1
 
     instrument = _instrument_for_recording(path, args)
-    distances = _grid(args.distances, int)
-    sizes = _grid(args.sizes, str) or [args.size]
-    combos = [(d, z) for d in distances for z in sizes]
+    axes = _sweep_axes(args)
+    if not axes:
+        raise ConfigError("掃引する軸がありません。--distances か --axis を指定してください。")
+
+    names = list(axes)
+    combos = list(itertools.product(*(axes[n] for n in names)))
 
     console.print(
         f"{path.name}: {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
         f"{len(combos)} 通りを同じ録画に対して再生します "
-        f"(maker {args.maker_bps:g}bps → 往復 {2 * args.maker_bps:g}bps)"
+        f"(maker {args.maker_bps:g}bps → 往復 {2 * args.maker_bps:g}bps)\n"
+        f"軸: {', '.join(f'{n}={len(axes[n])}' for n in names)}"
     )
 
     rows = []
-    for distance, size in combos:
+    for combo in combos:
+        settings = dict(zip(names, combo, strict=True))
         run_args = argparse.Namespace(**vars(args))
-        run_args.max_distance = distance
-        run_args.size = size
+        for name, value in settings.items():
+            setattr(run_args, name, value)
+        shown = "  ".join(f"{n}={_label(n, v)}" for n, v in settings.items())
         try:
             _check_sizes(instrument, run_args)
         except ConfigError as exc:
-            console.print(f"[yellow]skip distance={distance} size={size}: {exc}[/yellow]")
+            console.print(f"[yellow]skip {shown}: {exc}[/yellow]")
             continue
 
         mm = build_maker(instrument, run_args)
@@ -594,9 +662,9 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         feed = ReplayFeed(instrument, path, speed=0.0, source=args.source)
         await run(feed, mm, duration_s=None, max_events=args.max_events)
         row = _sweep_row(mm, mm.summary())
-        row.update({"distance": distance, "size": size})
+        row["settings"] = settings
         rows.append(row)
-        console.print(f"  distance={str(distance):>4}  size={size:>10}  fills={row['fills']:,}")
+        console.print(f"  {shown}  fills={row['fills']:,}")
 
     if not rows:
         console.print("[red]走れた組み合わせがありません。[/red]")
@@ -605,8 +673,8 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
     # Best net edge first; rows that never filled have nothing to rank and go last.
     rows.sort(key=lambda r: (math.isnan(r["net_bps"]), -(r["net_bps"] or 0.0)))
     table = Table(title=f"{instrument.symbol} — sweep ({path.name})")
-    table.add_column("distance", justify="right")
-    table.add_column("size", justify="right")
+    for name in names:
+        table.add_column(name.replace("_", " "), justify="right")
     table.add_column("約定", justify="right")
     table.add_column("touch%", justify="right")
     table.add_column("取り bps", justify="right")
@@ -618,8 +686,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         net = r["net_bps"]
         colour = "dim" if math.isnan(net) else ("green" if net > 0 else "red")
         table.add_row(
-            "touch" if r["distance"] == 0 else str(r["distance"]),
-            str(r["size"]),
+            *(_label(n, r["settings"][n]) for n in names),
             f"{r['fills']:,}",
             f"{r['touch_share']:.0f}%",
             "—" if math.isnan(r["capture_bps"]) else f"{r['capture_bps']:+.2f}",
@@ -1656,6 +1723,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--sizes",
         default="",
         help="quote sizes to try (default: just --size)",
+    )
+    p_sw.add_argument(
+        "--axis",
+        action="append",
+        metavar="NAME=V1,V2",
+        help="任意の設定を軸にする (例: --axis gamma=0.6,3,9)。繰り返し指定可",
     )
     p_sw.add_argument(
         "--source", default=None,
