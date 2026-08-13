@@ -467,3 +467,41 @@ async def watch(
         if on_round:
             on_round(i + 1, rounds, tally, considered)
     return tally
+
+
+# ------------------------------------------------------------------ triage
+
+EXCHANGE_INFO = {
+    "spot": (VENUES["spot"][0], "/api/v3/exchangeInfo"),
+    "perp": (VENUES["perp"][0], "/fapi/v1/exchangeInfo"),
+}
+
+
+def parse_tick_sizes(payload: dict) -> dict[str, str]:
+    """Every symbol's tick, from one exchangeInfo call.
+
+    Fetching per symbol would be hundreds of round trips for a screen whose
+    whole point is being cheap enough to run on the entire market.
+    """
+    out: dict[str, str] = {}
+    for info in payload.get("symbols", ()):
+        for f in info.get("filters", ()):
+            if f.get("filterType") == "PRICE_FILTER":
+                out[info["symbol"]] = f["tickSize"]
+                break
+    return out
+
+
+async def fetch_tick_sizes(
+    session: aiohttp.ClientSession | None = None, *, product: str = "spot"
+) -> dict[str, str]:
+    if product not in EXCHANGE_INFO:
+        raise ValueError(f"product must be one of {tuple(EXCHANGE_INFO)}")
+    base, path = EXCHANGE_INFO[product]
+    owns = session is None
+    session = session or make_session()
+    try:
+        return parse_tick_sizes(await _get_json(session, path, base))
+    finally:
+        if owns:
+            await session.close()

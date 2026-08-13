@@ -42,6 +42,7 @@ from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
+from .research import triage
 from .research.archive import days_ending, fetch_day, load_seconds
 from .research.events import combine, score, simulate, threshold
 from .research.features import attach_open_interest, build, load_open_interest, to_minutes
@@ -54,7 +55,15 @@ from .research.predict import (
     split,
     volatility_threshold,
 )
-from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
+from .research.scan import (
+    ScanFilters,
+    fetch_market,
+    fetch_tick_sizes,
+    rank_persistence,
+    scan,
+    summarise,
+    watch,
+)
 from .sim.capture import MultiCapture, write_meta
 from .sim.hedge import HedgeConfig, Hedger
 from .sim.paper import PAPER_OWNER, PaperConfig, PaperVenue
@@ -807,6 +816,98 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
     console.print(
         "[dim]同じ1時間に対する再生なので、行どうしの比較は公平です。"
         "ただし約定数が二桁に届かない行は、まだ数字として読めません。[/dim]"
+    )
+    return 0
+
+
+async def cmd_triage(args: argparse.Namespace) -> int:
+    """Reject the whole market on three numbers, before writing any code.
+
+    Fee, tick width and spread. The best a maker can do is capture the spread
+    once per round trip, so a symbol whose spread does not cover twice the
+    maker fee is finished — no simulation, no recording, no strategy work.
+    """
+    try:
+        market = await fetch_market(product=args.product)
+        ticks = await fetch_tick_sizes(product=args.product)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]取得に失敗しました: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+
+    rows = []
+    missing_tick = 0
+    for symbol, stats in market.items():
+        if not symbol.endswith(args.quote_asset) or stats.quote_volume < args.min_volume:
+            continue
+        tick = ticks.get(symbol)
+        if tick is None:
+            # Listed on the ticker feed but not in exchangeInfo: skipped
+            # rather than guessed, since a wrong tick decides the verdict.
+            missing_tick += 1
+            continue
+        row = triage.build(
+            symbol,
+            bid=stats.bid,
+            ask=stats.ask,
+            tick_size=tick,
+            quote_volume=stats.quote_volume,
+        )
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        console.print("[red]条件に合う銘柄がありません。[/red]")
+        return 1
+
+    counts = triage.tally(rows, args.maker_bps, min_ticks=args.min_ticks)
+    survivors = triage.rank(rows, args.maker_bps, min_ticks=args.min_ticks)
+
+    console.print()
+    console.rule("[bold cyan]一次審査")
+    console.print(
+        f"  {args.product} / {args.quote_asset}建て / 24h出来高 {args.min_volume:,.0f} 以上\n"
+        f"  メイカー {args.maker_bps:g} bps → 往復 {2 * args.maker_bps:g} bps"
+        f" / スプレッド {args.min_ticks:g} tick 以上を要求\n"
+        f"  {len(rows):,} 銘柄  →  "
+        + "  ".join(f"{k} {v:,}" for k, v in counts.items())
+    )
+    if missing_tick:
+        console.print(f"  [dim]tick 不明で除外: {missing_tick:,}[/dim]")
+
+    if not survivors:
+        console.print(
+            "\n[red]候補ゼロ。この手数料では、板を全部取っても往復コストに勝てません。[/red]\n"
+            "[dim]手数料を下げる以外にできることはありません。"
+            "--maker-bps を変えて必要水準を探ってください。[/dim]"
+        )
+        return 0
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("symbol", style="cyan")
+    table.add_column("1tick\n(bps)", justify="right")
+    table.add_column("spread\n(bps)", justify="right")
+    table.add_column("spread\n(tick)", justify="right")
+    table.add_column("余裕\n(bps)", justify="right")
+    table.add_column("24h出来高", justify="right")
+    for row in survivors[: args.top]:
+        head = row.headroom_bps(args.maker_bps)
+        table.add_row(
+            row.symbol,
+            f"{row.tick_bps:,.2f}",
+            f"{row.spread_bps:,.2f}",
+            f"{row.spread_ticks:,.1f}",
+            f"[green]{head:+,.2f}[/green]",
+            f"{row.quote_volume:,.0f}",
+        )
+    console.print()
+    console.print(table)
+    console.print(
+        "\n[dim]これは落とすための審査で、通ったことは何の保証でもありません。"
+        "余裕 bps は「板を全部取れたら」の上限で、逆選択も在庫もヘッジ代も"
+        "まだ1銭も引いていません。上位数銘柄だけ capture → sweep → hedge に回してください。[/dim]"
     )
     return 0
 
@@ -2030,6 +2131,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_hg.set_defaults(
         func=cmd_hedge, headless=True, max_distance=0, requote_ms=100.0, min_edge_bps=0.0
     )
+
+    p_tri = sub.add_parser("triage", help="手数料・tick・スプレッドだけで全銘柄を一次審査")
+    p_tri.add_argument("--product", default="perp", choices=("spot", "perp"))
+    p_tri.add_argument("--maker-bps", type=float, default=10.0)
+    p_tri.add_argument("--min-ticks", type=float, default=2.0, help="必要なスプレッド幅")
+    p_tri.add_argument("--quote-asset", default="USDT")
+    p_tri.add_argument("--min-volume", type=float, default=5_000_000.0)
+    p_tri.add_argument("--top", type=int, default=25)
+    p_tri.set_defaults(func=cmd_triage)
 
     p_bt = sub.add_parser("backtest", help="headless synthetic run")
     add_common(p_bt)
