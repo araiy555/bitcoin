@@ -31,9 +31,9 @@ from rich.live import Live
 from rich.table import Table
 
 from .core.market import MarketView
-from .core.types import Instrument
+from .core.types import Instrument, Side
 from .feed import multi
-from .feed.base import Feed
+from .feed.base import DepthDelta, DepthSnapshot, Feed, TradeTick
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
 from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged
@@ -831,6 +831,8 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     so the tape alone gives maker-side adverse selection with no fill model
     in the way.
     """
+    if args.replay:
+        return await _probe_replay(args)
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     else:
@@ -938,6 +940,69 @@ async def cmd_probe(args: argparse.Namespace) -> int:
             "まだ引かれていないので、候補は capture → sweep → hedge の全コスト後 Net で"
             "判定してください。[/dim]"
         )
+    return 0
+
+
+async def _probe_replay(args: argparse.Namespace) -> int:
+    """Run the live screen's own measurement over a recording instead.
+
+    The screen and an hour of replayed depth disagreed about USUSDT by a
+    factor of ten, and two explanations fit: the screen measures the wrong
+    thing, or the two looked at different hours of a market whose character
+    changes. Feeding the recording through the screen's own accumulator
+    separates them — same data, same clock, only the method differs. If it
+    reproduces the replay's figure, the screen is sound and the gap was the
+    market; if it reproduces the screen's, the method is the problem.
+    """
+    path = Path(args.replay)
+    if not path.exists():
+        raise ConfigError(f"{path} がありません。")
+
+    instrument = _instrument_for_recording(path, args)
+    view = MarketView(instrument=instrument, depth=args.depth)
+    probe = dynamic.SymbolProbe(instrument.symbol, horizon_s=args.horizon_ms / 1000.0)
+    tick = float(instrument.tick_size)
+
+    console.print(
+        f"{path.name} ({args.source or 'all'}) を動的審査の計算式で再生します\n"
+        f"  [dim]{instrument.symbol} tick={instrument.tick_size}[/dim]"
+    )
+
+    for src, event in iter_tagged(path):
+        if args.source is not None and src is not None and src != args.source:
+            continue
+        view.apply(event)
+        ts = getattr(event, "ts_ns", 0) or 0
+        if isinstance(event, (DepthDelta, DepthSnapshot)):
+            bid, ask = view.book.best_bid(), view.book.best_ask()
+            if bid is None or ask is None:
+                continue
+            probe.on_book(
+                bid * tick,
+                ask * tick,
+                ts,
+                bid_qty=instrument.qty_f(view.book.depth_at(Side.BUY, bid)),
+                ask_qty=instrument.qty_f(view.book.depth_at(Side.SELL, ask)),
+            )
+        elif isinstance(event, TradeTick):
+            probe.on_trade(event.aggressor.sign, ts, qty=instrument.qty_f(event.qty))
+
+    console.print()
+    console.rule(f"[bold cyan]{instrument.symbol} — 録画に対する動的審査")
+    console.print(
+        f"  spread          : {probe.spread_bps:,.2f} bps\n"
+        f"  逆選択 {args.horizon_ms:g}ms  : {probe.markout_bps:+,.2f} bps"
+        f"  (全約定 {probe.settled:,})\n"
+        f"  逆選択 板消しのみ: {probe.sweep_markout_bps:+,.2f} bps"
+        f"  (板消し {probe.sweeps_settled:,})\n"
+        f"  [bold]MO/spread       : 全約定 {probe.ratio:,.2f}"
+        f"  / 板消し {probe.sweep_ratio:,.2f}[/bold]"
+    )
+    console.print(
+        "\n[dim]同じ録画をペーパー MM で再生した値と突き合わせてください。"
+        "一致すれば計算式は正しく、ライブとの差は時間帯の違いです。"
+        "一致しなければ計算式の側に原因があります。[/dim]"
+    )
     return 0
 
 
@@ -2317,6 +2382,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_prb = sub.add_parser("probe", help="候補を5分まとめて動的審査 (逆選択/スプレッド)")
     p_prb.add_argument("--symbols", default="", help="カンマ区切り。省略すると triage の候補")
+    p_prb.add_argument(
+        "--replay", default=None,
+        help="ライブではなく録画に対して同じ計算式を走らせる（検算用）",
+    )
+    p_prb.add_argument("--source", default=None, help="録画のどちらを使うか (spot / perp)")
+    p_prb.add_argument("--depth", type=int, default=20)
+    p_prb.add_argument("--tick-size", default=None)
+    p_prb.add_argument("--lot-size", default=None)
     p_prb.add_argument("--duration", type=float, default=300.0)
     p_prb.add_argument("--horizon-ms", type=float, default=100.0)
     p_prb.add_argument("--min-trades", type=int, default=500, help="判定に要る約定数")
