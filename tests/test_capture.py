@@ -285,3 +285,65 @@ def test_meta_records_the_tick_and_lot_sizes(tmp_path):
     payload = json.loads(meta.read_text(encoding="utf-8"))
     assert payload["sources"]["spot"]["tick_size"] == "0.01"
     assert payload["sources"]["perp"]["tick_size"] == "0.1"
+
+
+class TestCaptureIsReplayable:
+    """The writer and the reader have to agree on the envelope.
+
+    They drifted once: `capture` wraps each encoded event with a source tag
+    and a receive time, and feeding those straight to an event constructor is
+    a TypeError. Nothing caught it because every test decoded rows by hand
+    rather than through the feed that actually replays them.
+    """
+
+    def events(self):
+        return [
+            FeedStatus("connected", "scripted"),
+            DepthSnapshot(bids=[(100, 5)], asks=[(101, 5)], last_update_id=1, ts_ns=10),
+            DepthDelta(bids=[(100, 7)], asks=[], first_id=2, final_id=2, ts_ns=20),
+            TradeTick(price=100, qty=3, aggressor=Side.SELL, trade_id=1, ts_ns=30),
+            MarkPrice(mark=100, index=100, funding_rate=0.0, next_funding_ns=0, ts_ns=40),
+        ]
+
+    async def record(self, tmp_path, sources, expected):
+        # `run` stops on a count, not on the producers finishing, so ask for
+        # exactly what the scripts emit or the loop waits out the clock.
+        out = tmp_path / "cap.jsonl"
+        await MultiCapture(sources, out).run(max_events=expected)
+        return out
+
+    async def replay(self, path, **kw):
+        from jsboard.feed.replay import ReplayFeed
+
+        feed = ReplayFeed(INST, path, speed=0.0, **kw)
+        return [e async for e in feed.stream()]
+
+    @pytest.mark.asyncio
+    async def test_every_written_line_decodes(self, tmp_path):
+        events = self.events()
+        out = await self.record(tmp_path, {"perp": ScriptedFeed(PERP, events)}, len(events))
+        replayed = await self.replay(out)
+        # Plus the reader's own connecting/disconnected bookends.
+        assert len(replayed) == len(events) + 2
+
+    @pytest.mark.asyncio
+    async def test_selecting_a_source_keeps_only_that_venue(self, tmp_path):
+        out = await self.record(
+            tmp_path,
+            {
+                "spot": ScriptedFeed(INST, [TradeTick(1, 1, Side.BUY, 11, 1)]),
+                "perp": ScriptedFeed(PERP, [TradeTick(2, 2, Side.BUY, 22, 2)]),
+            },
+            2,
+        )
+        trades = [e for e in await self.replay(out, source="perp") if isinstance(e, TradeTick)]
+        assert [t.trade_id for t in trades] == [22]
+
+    @pytest.mark.asyncio
+    async def test_the_receive_time_is_recorded_but_not_replayed(self, tmp_path):
+        events = self.events()
+        out = await self.record(tmp_path, {"perp": ScriptedFeed(PERP, events)}, len(events))
+        rows = [json.loads(x) for x in out.read_text().splitlines()]
+        assert all("rx_ns" in r for r in rows)
+        trades = [e for e in await self.replay(out) if isinstance(e, TradeTick)]
+        assert trades[0].ts_ns == 30

@@ -226,6 +226,23 @@ class JsonlRecorder:
         self._fh.write(json.dumps(_encode(event)) + "\n")
 
 
+SOURCE_KEY = "src"
+"""Which venue a captured line came from."""
+
+RX_KEY = "rx_ns"
+"""When this process received the line, as distinct from the exchange time."""
+
+ENVELOPE_KEYS = (SOURCE_KEY, RX_KEY)
+"""Keys `capture` adds around an encoded event, which are not event fields.
+
+They describe the recording rather than the market — which feed a line came
+from, and when this process received it. Passing them to an event constructor
+is a TypeError, so the reader strips them and the writer adds only these.
+Anything new a capture wants to record belongs in this tuple as well, or the
+recording stops being replayable.
+"""
+
+
 class ReplayFeed(Feed):
     """Replay a JSONL recording, optionally in original wall-clock time."""
 
@@ -255,10 +272,9 @@ class ReplayFeed(Feed):
                 if not line:
                     continue
                 raw = json.loads(line)
-                # `src` is a routing tag, not part of any event; decoding it
-                # into an event constructor is a TypeError, which is why a
-                # capture recording could not be replayed at all before.
-                src = raw.pop("src", None)
+                src = raw.pop(SOURCE_KEY, None)
+                for key in ENVELOPE_KEYS:
+                    raw.pop(key, None)
                 if self.source is not None and src is not None and src != self.source:
                     continue
                 event = _decode(raw)

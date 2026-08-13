@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..feed.base import Feed, FeedEvent, FeedStatus
-from ..feed.replay import _encode
+from ..feed.replay import RX_KEY, SOURCE_KEY, _encode
 
 
 @dataclass(slots=True)
@@ -120,8 +120,8 @@ class MultiCapture:
 
                     name, event, received_ns = item
                     row = _encode(event)
-                    row["src"] = name
-                    row["rx_ns"] = received_ns
+                    row[SOURCE_KEY] = name
+                    row[RX_KEY] = received_ns
                     fh.write(json.dumps(row) + "\n")
                     written += 1
 
