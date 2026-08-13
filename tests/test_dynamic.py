@@ -158,3 +158,74 @@ class TestClock:
         p.on_trade(+1, 1000 * MS)
         quote(p, 99.9, 100.1, 500)  # arrives out of order
         assert p.last_ns == 1000 * MS
+
+
+class TestSelectionBias:
+    """Which prints count changed the answer by a factor of five."""
+
+    def loaded(self, spread=10.0):
+        p = probe()
+        p.spread_samples.append(spread)
+        return p
+
+    def test_a_sweep_outweighs_a_shower_of_dust(self):
+        p = probe()
+        quote(p, 99.9, 100.1, 0)
+        # 100 harmless one-lot prints, then one sweep of 1,000 that runs.
+        for i in range(100):
+            p.on_trade(+1, i * MS, qty=1.0)
+        quote(p, 99.9, 100.1, 150)  # nothing moved for those
+        p.on_trade(+1, 150 * MS, qty=1000.0)
+        quote(p, 100.9, 101.1, 400)  # the sweep ran the price up
+        # Size weighting lets the sweep dominate, as it should.
+        assert p.markout_bps < -50
+
+    def test_only_prints_that_clear_the_touch_count_as_sweeps(self):
+        p = probe()
+        p.on_book(99.9, 100.1, 0, bid_qty=500, ask_qty=500)
+        p.on_trade(+1, 0, qty=100.0)  # too small to reach a queued maker
+        assert p.sweeps == 0
+        p.on_trade(+1, MS, qty=600.0)  # clears the offer
+        assert p.sweeps == 1
+
+    def test_the_side_that_matters_is_the_one_being_hit(self):
+        p = probe()
+        p.on_book(99.9, 100.1, 0, bid_qty=10, ask_qty=1000)
+        p.on_trade(-1, 0, qty=50.0)  # sells into a thin bid: clears it
+        assert p.sweeps == 1
+        p.on_trade(+1, MS, qty=50.0)  # buys into a deep offer: does not
+        assert p.sweeps == 1
+
+    def test_an_unknown_touch_size_is_not_treated_as_a_sweep(self):
+        p = probe()
+        quote(p, 99.9, 100.1, 0)  # no quantities carried
+        p.on_trade(+1, 0, qty=1e9)
+        assert p.sweeps == 0
+
+    def test_the_verdict_uses_the_sweeps_once_there_are_enough(self):
+        p = self.loaded()
+        for tracker, mo, n in (
+            (p.markout, -1.0, 5000),  # optimistic: ratio 0.10
+            (p.sweep_markout, -9.0, 500),  # realistic: ratio 0.90
+        ):
+            w = tracker.windows[0]
+            w.weight, w.weighted_vs_mid, w.n = float(n), mo * n, n
+        assert p.ratio == pytest.approx(0.10)
+        assert p.sweep_ratio == pytest.approx(0.90)
+        assert p.decisive_ratio() == pytest.approx(0.90)
+        assert p.verdict() == "見込み薄"
+
+    def test_too_few_sweeps_falls_back_to_every_print(self):
+        p = self.loaded()
+        w = p.markout.windows[0]
+        w.weight, w.weighted_vs_mid, w.n = 5000.0, -1.0 * 5000, 5000
+        sw = p.sweep_markout.windows[0]
+        sw.weight, sw.weighted_vs_mid, sw.n = 3.0, -9.0 * 3, 3
+        assert p.decisive_ratio() == pytest.approx(0.10)
+        assert p.verdict() == "研究候補"
+
+    def test_a_zero_size_print_is_ignored(self):
+        p = probe()
+        quote(p, 99.9, 100.1, 0)
+        p.on_trade(+1, 0, qty=0.0)
+        assert p.trades == 0

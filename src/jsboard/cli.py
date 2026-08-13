@@ -854,9 +854,12 @@ async def cmd_probe(args: argparse.Namespace) -> int:
             if probe is None:
                 continue
             if isinstance(event, multi.Quote):
-                probe.on_book(event.bid, event.ask, event.ts_ns)
+                probe.on_book(
+                    event.bid, event.ask, event.ts_ns,
+                    bid_qty=event.bid_qty, ask_qty=event.ask_qty,
+                )
             else:
-                probe.on_trade(event.aggressor_sign, event.ts_ns)
+                probe.on_trade(event.aggressor_sign, event.ts_ns, qty=event.qty)
             seen += 1
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]観測に失敗しました: {exc}[/red]")
@@ -866,7 +869,8 @@ async def cmd_probe(args: argparse.Namespace) -> int:
         return 1
 
     rows = list(probes.values())
-    counts = dynamic.tally(rows, min_trades=args.min_trades)
+    gates = {"min_trades": args.min_trades, "min_sweeps": args.min_sweeps}
+    counts = dynamic.tally(rows, **gates)
 
     console.print()
     console.rule("[bold cyan]動的審査 — 100ms で逆選択がスプレッドを超えるか")
@@ -878,21 +882,32 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     table.add_column("symbol", style="cyan")
     table.add_column("spread\n(bps)", justify="right")
     table.add_column(f"逆選択\n{args.horizon_ms:g}ms", justify="right")
-    table.add_column("MO/spread", justify="right")
+    table.add_column("MO/spread\n(全約定)", justify="right")
+    table.add_column("MO/spread\n(板を消した分)", justify="right")
     table.add_column("約定", justify="right")
+    table.add_column("うち\n板消し", justify="right")
     table.add_column("判定")
 
     style = {"研究候補": "green", "見込み薄": "yellow", "不可": "red"}
-    for probe in dynamic.rank(rows, min_trades=args.min_trades)[: args.top]:
-        verdict = probe.verdict(min_trades=args.min_trades)
-        ratio = probe.ratio
+    def cell(value: float, fmt: str = "{:,.2f}") -> str:
+        return "—" if math.isnan(value) else fmt.format(value)
+
+    for probe in dynamic.rank(rows, **gates)[: args.top]:
+        verdict = probe.verdict(**gates)
         colour = style.get(verdict, "dim")
+        decisive = probe.decisive_ratio(min_sweeps=args.min_sweeps)
+        sweep = probe.sweep_ratio
+        sweep_text = cell(sweep)
+        if not math.isnan(sweep) and probe.sweeps_settled >= args.min_sweeps:
+            sweep_text = f"[{colour}]{sweep_text}[/{colour}]"
         table.add_row(
             probe.symbol,
-            "—" if math.isnan(probe.spread_bps) else f"{probe.spread_bps:,.2f}",
-            "—" if math.isnan(probe.markout_bps) else f"{probe.markout_bps:+,.2f}",
-            "—" if math.isnan(ratio) else f"[{colour}]{ratio:,.2f}[/{colour}]",
+            cell(probe.spread_bps),
+            cell(probe.sweep_markout_bps if decisive is sweep else probe.markout_bps, "{:+,.2f}"),
+            cell(probe.ratio),
+            sweep_text,
             f"{probe.settled:,}",
+            f"{probe.sweeps_settled:,}",
             f"[{colour}]{verdict}[/{colour}]",
         )
     console.print()
@@ -916,9 +931,12 @@ async def cmd_probe(args: argparse.Namespace) -> int:
         )
     else:
         console.print(
-            "\n[dim]MO/spread が小さいことは必要条件でしかありません。手数料・在庫・"
-            "約定モデルの誤差の余白がまだ引かれていないので、候補は capture → sweep → "
-            "hedge で全コスト後の Net で判定してください。[/dim]"
+            "\n[dim]判定は「板を消した分」の列で行っています — メイカーが実際に約定するのは"
+            "前に並んだ枚数を食い切る約定だけで、それは最も攻撃的な側だからです。"
+            "全約定の列はその楽観側の上限で、2列が開いている銘柄ほど情報が一気に来る板です。\n"
+            "小さいことは必要条件でしかありません。手数料・在庫・約定モデルの誤差の余白が"
+            "まだ引かれていないので、候補は capture → sweep → hedge の全コスト後 Net で"
+            "判定してください。[/dim]"
         )
     return 0
 
@@ -2302,6 +2320,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_prb.add_argument("--duration", type=float, default=300.0)
     p_prb.add_argument("--horizon-ms", type=float, default=100.0)
     p_prb.add_argument("--min-trades", type=int, default=500, help="判定に要る約定数")
+    p_prb.add_argument(
+        "--min-sweeps", type=int, default=100,
+        help="板を消した約定がこの数あれば、そちらで判定する",
+    )
     p_prb.add_argument("--max-symbols", type=int, default=20)
     p_prb.add_argument("--top", type=int, default=30)
     # Passed through to the static screen when --symbols is omitted.

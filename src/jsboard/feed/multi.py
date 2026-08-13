@@ -38,6 +38,11 @@ class Quote:
     bid: float
     ask: float
     ts_ns: int
+    bid_qty: float = 0.0
+    ask_qty: float = 0.0
+    """Size resting at the touch. A maker joining that queue only trades once
+    a print is large enough to clear it, so the quantity decides which prints
+    it would actually have participated in."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +51,19 @@ class Print:
     aggressor_sign: int
     """+1 when the taker bought, -1 when it sold."""
     ts_ns: int
+    qty: float = 0.0
 
 
 def _chunk(items: list[str], size: int) -> Iterable[list[str]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def _number(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _parse(msg: dict) -> Quote | Print | None:
@@ -64,14 +77,17 @@ def _parse(msg: dict) -> Quote | Print | None:
         except (KeyError, TypeError, ValueError):
             return None
         ts = int(data.get("T") or data.get("E") or 0) * NS_PER_MS
-        return Quote(data["s"], bid, ask, ts)
+        return Quote(
+            data["s"], bid, ask, ts,
+            bid_qty=_number(data.get("B")), ask_qty=_number(data.get("A")),
+        )
     if kind == "aggTrade":
         # `m` is "the buyer was the maker", so a true value means the
         # aggressor sold. Reading it the other way flips every sign in the
         # measurement, which would look like a working strategy.
         sign = -1 if data.get("m") else 1
         ts = int(data.get("T") or data.get("E") or 0) * NS_PER_MS
-        return Print(data["s"], sign, ts)
+        return Print(data["s"], sign, ts, qty=_number(data.get("q")))
     return None
 
 
