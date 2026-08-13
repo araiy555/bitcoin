@@ -32,6 +32,7 @@ from rich.table import Table
 
 from .core.market import MarketView
 from .core.types import Instrument
+from .feed import multi
 from .feed.base import Feed
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
@@ -42,7 +43,7 @@ from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .net import describe_tls_error, make_session
-from .research import triage
+from .research import dynamic, triage
 from .research.archive import days_ending, fetch_day, load_seconds
 from .research.events import combine, score, simulate, threshold
 from .research.features import attach_open_interest, build, load_open_interest, to_minutes
@@ -818,6 +819,138 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         "ただし約定数が二桁に届かない行は、まだ数字として読めません。[/dim]"
     )
     return 0
+
+
+async def cmd_probe(args: argparse.Namespace) -> int:
+    """Measure every candidate at once: does the price outrun the spread?
+
+    The static screen cannot see speed, and USUSDT cost an hour of recording
+    to establish that. Watching the whole shortlist for five minutes settles
+    the same question for all of them at once, and no paper maker runs: every
+    public print is a fill a maker at the front of that queue would have had,
+    so the tape alone gives maker-side adverse selection with no fill model
+    in the way.
+    """
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        console.print("[dim]triage で候補を絞っています…[/dim]")
+        symbols = await _triage_survivors(args)
+        if not symbols:
+            console.print("[red]triage の候補がゼロです。動的審査に進む対象がありません。[/red]")
+            return 1
+
+    console.print(
+        f"{len(symbols)} 銘柄を {args.duration:,.0f} 秒間まとめて観測します"
+        f" (逆選択の地平 {args.horizon_ms:g}ms)\n"
+        f"  [dim]{', '.join(symbols)}[/dim]"
+    )
+
+    probes = {s: dynamic.SymbolProbe(s, horizon_s=args.horizon_ms / 1000.0) for s in symbols}
+    seen = 0
+    try:
+        async for event in multi.stream(symbols, duration_s=args.duration):
+            probe = probes.get(event.symbol)
+            if probe is None:
+                continue
+            if isinstance(event, multi.Quote):
+                probe.on_book(event.bid, event.ask, event.ts_ns)
+            else:
+                probe.on_trade(event.aggressor_sign, event.ts_ns)
+            seen += 1
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]観測に失敗しました: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+
+    rows = list(probes.values())
+    counts = dynamic.tally(rows, min_trades=args.min_trades)
+
+    console.print()
+    console.rule("[bold cyan]動的審査 — 100ms で逆選択がスプレッドを超えるか")
+    console.print(
+        f"  {seen:,} イベント  →  " + "  ".join(f"{k} {v:,}" for k, v in counts.items())
+    )
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("symbol", style="cyan")
+    table.add_column("spread\n(bps)", justify="right")
+    table.add_column(f"逆選択\n{args.horizon_ms:g}ms", justify="right")
+    table.add_column("MO/spread", justify="right")
+    table.add_column("約定", justify="right")
+    table.add_column("判定")
+
+    style = {"研究候補": "green", "見込み薄": "yellow", "不可": "red"}
+    for probe in dynamic.rank(rows, min_trades=args.min_trades)[: args.top]:
+        verdict = probe.verdict(min_trades=args.min_trades)
+        ratio = probe.ratio
+        colour = style.get(verdict, "dim")
+        table.add_row(
+            probe.symbol,
+            "—" if math.isnan(probe.spread_bps) else f"{probe.spread_bps:,.2f}",
+            "—" if math.isnan(probe.markout_bps) else f"{probe.markout_bps:+,.2f}",
+            "—" if math.isnan(ratio) else f"[{colour}]{ratio:,.2f}[/{colour}]",
+            f"{probe.settled:,}",
+            f"[{colour}]{verdict}[/{colour}]",
+        )
+    console.print()
+    console.print(table)
+
+    measured = len(rows) - counts["サンプル不足"]
+    if measured == 0:
+        # The stop condition must not fire on a failed measurement. Nothing
+        # was observed, so nothing was ruled out.
+        console.print(
+            "\n[yellow]測定できた銘柄がゼロです。判定は出ていません。[/yellow]\n"
+            "[dim]--duration を伸ばすか --min-trades を下げてください。"
+            "全銘柄で約定ゼロなら、板に到達できていません。[/dim]"
+        )
+    elif counts["研究候補"] == 0:
+        console.print(
+            f"\n[red][bold]研究候補ゼロ（{measured} 銘柄を測定）。"
+            "100ms で板に貼りつく MM はここで終了。[/bold][/red]\n"
+            f"[dim]どの銘柄も、スプレッドが払う以上に価格が {args.horizon_ms:g}ms で動いています。"
+            "置き場所・サイズ・在庫規則では届きません。[/dim]"
+        )
+    else:
+        console.print(
+            "\n[dim]MO/spread が小さいことは必要条件でしかありません。手数料・在庫・"
+            "約定モデルの誤差の余白がまだ引かれていないので、候補は capture → sweep → "
+            "hedge で全コスト後の Net で判定してください。[/dim]"
+        )
+    return 0
+
+
+async def _triage_survivors(args: argparse.Namespace) -> list[str]:
+    """The static screen's shortlist, as plain symbol names."""
+    market = await fetch_market(product=args.product, samples=args.samples)
+    ticks = await fetch_tick_sizes(product=args.product)
+    rows = []
+    for symbol, stats in market.items():
+        if not symbol.endswith(args.quote_asset):
+            continue
+        if stats.quote_volume < args.min_volume or stats.trades < args.min_trades_24h:
+            continue
+        tick = ticks.get(symbol)
+        if tick is None:
+            continue
+        row = triage.build(
+            symbol,
+            bid=stats.bid,
+            ask=stats.ask,
+            tick_size=tick,
+            quote_volume=stats.quote_volume,
+            trades=stats.trades,
+            spread_bps=stats.spread_bps,
+        )
+        if row is not None:
+            rows.append(row)
+    survivors = triage.rank(
+        rows, args.maker_bps, min_ticks=args.min_ticks, max_tick_bps=args.max_tick_bps
+    )
+    return [r.symbol for r in survivors[: args.max_symbols]]
 
 
 async def cmd_triage(args: argparse.Namespace) -> int:
@@ -2163,6 +2296,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_tri.add_argument("--sample-interval", type=float, default=2.0)
     p_tri.add_argument("--top", type=int, default=25)
     p_tri.set_defaults(func=cmd_triage)
+
+    p_prb = sub.add_parser("probe", help="候補を5分まとめて動的審査 (逆選択/スプレッド)")
+    p_prb.add_argument("--symbols", default="", help="カンマ区切り。省略すると triage の候補")
+    p_prb.add_argument("--duration", type=float, default=300.0)
+    p_prb.add_argument("--horizon-ms", type=float, default=100.0)
+    p_prb.add_argument("--min-trades", type=int, default=500, help="判定に要る約定数")
+    p_prb.add_argument("--max-symbols", type=int, default=20)
+    p_prb.add_argument("--top", type=int, default=30)
+    # Passed through to the static screen when --symbols is omitted.
+    p_prb.add_argument("--product", default="perp", choices=("spot", "perp"))
+    p_prb.add_argument("--maker-bps", type=float, default=2.0)
+    p_prb.add_argument("--min-ticks", type=float, default=2.0)
+    p_prb.add_argument("--max-tick-bps", type=float, default=2.0)
+    p_prb.add_argument("--quote-asset", default="USDT")
+    p_prb.add_argument("--min-volume", type=float, default=5_000_000.0)
+    p_prb.add_argument("--min-trades-24h", type=int, default=20_000)
+    p_prb.add_argument("--samples", type=int, default=3)
+    p_prb.set_defaults(func=cmd_probe)
 
     p_bt = sub.add_parser("backtest", help="headless synthetic run")
     add_common(p_bt)
