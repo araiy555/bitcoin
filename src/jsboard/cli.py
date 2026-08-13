@@ -282,7 +282,13 @@ def _capture_line(mm: MarketMaker, s: dict) -> str | None:
 
 
 def _markout_line(s: dict) -> str | None:
-    """Adverse selection: where the mid went after our fills matured."""
+    """Adverse selection: how far the mid moved against us after each fill.
+
+    Measured mid-to-mid, so the spread we earned is excluded — that half
+    lives in the attribution's spread-capture term instead. Reading a
+    fill-referenced mark-out as adverse selection double-counts the spread
+    and, on a wide-tick symbol, flips the sign.
+    """
     windows = s.get("markout") or []
     parts = []
     for w in windows:
@@ -292,7 +298,38 @@ def _markout_line(s: dict) -> str | None:
             continue
         colour = "green" if mean >= 0 else "red"
         parts.append(f"+{w['horizon_s']:.0f}s [{colour}]{mean:+.2f}[/{colour}]bps(n={int(w['n'])})")
-    return "  mark-out       : " + "  ".join(parts) if parts else None
+    return "  逆選択(mid基準): " + "  ".join(parts) if parts else None
+
+
+def _attribution_lines(mm: MarketMaker, s: dict) -> list[str]:
+    """The identity the whole diagnosis rests on, in currency and in bps."""
+    a = s.get("attribution")
+    if not a:
+        return []
+
+    quote = mm.instrument.quote
+    lines = [
+        f"  P&L 分解       : スプレッド取り {a['spread_capture']:+,.2f}"
+        f"  在庫 {a['inventory']:+,.2f}"
+        f"  手数料 {-a['fees']:+,.2f}"
+        f"  = {a['total']:+,.2f} {quote}"
+    ]
+    if a.get("unpriced_fills"):
+        lines.append(
+            f"  [yellow]うち {int(a['unpriced_fills'])} 件はミッド不明のため分解できていません[/yellow]"
+        )
+
+    matched = min(s["bought"], s["sold"])
+    bps = mm.attribution.per_round_trip_bps(matched)
+    if bps:
+        colour = "green" if bps["total"] > 0 else "red"
+        lines.append(
+            f"  往復あたり     : スプレッド {bps['spread_capture']:+.2f}"
+            f"  在庫 {bps['inventory']:+.2f}"
+            f"  手数料 {bps['fees']:+.2f}"
+            f"  = [{colour}]{bps['total']:+.2f} bps[/{colour}]"
+        )
+    return lines
 
 
 def _reach_lines(mm: MarketMaker, s: dict) -> list[str]:
@@ -346,7 +383,12 @@ def _print_report(mm: MarketMaker, result) -> None:
         f"  unrealized P&L : {s['unrealized']:+,.2f} {inst.quote}\n"
         f"  [bold]total P&L      : {s['total']:+,.2f} {inst.quote}[/bold]"
     )
-    for line in (_capture_line(mm, s), _markout_line(s), *_reach_lines(mm, s)):
+    for line in (
+        _capture_line(mm, s),
+        *_attribution_lines(mm, s),
+        _markout_line(s),
+        *_reach_lines(mm, s),
+    ):
         if line:
             console.print(line)
     console.print(f"  last decision  : {s['decision']}")
@@ -604,6 +646,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     total = sum(placement.values()) or 1
     at_touch = sum(n for d, n in placement.items() if d <= 0)
     markout = s.get("markout") or []
+    bps = mm.attribution.per_round_trip_bps(matched)
     return {
         "fills": int(s["fills"]),
         "capture_bps": capture,
@@ -612,6 +655,9 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "total": s["total"],
         "touch_share": at_touch / total * 100.0,
         "markout_10s": markout[1]["mean_bps"] if len(markout) > 1 else math.nan,
+        "spread_bps": bps.get("spread_capture", math.nan),
+        "inventory_bps": bps.get("inventory", math.nan),
+        "attributed_bps": bps.get("total", math.nan),
     }
 
 
@@ -677,21 +723,23 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         table.add_column(name.replace("_", " "), justify="right")
     table.add_column("約定", justify="right")
     table.add_column("touch%", justify="right")
-    table.add_column("取り bps", justify="right")
-    table.add_column("手数料後 bps", justify="right")
-    table.add_column("mark-out\n10s", justify="right")
+    table.add_column("スプレッド\n取り bps", justify="right")
+    table.add_column("在庫\nbps", justify="right")
+    table.add_column("逆選択\n10s bps", justify="right")
+    table.add_column("手数料後\n合計 bps", justify="right")
     table.add_column(f"実現損益\n({instrument.quote})", justify="right")
 
     for r in rows:
-        net = r["net_bps"]
-        colour = "dim" if math.isnan(net) else ("green" if net > 0 else "red")
+        attributed = r["attributed_bps"]
+        colour = "dim" if math.isnan(attributed) else ("green" if attributed > 0 else "red")
         table.add_row(
             *(_label(n, r["settings"][n]) for n in names),
             f"{r['fills']:,}",
             f"{r['touch_share']:.0f}%",
-            "—" if math.isnan(r["capture_bps"]) else f"{r['capture_bps']:+.2f}",
-            f"[{colour}]{'—' if math.isnan(net) else f'{net:+.2f}'}[/{colour}]",
+            "—" if math.isnan(r["spread_bps"]) else f"{r['spread_bps']:+.2f}",
+            "—" if math.isnan(r["inventory_bps"]) else f"{r['inventory_bps']:+.2f}",
             "—" if math.isnan(r["markout_10s"]) else f"{r['markout_10s']:+.2f}",
+            f"[{colour}]{'—' if math.isnan(attributed) else f'{attributed:+.2f}'}[/{colour}]",
             f"{r['realized']:+.2f}",
         )
     console.print(table)

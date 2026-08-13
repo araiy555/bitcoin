@@ -18,6 +18,7 @@ from ..core.market import MARKET_OWNER, MarketView
 from ..core.types import Fill, Instrument, Side
 from ..feed.base import DepthDelta, DepthSnapshot, FeedEvent, TradeTick
 from ..sim.paper import PAPER_OWNER, PaperVenue
+from .attribution import PnLAttribution
 from .fair_value import FairValueEstimator
 from .inventory import Position
 from .markout import MarkOutTracker
@@ -75,10 +76,16 @@ class MarketMaker:
     config: StrategyConfig = field(default_factory=StrategyConfig)
     stats: StrategyStats = field(default_factory=StrategyStats)
     markout: MarkOutTracker = field(default_factory=MarkOutTracker)
+    attribution: PnLAttribution = field(init=False)
     clock: object = time.time_ns
     last_quotes: QuoteSet = field(default_factory=QuoteSet)
     last_decision: RiskDecision | None = None
     recent_fills: list[Fill] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # The attribution needs the instrument to convert ticks and lots into
+        # quote currency, so it cannot be a plain default_factory.
+        self.attribution = PnLAttribution(self.instrument)
 
     # ------------------------------------------------------------ ingestion
 
@@ -88,17 +95,35 @@ class MarketMaker:
 
         fills: list[Fill] = []
         if isinstance(event, TradeTick):
+            # The mid *before* our own fills are booked is the reference both
+            # the attribution and the mark-out measure against: it is the
+            # price the market showed at the instant we traded.
+            mid = self.market.mid
             fills = self.venue.on_trade(event)
             now = self.clock()
             for fill in fills:
-                self.position.apply(fill, PAPER_OWNER)
                 # Our side of the trade, which is the opposite of the taker's
                 # when we were the maker. Both sides are possible on one fill
                 # only if we somehow traded with ourselves; book each anyway.
+                sides = []
                 if fill.maker_owner == PAPER_OWNER:
-                    self.markout.on_fill(now, fill.aggressor.opposite.sign, fill.price, fill.qty)
+                    sides.append(fill.aggressor.opposite.sign)
                 if fill.taker_owner == PAPER_OWNER:
-                    self.markout.on_fill(now, fill.aggressor.sign, fill.price, fill.qty)
+                    sides.append(fill.aggressor.sign)
+                if not sides:
+                    continue
+                before = self.position.fees_paid
+                self.position.apply(fill, PAPER_OWNER)
+                fee = self.position.fees_paid - before
+                for sign in sides:
+                    self.markout.on_fill(now, sign, fill.price, fill.qty, mid_ticks=mid)
+                    self.attribution.on_fill(
+                        price_ticks=fill.price,
+                        qty_lots=fill.qty,
+                        sign=sign,
+                        fee=fee / len(sides),
+                        mid_ticks=mid,
+                    )
             if fills:
                 self.stats.fills += len(fills)
                 self.recent_fills.extend(fills)
@@ -109,7 +134,9 @@ class MarketMaker:
             for price, qty in event.asks:
                 self.venue.on_depth(Side.SELL, price, qty)
 
-        self.markout.poll(self.clock(), self.market.mid)
+        mid_now = self.market.mid
+        self.markout.poll(self.clock(), mid_now)
+        self.attribution.on_mid(mid_now)
         return fills
 
     # -------------------------------------------------------------- quoting
@@ -255,6 +282,7 @@ class MarketMaker:
                 "decision": self.stats.last_decision,
                 "halted": self.risk.halted,
                 "markout": self.markout.summary(),
+                "attribution": self.attribution.summary(),
                 "placement": dict(self.stats.placement_ticks),
                 "queue_ahead_ratio": self.stats.mean_queue_ahead_ratio,
                 "prints_seen": self.venue.prints_seen,

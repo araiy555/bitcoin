@@ -37,24 +37,45 @@ class _Pending:
 
     due_ns: int
     sign: int
-    price_ticks: float
+    fill_ticks: float
+    mid_ticks: float
     weight: float
 
 
 @dataclass(slots=True)
 class MarkOutWindow:
-    """Size-weighted mark-out at a single horizon."""
+    """Size-weighted mark-out at a single horizon, against two references.
+
+    Which reference matters depends on the question, and conflating them is
+    the easy mistake:
+
+      vs_mid   mid at the fill → mid at the horizon. Adverse selection on its
+               own: how much the market moved against us after trading with
+               us, with the spread we earned excluded.
+      vs_fill  our fill price → mid at the horizon. What the fill is worth if
+               unwound at mid, so it carries the half-spread inside it.
+
+    On a symbol whose tick is several basis points wide the gap between them
+    is larger than either number, and reading `vs_fill` as adverse selection
+    turns a loss into an apparent gain.
+    """
 
     horizon_s: float
     n: int = 0
     weight: float = 0.0
-    weighted_bps: float = 0.0
+    weighted_vs_mid: float = 0.0
+    weighted_vs_fill: float = 0.0
     pending: deque[_Pending] = field(default_factory=deque)
 
     @property
     def mean_bps(self) -> float:
-        """Size-weighted mean, NaN until something has matured."""
-        return self.weighted_bps / self.weight if self.weight > 0 else math.nan
+        """Adverse selection: size-weighted, NaN until something has matured."""
+        return self.weighted_vs_mid / self.weight if self.weight > 0 else math.nan
+
+    @property
+    def mean_vs_fill_bps(self) -> float:
+        """The same fills measured from our own price, spread included."""
+        return self.weighted_vs_fill / self.weight if self.weight > 0 else math.nan
 
     @property
     def unsettled(self) -> int:
@@ -78,15 +99,30 @@ class MarkOutTracker:
         if not self.windows:
             self.windows = [MarkOutWindow(h) for h in self.horizons_s]
 
-    def on_fill(self, now_ns: int, sign: int, price_ticks: float, weight: float = 1.0) -> None:
-        """Register one of our fills. `sign` is +1 when we bought, -1 when we sold."""
+    def on_fill(
+        self,
+        now_ns: int,
+        sign: int,
+        price_ticks: float,
+        weight: float = 1.0,
+        mid_ticks: float | None = None,
+    ) -> None:
+        """Register one of our fills. `sign` is +1 when we bought, -1 when we sold.
+
+        `mid_ticks` is the mid at the moment of the fill and is the reference
+        adverse selection is measured from. Without it there is no way to
+        separate the spread we earned from the move that followed, so the fill
+        is not recorded rather than being recorded against the wrong baseline.
+        """
         if weight <= 0 or price_ticks <= 0 or sign == 0:
+            return
+        if mid_ticks is None or mid_ticks <= 0:
             return
         for window in self.windows:
             # now_ns is monotonic and the offset is constant per window, so
             # each deque stays sorted by due time and settles from the front.
             due = now_ns + int(window.horizon_s * NS_PER_S)
-            window.pending.append(_Pending(due, sign, price_ticks, weight))
+            window.pending.append(_Pending(due, sign, price_ticks, mid_ticks, weight))
 
     def poll(self, now_ns: int, mid_ticks: float | None) -> None:
         """Settle every fill whose horizon has elapsed, at the current mid."""
@@ -98,16 +134,19 @@ class MarkOutTracker:
             queue = window.pending
             while queue and queue[0].due_ns <= now_ns:
                 fill = queue.popleft()
-                bps = fill.sign * (mid_ticks - fill.price_ticks) / fill.price_ticks * 10_000.0
+                vs_mid = fill.sign * (mid_ticks - fill.mid_ticks) / fill.mid_ticks * 10_000.0
+                vs_fill = fill.sign * (mid_ticks - fill.fill_ticks) / fill.fill_ticks * 10_000.0
                 window.n += 1
                 window.weight += fill.weight
-                window.weighted_bps += bps * fill.weight
+                window.weighted_vs_mid += vs_mid * fill.weight
+                window.weighted_vs_fill += vs_fill * fill.weight
 
     def summary(self) -> list[dict[str, float]]:
         return [
             {
                 "horizon_s": w.horizon_s,
                 "mean_bps": w.mean_bps,
+                "vs_fill_bps": w.mean_vs_fill_bps,
                 "n": float(w.n),
                 "unsettled": float(w.unsettled),
             }
