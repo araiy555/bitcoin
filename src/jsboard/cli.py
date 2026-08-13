@@ -870,8 +870,9 @@ async def cmd_triage(args: argparse.Namespace) -> int:
         console.print("[red]条件に合う銘柄がありません。[/red]")
         return 1
 
-    counts = triage.tally(rows, args.maker_bps, min_ticks=args.min_ticks)
-    survivors = triage.rank(rows, args.maker_bps, min_ticks=args.min_ticks)
+    gates = {"min_ticks": args.min_ticks, "max_tick_bps": args.max_tick_bps}
+    counts = triage.tally(rows, args.maker_bps, **gates)
+    survivors = triage.rank(rows, args.maker_bps, **gates)
 
     console.print()
     console.rule("[bold cyan]一次審査")
@@ -879,7 +880,8 @@ async def cmd_triage(args: argparse.Namespace) -> int:
         f"  {args.product} / {args.quote_asset}建て / 24h出来高 {args.min_volume:,.0f} 以上"
         f" / 約定 {args.min_trades:,} 件以上 / {args.samples} 回観測の中央値\n"
         f"  メイカー {args.maker_bps:g} bps → 往復 {2 * args.maker_bps:g} bps"
-        f" / スプレッド {args.min_ticks:g} tick 以上を要求\n"
+        f" / スプレッド {args.min_ticks:g} tick 以上"
+        f" / 1tick {args.max_tick_bps:g} bps 以下を要求\n"
         f"  {len(rows):,} 銘柄  →  "
         + "  ".join(f"{k} {v:,}" for k, v in counts.items())
     )
@@ -2147,6 +2149,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_tri.add_argument("--product", default="perp", choices=("spot", "perp"))
     p_tri.add_argument("--maker-bps", type=float, default=10.0)
     p_tri.add_argument("--min-ticks", type=float, default=2.0, help="必要なスプレッド幅")
+    p_tri.add_argument(
+        "--max-tick-bps", type=float, default=2.0,
+        help="1tick の上限。太いと逆選択もヘッジ代も比例して重くなる",
+    )
     p_tri.add_argument("--quote-asset", default="USDT")
     p_tri.add_argument("--min-volume", type=float, default=5_000_000.0)
     p_tri.add_argument(

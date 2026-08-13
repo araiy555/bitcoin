@@ -31,11 +31,18 @@ same three numbers:
   be nudged, and the only two states are "in front of everyone" and
   "invisible". Room to manoeuvre needs at least two or three ticks.
 
-  **tick width in bps.** A coarse tick sets a floor on adverse selection: the
-  smallest move the price can make is one tick, and if that tick is worth
-  several basis points then every adverse move is expensive. On WIF the
-  0-100ms bucket lost ~2.9 bps against a 7.37 bps tick — one observation, not
-  a law, but the direction is structural and a fine tick is strictly safer.
+  **tick width in bps.** A coarse tick sets a floor on two separate costs.
+  The smallest move the price can make is one tick, so adverse selection
+  cannot be cheaper than that — WIF lost ~2.9 bps in the 0-100ms bucket
+  against a 7.37 bps tick. And crossing to hedge costs about half a spread,
+  which on a two-tick book is one whole tick. Both scale with tick width, and
+  on WIF they came to ~25 bps against 7.5 bps of captured spread.
+
+  The 2 bps default ceiling is a judgement, not a measurement: the loss/tick
+  ratio rests on a single symbol. It is set where it is because a symbol that
+  fails it cannot be rescued downstream and a rejected symbol costs nothing,
+  whereas a wrongly accepted one costs an hour of recording and a day of
+  analysis. Raise it with --max-tick-bps to see what it is excluding.
 """
 
 from __future__ import annotations
@@ -84,17 +91,25 @@ class Triage:
         """
         return self.spread_bps - 2.0 * maker_bps
 
-    def verdict(self, maker_bps: float, *, min_ticks: float = 2.0) -> str:
+    def verdict(
+        self, maker_bps: float, *, min_ticks: float = 2.0, max_tick_bps: float = 2.0
+    ) -> str:
         if self.spread_bps <= 0:
             return "板なし"
         if self.headroom_bps(maker_bps) <= 0:
             return "手数料負け"
+        if self.tick_bps > max_tick_bps:
+            return "tickが太い"
         if self.spread_ticks < min_ticks:
             return "tickが粗い"
         return "候補"
 
-    def passes(self, maker_bps: float, *, min_ticks: float = 2.0) -> bool:
-        return self.verdict(maker_bps, min_ticks=min_ticks) == "候補"
+    def passes(
+        self, maker_bps: float, *, min_ticks: float = 2.0, max_tick_bps: float = 2.0
+    ) -> bool:
+        return (
+            self.verdict(maker_bps, min_ticks=min_ticks, max_tick_bps=max_tick_bps) == "候補"
+        )
 
 
 def build(
@@ -127,17 +142,36 @@ def build(
     )
 
 
-def rank(rows: list[Triage], maker_bps: float, *, min_ticks: float = 2.0) -> list[Triage]:
-    """Survivors first, by how much room is left after the fee."""
+def rank(
+    rows: list[Triage],
+    maker_bps: float,
+    *,
+    min_ticks: float = 2.0,
+    max_tick_bps: float = 2.0,
+) -> list[Triage]:
+    """Survivors first, by how much room is left after the fee.
+
+    Headroom alone is a misleading key, which the first live run showed: the
+    two widest symbols were both a 6.3 bps tick with a two-tick spread —
+    WIFUSDT's shape almost exactly. Both costs that killed WIF scale with tick
+    width, so the gates run first and the ranking only orders what survives
+    them.
+    """
     return sorted(
-        (r for r in rows if r.passes(maker_bps, min_ticks=min_ticks)),
+        (r for r in rows if r.passes(maker_bps, min_ticks=min_ticks, max_tick_bps=max_tick_bps)),
         key=lambda r: -r.headroom_bps(maker_bps),
     )
 
 
-def tally(rows: list[Triage], maker_bps: float, *, min_ticks: float = 2.0) -> dict[str, int]:
+def tally(
+    rows: list[Triage],
+    maker_bps: float,
+    *,
+    min_ticks: float = 2.0,
+    max_tick_bps: float = 2.0,
+) -> dict[str, int]:
     """How many symbols died at each gate, which is the useful summary."""
-    counts = {"板なし": 0, "手数料負け": 0, "tickが粗い": 0, "候補": 0}
+    counts = {"板なし": 0, "手数料負け": 0, "tickが太い": 0, "tickが粗い": 0, "候補": 0}
     for row in rows:
-        counts[row.verdict(maker_bps, min_ticks=min_ticks)] += 1
+        counts[row.verdict(maker_bps, min_ticks=min_ticks, max_tick_bps=max_tick_bps)] += 1
     return counts

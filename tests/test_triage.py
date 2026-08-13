@@ -50,10 +50,23 @@ class TestVerdict:
         assert r.verdict(10.0) == "手数料負け"
 
     def test_the_same_symbol_still_fails_on_tick_at_a_free_fee(self):
-        # Even with no fee at all, a one-tick spread leaves no room to move.
+        # Even with no fee at all, a 7.37 bps tick is too coarse to work with.
         r = row(0.13555, 0.13565, 0.0001)
         assert r.headroom_bps(0.0) > 0
+        assert r.verdict(0.0) == "tickが太い"
+
+    def test_a_thin_spread_on_a_fine_tick_dies_at_the_other_tick_gate(self):
+        # Passes the width ceiling but has only 1.5 ticks to stand in.
+        r = row(99.99, 100.01, 0.02)
+        assert r.tick_bps <= 2.0
         assert r.verdict(0.0) == "tickが粗い"
+
+    def test_the_shape_that_topped_the_first_live_run(self):
+        # ATUSDT/TSTUSDT: a 6.3 bps tick with a two-tick spread. The widest
+        # headroom in the table, and WIF's disease.
+        r = row(99.9368, 100.0632, 0.0632)
+        assert r.headroom_bps(2.0) > 8
+        assert r.verdict(2.0) == "tickが太い"
 
     def test_a_wide_spread_on_a_fine_tick_survives(self):
         r = row(99.7, 100.3, 0.01)
@@ -74,7 +87,7 @@ class TestRankAndTally:
             row(0.13555, 0.13565, 0.0001, "WIFUSDT"),      # 手数料負け
             row(63_999.99, 64_000.01, 0.01, "BTCUSDT"),    # 手数料負け
             row(99.7, 100.3, 0.01, "MIDUSDT"),             # 候補, 60 bps
-            row(9.95, 10.05, 0.001, "WIDEUSDT"),           # 候補, 100 bps
+            row(9.95, 10.05, 0.0005, "WIDEUSDT"),          # 候補, 100 bps
             # Clears the fee (30 bps of spread) but the spread is 1.5 ticks:
             # the gate the fee alone would have let through.
             row(99.85, 100.15, 0.2, "COARSEUSDT"),
@@ -88,7 +101,7 @@ class TestRankAndTally:
         counts = tally(self.market(), 10.0)
         assert counts["候補"] == 2
         assert counts["手数料負け"] == 2
-        assert counts["tickが粗い"] == 1
+        assert counts["tickが太い"] == 1
         assert sum(counts.values()) == 5
 
     def test_a_harsher_tick_requirement_kills_more(self):
