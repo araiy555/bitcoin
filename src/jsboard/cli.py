@@ -462,19 +462,7 @@ async def cmd_record(args: argparse.Namespace) -> int:
 
 async def cmd_replay(args: argparse.Namespace) -> int:
     path = Path(args.path)
-    meta_path = path.with_suffix(path.suffix + ".meta.json")
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        instrument = Instrument(
-            symbol=meta["symbol"],
-            tick_size=Decimal(meta["tick_size"]),
-            lot_size=Decimal(meta["lot_size"]),
-            base=meta.get("base", ""),
-            quote=meta.get("quote", ""),
-        )
-    else:
-        instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
-
+    instrument = _instrument_for_recording(path, args)
     feed = ReplayFeed(instrument, path, speed=args.speed, source=args.source)
     mm = build_maker(instrument, args)
     # A recording carries the timestamps it was captured with. Judged against
@@ -487,19 +475,47 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _instrument_from_spec(spec: dict) -> Instrument:
+    return Instrument(
+        symbol=spec["symbol"],
+        tick_size=Decimal(spec["tick_size"]),
+        lot_size=Decimal(spec["lot_size"]),
+        base=spec.get("base", ""),
+        quote=spec.get("quote", ""),
+    )
+
+
 def _instrument_for_recording(path: Path, args: argparse.Namespace) -> Instrument:
-    """Prefer the spec the recorder saved; fall back to the CLI overrides."""
+    """Prefer the spec the recorder saved; fall back to the CLI overrides.
+
+    Two recorders write two shapes. `record` stores one instrument at the top
+    level; `capture` stores one per venue under "sources", because spot and
+    perp do not share a tick size and guessing wrong silently rescales every
+    price in the file.
+    """
     meta_path = path.with_suffix(path.suffix + ".meta.json")
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        return Instrument(
-            symbol=meta["symbol"],
-            tick_size=Decimal(meta["tick_size"]),
-            lot_size=Decimal(meta["lot_size"]),
-            base=meta.get("base", ""),
-            quote=meta.get("quote", ""),
+    if not meta_path.exists():
+        return build_instrument(args.symbol, args.tick_size, args.lot_size)
+
+    meta = json.loads(meta_path.read_text())
+    sources = meta.get("sources")
+    if not sources:
+        return _instrument_from_spec(meta)
+
+    wanted = getattr(args, "source", None)
+    if wanted is None:
+        if len(sources) == 1:
+            return _instrument_from_spec(next(iter(sources.values())))
+        raise ConfigError(
+            f"{meta_path.name} は {', '.join(sorted(sources))} を含んでいます。\n"
+            f"  --source でどちらを再生するか指定してください（例: --source perp）。"
         )
-    return build_instrument(args.symbol, args.tick_size, args.lot_size)
+    if wanted not in sources:
+        raise ConfigError(
+            f"--source {wanted} は {meta_path.name} にありません。"
+            f"  使えるのは: {', '.join(sorted(sources))}"
+        )
+    return _instrument_from_spec(sources[wanted])
 
 
 def _grid(spec: str, cast):
@@ -1752,6 +1768,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return asyncio.run(args.func(args))
+    except ConfigError as exc:
+        # A setting that would make the session do nothing. Say so plainly
+        # rather than showing a traceback for what is a usage question.
+        console.print(f"[red]{exc}[/red]")
+        return 2
     except KeyboardInterrupt:
         console.print("\n[dim]interrupted[/dim]")
         return 130
