@@ -197,3 +197,109 @@ class TestExposureClock:
         attr.on_mid(100, now_ns=10 * self.S)
         attr.on_mid(100, now_ns=1 * self.S)
         assert attr.elapsed_ns == 0
+
+
+class TestAgeBuckets:
+    """Inventory P&L split by how long the parcel had been held.
+
+    Subtracting a fill-aggregated mark-out from a time-aggregated inventory
+    P&L does not give "the loss after 100ms" — the two have different bases
+    and overlapping positions do not cancel. This splits the accounting
+    itself, so the buckets sum back to the term they came from.
+    """
+
+    S = 1_000_000_000
+
+    def total_buckets(self, attr):
+        return sum(attr.inventory_by_age) + attr.inventory_unaged
+
+    def test_buckets_sum_to_the_inventory_term(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        for i in range(1, 40):
+            attr.on_mid(100 + i, now_ns=i * self.S // 2)
+        assert self.total_buckets(attr) == pytest.approx(attr.inventory_pnl)
+
+    def test_a_move_inside_100ms_lands_in_the_first_bucket(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(101, now_ns=self.S // 20)  # 50ms later
+        assert attr.inventory_by_age[0] == pytest.approx(10.0)
+        assert sum(attr.inventory_by_age[1:]) == pytest.approx(0.0)
+
+    def test_an_old_parcel_lands_in_the_last_bucket(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=30 * self.S)
+        attr.on_mid(101, now_ns=31 * self.S)
+        assert attr.inventory_by_age[-1] == pytest.approx(10.0)
+        assert sum(attr.inventory_by_age[:-1]) == pytest.approx(0.0)
+
+    def test_two_parcels_of_different_ages_split_one_move(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=30 * self.S)
+        # A second parcel, brand new, while the first is 30s old.
+        attr.on_fill(price_ticks=100, qty_lots=5, sign=+1, fee=0.0, mid_ticks=100,
+                     now_ns=30 * self.S)
+        attr.on_mid(101, now_ns=30 * self.S + self.S // 20)
+        assert attr.inventory_by_age[0] == pytest.approx(5.0)   # the new parcel
+        assert attr.inventory_by_age[-1] == pytest.approx(10.0)  # the old one
+        assert self.total_buckets(attr) == pytest.approx(attr.inventory_pnl)
+
+    def test_reducing_consumes_the_oldest_parcel_first(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=30 * self.S)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100,
+                     now_ns=30 * self.S)
+        # Sell 10: FIFO retires the 30s-old parcel, leaving only the fresh one.
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=-1, fee=0.0, mid_ticks=100,
+                     now_ns=30 * self.S)
+        attr.on_mid(101, now_ns=30 * self.S + self.S // 20)
+        assert attr.inventory_by_age[0] == pytest.approx(10.0)
+        assert attr.inventory_by_age[-1] == pytest.approx(0.0)
+
+    def test_lots_stay_in_step_with_the_position(self, attr):
+        attr.on_mid(100, now_ns=0)
+        moves = [(+1, 10), (+1, 5), (-1, 12), (-1, 20), (+1, 3)]
+        for i, (sign, qty) in enumerate(moves):
+            attr.on_fill(price_ticks=100, qty_lots=qty, sign=sign, fee=0.0, mid_ticks=100,
+                         now_ns=i * self.S)
+            assert sum(x.lots for x in attr.open_lots) == attr.position_lots
+
+    def test_a_flip_through_zero_reconciles_and_restarts_the_age(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=30 * self.S)
+        attr.on_fill(price_ticks=100, qty_lots=30, sign=-1, fee=0.0, mid_ticks=100,
+                     now_ns=30 * self.S)
+        assert attr.position_lots == -20
+        attr.on_mid(101, now_ns=30 * self.S + self.S // 20)
+        assert attr.inventory_by_age[0] == pytest.approx(-20.0)
+        assert self.total_buckets(attr) == pytest.approx(attr.inventory_pnl)
+
+    def test_without_a_clock_the_move_is_held_apart_not_bucketed(self, attr):
+        attr.on_mid(100)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100)
+        attr.on_mid(110)
+        assert sum(attr.inventory_by_age) == pytest.approx(0.0)
+        assert attr.inventory_unaged == pytest.approx(100.0)
+        assert self.total_buckets(attr) == pytest.approx(attr.inventory_pnl)
+
+
+class TestBreakevenFee:
+    def test_the_edge_has_to_cover_both_legs(self, attr):
+        attr.on_fill(price_ticks=99, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100)
+        attr.on_fill(price_ticks=101, qty_lots=10, sign=-1, fee=0.0, mid_ticks=100)
+        # 200 bps of edge over the round trip tolerates 100 bps per side.
+        assert attr.max_maker_bps(10.0) == pytest.approx(100.0)
+
+    def test_a_losing_run_tolerates_a_negative_fee_only(self, attr):
+        attr.on_fill(price_ticks=101, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100)
+        assert attr.max_maker_bps(10.0) < 0
+
+    def test_nothing_matched_has_no_answer(self, attr):
+        import math
+
+        assert math.isnan(attr.max_maker_bps(0.0))

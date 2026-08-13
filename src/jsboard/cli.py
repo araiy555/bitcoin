@@ -292,12 +292,16 @@ def _markout_line(s: dict) -> str | None:
     windows = s.get("markout") or []
     parts = []
     for w in windows:
+        # Sub-second horizons round to "0s" under a seconds format, which
+        # reads as no horizon at all.
+        h = w["horizon_s"]
+        label = f"{h * 1000:.0f}ms" if h < 1 else f"{h:.0f}s"
         mean = w["mean_bps"]
         if math.isnan(mean):
-            parts.append(f"+{w['horizon_s']:.0f}s n/a")
+            parts.append(f"+{label} n/a")
             continue
         colour = "green" if mean >= 0 else "red"
-        parts.append(f"+{w['horizon_s']:.0f}s [{colour}]{mean:+.2f}[/{colour}]bps(n={int(w['n'])})")
+        parts.append(f"+{label} [{colour}]{mean:+.2f}[/{colour}]bps(n={int(w['n'])})")
     return "  逆選択(mid基準): " + "  ".join(parts) if parts else None
 
 
@@ -328,6 +332,16 @@ def _attribution_lines(mm: MarketMaker, s: dict) -> list[str]:
             f"  在庫 {bps['inventory']:+.2f}"
             f"  手数料 {bps['fees']:+.2f}"
             f"  = [{colour}]{bps['total']:+.2f} bps[/{colour}]"
+        )
+        buckets = "  ".join(
+            f"{label} {value:+.2f}"
+            for label, _, value in mm.attribution.age_buckets(matched)
+        )
+        lines.append(f"  在庫の内訳     : {buckets}  bps (保有時間別)")
+        ceiling = mm.attribution.max_maker_bps(matched)
+        lines.append(
+            f"  許容メイカー料 : [bold]{ceiling:+.2f} bps/片道[/bold]"
+            f"  (現在 {mm.position.fees.maker_bps:g})"
         )
     return lines
 
@@ -676,6 +690,11 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "markout_1s": _markout_at(markout, 1.0),
         "markout_10s": _markout_at(markout, 10.0),
         "exposed_share": a.get("exposed_share", math.nan) * 100.0,
+        "max_maker_bps": mm.attribution.max_maker_bps(matched),
+        **{
+            f"age_{i}": value
+            for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
+        },
     }
 
 
@@ -747,10 +766,15 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("mo1s", "markout_1s", "{:+.2f}"),
         ("mo10s", "markout_10s", "{:+.2f}"),
         ("在庫時間%", "exposed_share", "{:.0f}"),
+        ("在庫0-100ms", "age_0", "{:+.2f}"),
+        ("100ms-1s", "age_1", "{:+.2f}"),
+        ("1-10s", "age_2", "{:+.2f}"),
+        ("10s+", "age_3", "{:+.2f}"),
+        ("許容料率", "max_maker_bps", "{:+.2f}"),
     ]
 
     def cell(row: dict, key: str, fmt: str) -> str:
-        value = row[key]
+        value = row.get(key, math.nan)
         return "—" if isinstance(value, float) and math.isnan(value) else fmt.format(value)
 
     if args.plain:

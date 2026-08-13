@@ -35,9 +35,32 @@ without disturbing the identity above.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 from ..core.types import Instrument
+
+NS_PER_S = 1_000_000_000
+
+AGE_BOUNDS_S = (0.1, 1.0, 10.0)
+"""Upper edges of the holding-age buckets; the last bucket is everything older."""
+
+AGE_LABELS = ("0-100ms", "100ms-1s", "1-10s", "10s+")
+
+
+@dataclass(slots=True)
+class _Lot:
+    """One open parcel of inventory, and when we acquired it."""
+
+    acquired_ns: int
+    lots: int  # signed, same sign as the position it belongs to
+
+
+def _bucket_index(age_s: float) -> int:
+    for i, bound in enumerate(AGE_BOUNDS_S):
+        if age_s < bound:
+            return i
+    return len(AGE_BOUNDS_S)
 
 
 @dataclass(slots=True)
@@ -59,6 +82,18 @@ class PnLAttribution:
     exposed_ns: int = 0
     abs_position_ns: float = 0.0
     last_clock_ns: int | None = None
+
+    # Inventory P&L split by how long the parcel had been held when the move
+    # happened. Each open lot carries its acquisition time, and the lots sum
+    # to the position, so the buckets sum to the inventory term exactly —
+    # unlike subtracting a fill-aggregated mark-out from a time-aggregated
+    # P&L, which are not the same base and do not cancel.
+    open_lots: deque[_Lot] = field(default_factory=deque)
+    inventory_by_age: list[float] = field(default_factory=lambda: [0.0] * (len(AGE_BOUNDS_S) + 1))
+    inventory_unaged: float = 0.0
+    """Inventory moves booked with no clock available, so they belong to no
+    bucket. Kept separate rather than dumped into one, so the buckets plus
+    this always reconstruct the total."""
 
     fills_priced: int = 0
     fills_unpriced: int = 0
@@ -86,13 +121,53 @@ class PnLAttribution:
 
     def on_mid(self, mid_ticks: float | None, now_ns: int | None = None) -> None:
         """Mark the carried position to a new mid."""
+        # Ages are taken at the start of the interval — how long each parcel
+        # had been held when the move began — so capture it before the clock
+        # advances. The bucket edges are far wider than one update interval,
+        # so the choice of endpoint moves very little across a boundary.
+        interval_start = self.last_clock_ns
         self.on_clock(now_ns)
         if mid_ticks is None or mid_ticks <= 0:
             return
         if self.last_mid_ticks is not None and self.position_lots:
             move = (mid_ticks - self.last_mid_ticks) * self._tick
             self.inventory_pnl += move * self.instrument.qty_f(self.position_lots)
+            self._split_by_age(move, interval_start if interval_start is not None else now_ns)
         self.last_mid_ticks = mid_ticks
+
+    def _split_by_age(self, move: float, at_ns: int | None) -> None:
+        """Hand this move to the buckets its parcels were sitting in."""
+        if at_ns is None:
+            self.inventory_unaged += move * self.instrument.qty_f(self.position_lots)
+            return
+        for lot in self.open_lots:
+            age_s = max(0.0, (at_ns - lot.acquired_ns) / NS_PER_S)
+            self.inventory_by_age[_bucket_index(age_s)] += move * self.instrument.qty_f(lot.lots)
+
+    def _book_lots(self, sign: int, qty_lots: int, now_ns: int | None) -> None:
+        """Keep the FIFO parcels in step with the position.
+
+        Reducing consumes the oldest parcel first, which is what makes an age
+        bucket mean anything: inventory that turns over quickly never reaches
+        the older buckets.
+        """
+        acquired = now_ns if now_ns is not None else 0
+        adding = self.position_lots == 0 or (self.position_lots > 0) == (sign > 0)
+        if adding:
+            self.open_lots.append(_Lot(acquired, sign * qty_lots))
+            return
+
+        remaining = qty_lots
+        while remaining > 0 and self.open_lots:
+            head = self.open_lots[0]
+            take = min(abs(head.lots), remaining)
+            head.lots -= (1 if head.lots > 0 else -1) * take
+            remaining -= take
+            if head.lots == 0:
+                self.open_lots.popleft()
+        if remaining > 0:
+            # Flipped through zero: the residual is a new parcel, acquired now.
+            self.open_lots.append(_Lot(acquired, sign * remaining))
 
     def on_fill(
         self,
@@ -118,6 +193,7 @@ class PnLAttribution:
             self.spread_capture += edge * self.instrument.qty_f(qty_lots)
             self.fills_priced += 1
 
+        self._book_lots(sign, qty_lots, now_ns)
         self.position_lots += sign * qty_lots
         self.fees += fee
 
@@ -139,6 +215,35 @@ class PnLAttribution:
     def mean_abs_position(self) -> float:
         """Time-weighted average absolute position, in base units."""
         return self.abs_position_ns / self.elapsed_ns if self.elapsed_ns else 0.0
+
+    def max_maker_bps(self, matched_qty: float) -> float:
+        """The highest maker fee this run could have paid and still broken even.
+
+        Stated as one side, since that is how a fee schedule is quoted: the
+        edge before fees has to cover the fee on both legs of a round trip.
+        Reading it as "which VIP tier would this need" is more useful than
+        asking whether one particular fee happens to work.
+        """
+        bps = self.per_round_trip_bps(matched_qty)
+        if not bps:
+            return float("nan")
+        return bps["net_before_fees"] / 2.0
+
+    def age_buckets(self, matched_qty: float = 0.0) -> list[tuple[str, float, float]]:
+        """(label, quote currency, bps) per holding-age bucket."""
+        bps_scale = 0.0
+        mid = self.last_mid_ticks
+        if matched_qty > 0 and mid:
+            notional = matched_qty * float(mid) * self._tick
+            if notional > 0:
+                bps_scale = 10_000.0 / notional
+        rows = [
+            (label, value, value * bps_scale)
+            for label, value in zip(AGE_LABELS, self.inventory_by_age, strict=True)
+        ]
+        if self.inventory_unaged:
+            rows.append(("時計なし", self.inventory_unaged, self.inventory_unaged * bps_scale))
+        return rows
 
     def per_round_trip_bps(self, matched_qty: float) -> dict[str, float]:
         """The same terms as basis points of the notional actually turned over."""
@@ -167,4 +272,6 @@ class PnLAttribution:
             "unpriced_fills": float(self.fills_unpriced),
             "exposed_share": self.exposed_share,
             "mean_abs_position": self.mean_abs_position,
+            "inventory_by_age": dict(zip(AGE_LABELS, self.inventory_by_age, strict=True)),
+            "inventory_unaged": self.inventory_unaged,
         }
