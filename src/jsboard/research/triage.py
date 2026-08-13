@@ -54,6 +54,11 @@ class Triage:
     tick_size: float
     spread_bps: float
     quote_volume: float = 0.0
+    trades: int = 0
+    """24h trade count. A wide spread on a book nobody trades is wide because
+    it is dead, not because it is an opportunity — and a maker there fills a
+    handful of times a day. Volume alone does not catch this: one large
+    transfer can carry a symbol past a volume floor it never traded through."""
 
     @property
     def tick_bps(self) -> float:
@@ -99,8 +104,16 @@ def build(
     ask: float,
     tick_size: float | Decimal,
     quote_volume: float = 0.0,
+    trades: int = 0,
+    spread_bps: float | None = None,
 ) -> Triage | None:
-    """A triage row from a top of book, or None when there is no book."""
+    """A triage row from a top of book, or None when there is no book.
+
+    `spread_bps` overrides the snapshot when several observations have been
+    folded into a median. One look at a thin book is close to worthless — the
+    same symbol was seen at 4.93, 7.11 and 11.70 bps in three runs seconds
+    apart — and the ranking is only as good as that number.
+    """
     if bid <= 0 or ask <= bid:
         return None
     mid = (bid + ask) / 2.0
@@ -108,8 +121,9 @@ def build(
         symbol=symbol,
         mid=mid,
         tick_size=float(tick_size),
-        spread_bps=(ask - bid) / mid * 10_000.0,
+        spread_bps=(ask - bid) / mid * 10_000.0 if spread_bps is None else spread_bps,
         quote_volume=quote_volume,
+        trades=trades,
     )
 
 

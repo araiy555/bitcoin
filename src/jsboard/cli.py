@@ -828,7 +828,9 @@ async def cmd_triage(args: argparse.Namespace) -> int:
     maker fee is finished — no simulation, no recording, no strategy work.
     """
     try:
-        market = await fetch_market(product=args.product)
+        market = await fetch_market(
+            product=args.product, samples=args.samples, interval=args.sample_interval
+        )
         ticks = await fetch_tick_sizes(product=args.product)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]取得に失敗しました: {exc}[/red]")
@@ -840,7 +842,9 @@ async def cmd_triage(args: argparse.Namespace) -> int:
     rows = []
     missing_tick = 0
     for symbol, stats in market.items():
-        if not symbol.endswith(args.quote_asset) or stats.quote_volume < args.min_volume:
+        if not symbol.endswith(args.quote_asset):
+            continue
+        if stats.quote_volume < args.min_volume or stats.trades < args.min_trades:
             continue
         tick = ticks.get(symbol)
         if tick is None:
@@ -854,6 +858,10 @@ async def cmd_triage(args: argparse.Namespace) -> int:
             ask=stats.ask,
             tick_size=tick,
             quote_volume=stats.quote_volume,
+            trades=stats.trades,
+            # The median of several looks, not one snapshot: a thin book's
+            # touch swings enough between polls to reorder the whole table.
+            spread_bps=stats.spread_bps,
         )
         if row is not None:
             rows.append(row)
@@ -868,7 +876,8 @@ async def cmd_triage(args: argparse.Namespace) -> int:
     console.print()
     console.rule("[bold cyan]一次審査")
     console.print(
-        f"  {args.product} / {args.quote_asset}建て / 24h出来高 {args.min_volume:,.0f} 以上\n"
+        f"  {args.product} / {args.quote_asset}建て / 24h出来高 {args.min_volume:,.0f} 以上"
+        f" / 約定 {args.min_trades:,} 件以上 / {args.samples} 回観測の中央値\n"
         f"  メイカー {args.maker_bps:g} bps → 往復 {2 * args.maker_bps:g} bps"
         f" / スプレッド {args.min_ticks:g} tick 以上を要求\n"
         f"  {len(rows):,} 銘柄  →  "
@@ -891,6 +900,7 @@ async def cmd_triage(args: argparse.Namespace) -> int:
     table.add_column("spread\n(bps)", justify="right")
     table.add_column("spread\n(tick)", justify="right")
     table.add_column("余裕\n(bps)", justify="right")
+    table.add_column("24h約定", justify="right")
     table.add_column("24h出来高", justify="right")
     for row in survivors[: args.top]:
         head = row.headroom_bps(args.maker_bps)
@@ -900,6 +910,7 @@ async def cmd_triage(args: argparse.Namespace) -> int:
             f"{row.spread_bps:,.2f}",
             f"{row.spread_ticks:,.1f}",
             f"[green]{head:+,.2f}[/green]",
+            f"{row.trades:,}",
             f"{row.quote_volume:,.0f}",
         )
     console.print()
@@ -2138,6 +2149,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tri.add_argument("--min-ticks", type=float, default=2.0, help="必要なスプレッド幅")
     p_tri.add_argument("--quote-asset", default="USDT")
     p_tri.add_argument("--min-volume", type=float, default=5_000_000.0)
+    p_tri.add_argument(
+        "--min-trades", type=int, default=20_000,
+        help="24h約定件数の下限。板が広いのは誰も居ないからかもしれない",
+    )
+    p_tri.add_argument("--samples", type=int, default=3, help="板を何回見るか")
+    p_tri.add_argument("--sample-interval", type=float, default=2.0)
     p_tri.add_argument("--top", type=int, default=25)
     p_tri.set_defaults(func=cmd_triage)
 

@@ -117,3 +117,32 @@ class TestParseTickSizes:
 
     def test_an_empty_payload_is_not_an_error(self):
         assert parse_tick_sizes({}) == {}
+
+
+class TestSampledSpread:
+    """One look at a thin book is not a measurement."""
+
+    def test_a_median_overrides_the_snapshot(self):
+        r = build("XUSDT", bid=99.9, ask=100.1, tick_size=0.01, spread_bps=7.0)
+        assert r.spread_bps == pytest.approx(7.0)
+        # The mid still comes from the snapshot, so ticks stay meaningful.
+        assert r.tick_bps == pytest.approx(1.0)
+        assert r.spread_ticks == pytest.approx(7.0)
+
+    def test_without_an_override_the_snapshot_is_used(self):
+        r = build("XUSDT", bid=99.9, ask=100.1, tick_size=0.01)
+        assert r.spread_bps == pytest.approx(20.0)
+
+    def test_the_verdict_follows_the_median_not_the_snapshot(self):
+        # A momentarily wide touch that is usually tight must not survive.
+        wide_once = build("XUSDT", bid=99.0, ask=101.0, tick_size=0.01, spread_bps=1.0)
+        assert wide_once.verdict(2.0) == "手数料負け"
+
+
+class TestTradeCount:
+    def test_it_is_carried_through(self):
+        r = build("XUSDT", bid=99.9, ask=100.1, tick_size=0.01, trades=1234)
+        assert r.trades == 1234
+
+    def test_it_defaults_to_zero_rather_than_being_absent(self):
+        assert build("XUSDT", bid=99.9, ask=100.1, tick_size=0.01).trades == 0
