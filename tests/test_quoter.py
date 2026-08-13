@@ -203,3 +203,52 @@ class TestDegenerate:
         keys = [q.key() for q in qs.all()]
 
         assert len(keys) == len(set(keys))
+
+
+class TestMaxDistance:
+    """The cap that decides whether we ever join the queue at all."""
+
+    def cfg(self, **kw):
+        base = dict(levels=3, level_step_ticks=2, base_size_lots=10, max_position_lots=100)
+        base.update(kw)
+        return QuoterConfig(**base)
+
+    def quote(self, **kw):
+        q = Quoter(self.cfg(**kw))
+        return q.quote(
+            fair_value=1000.5,
+            sigma_ticks=0.5,
+            inventory_lots=0,
+            best_bid=1000,
+            best_ask=1001,
+        )
+
+    def test_uncapped_quotes_rest_behind_the_touch(self):
+        qs = self.quote(max_distance_ticks=None)
+        assert max(q.price for q in qs.bids) < 1000
+        assert min(q.price for q in qs.asks) > 1001
+
+    def test_zero_clamps_every_level_onto_the_touch(self):
+        qs = self.quote(max_distance_ticks=0)
+        assert {q.price for q in qs.bids} == {1000}
+        assert {q.price for q in qs.asks} == {1001}
+
+    def test_the_collapsed_ladder_keeps_its_total_size(self):
+        loose = self.quote(max_distance_ticks=None)
+        tight = self.quote(max_distance_ticks=0)
+        assert sum(q.qty for q in tight.bids) == sum(q.qty for q in loose.bids)
+
+    def test_a_wider_cap_allows_stepping_back_that_far(self):
+        qs = self.quote(max_distance_ticks=2)
+        assert min(q.price for q in qs.bids) >= 998
+        assert max(q.price for q in qs.asks) <= 1003
+
+    def test_the_cap_never_makes_a_quote_cross(self):
+        qs = self.quote(max_distance_ticks=0, min_half_spread_ticks=0)
+        assert all(q.price < 1001 for q in qs.bids)
+        assert all(q.price > 1000 for q in qs.asks)
+
+    def test_the_cap_does_not_widen_a_quote_that_is_already_inside(self):
+        # Price improvement puts us inside the touch; the cap only pulls in.
+        qs = self.quote(max_distance_ticks=0, min_half_spread_ticks=0, liquidity_premium_ticks=0.0)
+        assert max(q.price for q in qs.bids) >= 1000

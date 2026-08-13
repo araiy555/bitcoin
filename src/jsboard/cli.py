@@ -196,6 +196,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             base_size_lots=instrument.to_lots(args.size),
             max_position_lots=instrument.to_lots(args.max_position),
             min_half_spread_ticks=args.min_half_spread,
+            max_distance_ticks=getattr(args, "max_distance", None),
             # Quote at least wide enough to cover what the venue charges us.
             min_edge_bps=args.min_edge_bps if args.min_edge_bps is not None else args.maker_bps,
         )
@@ -474,7 +475,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     else:
         instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
 
-    feed = ReplayFeed(instrument, path, speed=args.speed)
+    feed = ReplayFeed(instrument, path, speed=args.speed, source=args.source)
     mm = build_maker(instrument, args)
     # A recording carries the timestamps it was captured with. Judged against
     # the wall clock those are always in the past — a day-old capture reads as
@@ -483,6 +484,138 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     # event being replayed.
     attach_virtual_clock(mm)
     await drive(feed, mm, args, headless=args.headless)
+    return 0
+
+
+def _instrument_for_recording(path: Path, args: argparse.Namespace) -> Instrument:
+    """Prefer the spec the recorder saved; fall back to the CLI overrides."""
+    meta_path = path.with_suffix(path.suffix + ".meta.json")
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        return Instrument(
+            symbol=meta["symbol"],
+            tick_size=Decimal(meta["tick_size"]),
+            lot_size=Decimal(meta["lot_size"]),
+            base=meta.get("base", ""),
+            quote=meta.get("quote", ""),
+        )
+    return build_instrument(args.symbol, args.tick_size, args.lot_size)
+
+
+def _grid(spec: str, cast):
+    """Parse a comma-separated sweep axis. "none" means the uncapped setting."""
+    out = []
+    for piece in spec.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        out.append(None if piece.lower() in {"none", "off"} else cast(piece))
+    return out
+
+
+def _sweep_row(mm: MarketMaker, s: dict) -> dict:
+    """Reduce one replay to the handful of numbers worth comparing."""
+    matched = min(s["bought"], s["sold"])
+    mid_ticks = s.get("mid_ticks")
+    capture = math.nan
+    if matched > 0 and mid_ticks:
+        notional = matched * float(mid_ticks) * float(mm.instrument.tick_size)
+        if notional > 0:
+            capture = s["gross"] / notional * 10_000.0
+    placement = s.get("placement") or {}
+    total = sum(placement.values()) or 1
+    at_touch = sum(n for d, n in placement.items() if d <= 0)
+    markout = s.get("markout") or []
+    return {
+        "fills": int(s["fills"]),
+        "capture_bps": capture,
+        "net_bps": capture - 2.0 * mm.position.fees.maker_bps,
+        "realized": s["realized"],
+        "total": s["total"],
+        "touch_share": at_touch / total * 100.0,
+        "markout_10s": markout[1]["mean_bps"] if len(markout) > 1 else math.nan,
+    }
+
+
+async def cmd_sweep(args: argparse.Namespace) -> int:
+    """Replay one recording under many settings.
+
+    A live session yields one data point per hour of waiting, which is far
+    too slow to choose a quote width or a size. A recording can be replayed
+    as many times as there are settings to try, against the identical market,
+    so the comparison is a controlled one rather than a comparison of two
+    different hours.
+    """
+    path = Path(args.path)
+    if not path.exists():
+        console.print(f"[red]{path} がありません。まず capture で録画してください。[/red]")
+        return 1
+
+    instrument = _instrument_for_recording(path, args)
+    distances = _grid(args.distances, int)
+    sizes = _grid(args.sizes, str) or [args.size]
+    combos = [(d, z) for d in distances for z in sizes]
+
+    console.print(
+        f"{path.name}: {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
+        f"{len(combos)} 通りを同じ録画に対して再生します "
+        f"(maker {args.maker_bps:g}bps → 往復 {2 * args.maker_bps:g}bps)"
+    )
+
+    rows = []
+    for distance, size in combos:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.max_distance = distance
+        run_args.size = size
+        try:
+            _check_sizes(instrument, run_args)
+        except ConfigError as exc:
+            console.print(f"[yellow]skip distance={distance} size={size}: {exc}[/yellow]")
+            continue
+
+        mm = build_maker(instrument, run_args)
+        attach_virtual_clock(mm)
+        feed = ReplayFeed(instrument, path, speed=0.0, source=args.source)
+        await run(feed, mm, duration_s=None, max_events=args.max_events)
+        row = _sweep_row(mm, mm.summary())
+        row.update({"distance": distance, "size": size})
+        rows.append(row)
+        console.print(f"  distance={str(distance):>4}  size={size:>10}  fills={row['fills']:,}")
+
+    if not rows:
+        console.print("[red]走れた組み合わせがありません。[/red]")
+        return 1
+
+    # Best net edge first; rows that never filled have nothing to rank and go last.
+    rows.sort(key=lambda r: (math.isnan(r["net_bps"]), -(r["net_bps"] or 0.0)))
+    table = Table(title=f"{instrument.symbol} — sweep ({path.name})")
+    table.add_column("distance", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("約定", justify="right")
+    table.add_column("touch%", justify="right")
+    table.add_column("取り bps", justify="right")
+    table.add_column("手数料後 bps", justify="right")
+    table.add_column("mark-out\n10s", justify="right")
+    table.add_column(f"実現損益\n({instrument.quote})", justify="right")
+
+    for r in rows:
+        net = r["net_bps"]
+        colour = "dim" if math.isnan(net) else ("green" if net > 0 else "red")
+        table.add_row(
+            "touch" if r["distance"] == 0 else str(r["distance"]),
+            str(r["size"]),
+            f"{r['fills']:,}",
+            f"{r['touch_share']:.0f}%",
+            "—" if math.isnan(r["capture_bps"]) else f"{r['capture_bps']:+.2f}",
+            f"[{colour}]{'—' if math.isnan(net) else f'{net:+.2f}'}[/{colour}]",
+            "—" if math.isnan(r["markout_10s"]) else f"{r['markout_10s']:+.2f}",
+            f"{r['realized']:+.2f}",
+        )
+    console.print(table)
+    console.print(
+        "[dim]同じ1時間に対する再生なので、行どうしの比較は公平です。"
+        "ただし約定数が二桁に届かない行は、まだ数字として読めません。[/dim]"
+    )
     return 0
 
 
@@ -1400,6 +1533,12 @@ def add_common(p: argparse.ArgumentParser) -> None:
     mm.add_argument("--max-position", default="0.10", help="inventory limit")
     mm.add_argument("--min-half-spread", type=int, default=1, help="ticks")
     mm.add_argument(
+        "--max-distance",
+        type=int,
+        default=None,
+        help="cap ticks behind the touch (0 = join the queue at best)",
+    )
+    mm.add_argument(
         "--min-edge-bps",
         type=float,
         default=None,
@@ -1483,7 +1622,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_rep)
     p_rep.add_argument("path")
     p_rep.add_argument("--speed", type=float, default=1.0, help="0 = as fast as possible")
+    p_rep.add_argument(
+        "--source", default=None,
+        help="capture 録画のどちらを再生するか (spot / perp)",
+    )
     p_rep.set_defaults(func=cmd_replay)
+
+    p_sw = sub.add_parser("sweep", help="replay one recording under many settings")
+    add_common(p_sw)
+    p_sw.add_argument("path", help="a .jsonl recording from `capture`")
+    p_sw.add_argument(
+        "--distances",
+        default="0,1,2,4,none",
+        help="ticks behind the touch to try; 'none' = uncapped",
+    )
+    p_sw.add_argument(
+        "--sizes",
+        default="",
+        help="quote sizes to try (default: just --size)",
+    )
+    p_sw.add_argument(
+        "--source", default=None,
+        help="capture 録画のどちらを再生するか (spot / perp)",
+    )
+    p_sw.set_defaults(func=cmd_sweep, headless=True)
 
     p_bt = sub.add_parser("backtest", help="headless synthetic run")
     add_common(p_bt)

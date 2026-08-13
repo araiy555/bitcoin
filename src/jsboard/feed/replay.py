@@ -235,10 +235,16 @@ class ReplayFeed(Feed):
         path: str | Path,
         *,
         speed: float = 1.0,
+        source: str | None = None,
     ) -> None:
         super().__init__(instrument)
         self.path = Path(path)
         self.speed = speed
+        self.source = source
+        """Which `src` tag to replay. A `capture` recording interleaves spot
+        and perp on one timeline, and feeding both into a single book would
+        build a book that never existed. None replays every line, which is
+        what a single-venue `record` file wants."""
 
     async def stream(self) -> AsyncIterator[FeedEvent]:
         yield FeedStatus("connecting", str(self.path))
@@ -248,7 +254,14 @@ class ReplayFeed(Feed):
                 line = line.strip()
                 if not line:
                     continue
-                event = _decode(json.loads(line))
+                raw = json.loads(line)
+                # `src` is a routing tag, not part of any event; decoding it
+                # into an event constructor is a TypeError, which is why a
+                # capture recording could not be replayed at all before.
+                src = raw.pop("src", None)
+                if self.source is not None and src is not None and src != self.source:
+                    continue
+                event = _decode(raw)
                 ts = getattr(event, "ts_ns", None)
                 if self.speed > 0 and prev_ts is not None and ts is not None:
                     gap = (ts - prev_ts) / 1e9 / self.speed

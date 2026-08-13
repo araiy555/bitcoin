@@ -253,3 +253,45 @@ class TestHalting:
         assert mm.risk.halted
         assert "halted" in result.stopped_because
         assert mm.venue.open_orders() == []
+
+
+class TestReplaySource:
+    """A capture file carries two venues; a replay must take only one."""
+
+    def write(self, tmp_path, lines):
+        path = tmp_path / "cap.jsonl"
+        path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+        return path
+
+    def lines(self):
+        def trade(src, price, tid):
+            return {
+                "src": src, "k": "trade", "price": price, "qty": 100,
+                "aggressor": 1, "trade_id": tid, "ts_ns": 1_000 + tid,
+            }
+        return [trade("spot", 100, 1), trade("perp", 200, 2), trade("spot", 101, 3)]
+
+    async def drain(self, feed):
+        return [e for e in [x async for x in feed.stream()] if hasattr(e, "trade_id")]
+
+    @pytest.mark.asyncio
+    async def test_selecting_one_source_drops_the_other(self, tmp_path):
+        path = self.write(tmp_path, self.lines())
+        events = await self.drain(ReplayFeed(BTC, path, speed=0.0, source="perp"))
+        assert [e.trade_id for e in events] == [2]
+
+    @pytest.mark.asyncio
+    async def test_no_source_replays_everything(self, tmp_path):
+        path = self.write(tmp_path, self.lines())
+        events = await self.drain(ReplayFeed(BTC, path, speed=0.0, source=None))
+        assert [e.trade_id for e in events] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_untagged_lines_survive_a_source_filter(self, tmp_path):
+        # `record` writes no src tag; asking for one must not empty the file.
+        rows = [dict(x) for x in self.lines()]
+        for row in rows:
+            row.pop("src")
+        path = self.write(tmp_path, rows)
+        events = await self.drain(ReplayFeed(BTC, path, speed=0.0, source="perp"))
+        assert [e.trade_id for e in events] == [1, 2, 3]

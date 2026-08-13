@@ -108,6 +108,19 @@ class QuoterConfig:
     side must earn at least `f` bps per side to break even, so the floor is
     the fee itself."""
 
+    max_distance_ticks: int | None = None
+    """Cap on how far behind the touch a quote may rest. None = uncapped.
+
+    The pricing model above works outward from the reservation price, which
+    means the distance from the touch is whatever the half-spread and the
+    ladder step happen to produce — and on a symbol whose spread is one tick,
+    that is *always* behind the best price. A maker that never joins the touch
+    fills rarely and only on dislocations; that may be the right trade at a
+    high fee, but it should be a choice rather than an accident.
+
+    0 clamps every quote onto the touch, joining the queue at the best price.
+    Larger values allow the ladder to step back that many ticks and no more."""
+
     allow_price_improvement: bool = True
     """Let a quote sit *inside* the spread when the model says it should.
 
@@ -208,6 +221,11 @@ class Quoter:
 
             bid_px = int(math.floor(reservation - offset))
             ask_px = int(math.ceil(reservation + offset))
+
+            if cfg.max_distance_ticks is not None:
+                # Pull a quote that drifted too far back up to the touch.
+                bid_px = max(bid_px, best_bid - cfg.max_distance_ticks)
+                ask_px = min(ask_px, best_ask + cfg.max_distance_ticks)
 
             # Hard constraint: a maker never crosses. A bid must stay below the
             # best offer and an ask above the best bid, or it is a taker order.
