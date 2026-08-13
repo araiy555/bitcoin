@@ -226,6 +226,25 @@ class JsonlRecorder:
         self._fh.write(json.dumps(_encode(event)) + "\n")
 
 
+def iter_tagged(path: str | Path):
+    """Yield (source, event) for every line, in recorded order.
+
+    `ReplayFeed` deliberately serves one venue, because feeding two into one
+    book builds a book that never existed. Cross-venue work needs the
+    opposite: both streams, still interleaved, each routed to its own book.
+    """
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            src = raw.pop(SOURCE_KEY, None)
+            for key in ENVELOPE_KEYS:
+                raw.pop(key, None)
+            yield src, _decode(raw)
+
+
 SOURCE_KEY = "src"
 """Which venue a captured line came from."""
 

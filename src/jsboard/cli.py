@@ -35,7 +35,7 @@ from .core.types import Instrument
 from .feed.base import Feed
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
-from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed
+from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig
@@ -56,7 +56,8 @@ from .research.predict import (
 )
 from .research.scan import ScanFilters, rank_persistence, scan, summarise, watch
 from .sim.capture import MultiCapture, write_meta
-from .sim.paper import PaperConfig, PaperVenue
+from .sim.hedge import HedgeConfig, Hedger
+from .sim.paper import PAPER_OWNER, PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .ui.board import Board
 
@@ -808,6 +809,171 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         "ただし約定数が二桁に届かない行は、まだ数字として読めません。[/dim]"
     )
     return 0
+
+
+def _hedge_verdict(net_by_fee: dict[float, float]) -> tuple[str, str]:
+    """The decision, fixed in advance so the data cannot be argued with.
+
+    Stated before the run rather than after: with a free maker fee the
+    strategy either survives its own costs or it does not, and if it does,
+    the only remaining question is which fee tier it needs.
+    """
+    free = net_by_fee.get(0.0, float("nan"))
+    two = net_by_fee.get(2.0, float("nan"))
+    if not (free > 0):
+        return (
+            "red",
+            "終了。手数料ゼロでもコストを回収できていないので、"
+            "この銘柄でのマーケットメイクは成立しません。別戦略へ。",
+        )
+    if not (two > 0):
+        return (
+            "yellow",
+            "戦略は成立するが、低手数料口座が必須。"
+            "現在の 10 bps 口座では不可能で、2 bps でも届いていません。",
+        )
+    return (
+        "green",
+        "成立。次は期間を変えた out-of-sample → ペーパー → 少額実売買。",
+    )
+
+
+async def cmd_hedge(args: argparse.Namespace) -> int:
+    """Make on one venue, hedge immediately on the other, and total it up.
+
+    This is the decisive test, not another diagnostic. The maker leg earns a
+    spread and the hedge leg pays to cross; the question is whether anything
+    survives both plus the fees. One number decides it, at three fee levels.
+    """
+    path = Path(args.path)
+    if not path.exists():
+        console.print(f"[red]{path} がありません。[/red]")
+        return 1
+
+    meta_path = path.with_suffix(path.suffix + ".meta.json")
+    if not meta_path.exists():
+        raise ConfigError(f"{meta_path.name} がありません。capture で録った録画が要ります。")
+    sources = json.loads(meta_path.read_text()).get("sources") or {}
+    for name in (args.maker_source, args.hedge_source):
+        if name not in sources:
+            raise ConfigError(
+                f"--{'maker' if name == args.maker_source else 'hedge'}-source {name} は "
+                f"録画にありません。使えるのは: {', '.join(sorted(sources))}"
+            )
+    maker_inst = _instrument_from_spec(sources[args.maker_source])
+    hedge_inst = _instrument_from_spec(sources[args.hedge_source])
+
+    console.print(
+        f"{path.name}\n"
+        f"  メイク: {args.maker_source} {maker_inst.symbol} "
+        f"tick={maker_inst.tick_size} lot={maker_inst.lot_size}\n"
+        f"  ヘッジ: {args.hedge_source} {hedge_inst.symbol} "
+        f"tick={hedge_inst.tick_size} lot={hedge_inst.lot_size} "
+        f"(taker {args.taker_bps:g}bps, ratio {args.hedge_ratio:g})\n"
+        f"  requote {args.requote_ms:g}ms"
+    )
+
+    rows = []
+    net_by_fee: dict[float, float] = {}
+    for maker_bps in _grid(args.maker_fees, float):
+        run_args = argparse.Namespace(**vars(args))
+        run_args.maker_bps = maker_bps
+        _check_sizes(maker_inst, run_args)
+        row = await _run_hedged(path, maker_inst, hedge_inst, run_args)
+        row["maker_bps"] = maker_bps
+        rows.append(row)
+        net_by_fee[maker_bps] = row["net_bps"]
+
+    columns = [
+        ("maker", "maker_bps", "{:g}"),
+        ("約定", "fills", "{:,.0f}"),
+        ("ヘッジ", "hedges", "{:,.0f}"),
+        ("未ヘッジ", "skipped", "{:,.0f}"),
+        ("make.spread", "maker_spread", "{:+.2f}"),
+        ("make.在庫", "maker_inventory", "{:+.2f}"),
+        ("hedge.cross", "hedge_cross", "{:+.2f}"),
+        ("hedge.在庫", "hedge_inventory", "{:+.2f}"),
+        ("手数料", "fees", "{:+.2f}"),
+        ("Net bps", "net_bps", "{:+.2f}"),
+    ]
+
+    def cell(row, key, fmt):
+        value = row[key]
+        return "—" if isinstance(value, float) and math.isnan(value) else fmt.format(value)
+
+    if args.plain:
+        console.print("\t".join(c[0] for c in columns), highlight=False)
+        for r in rows:
+            console.print("\t".join(cell(r, k, f) for _, k, f in columns), highlight=False)
+    else:
+        table = Table(title=f"{maker_inst.symbol} — メイク＋即時ヘッジ", padding=(0, 1))
+        for header, _, _ in columns:
+            table.add_column(header, justify="right")
+        for r in rows:
+            net = r["net_bps"]
+            colour = "dim" if math.isnan(net) else ("green" if net > 0 else "red")
+            cells = [cell(r, k, f) for _, k, f in columns]
+            cells[-1] = f"[{colour}]{cells[-1]}[/{colour}]"
+            table.add_row(*cells)
+        console.print(table)
+
+    colour, verdict = _hedge_verdict(net_by_fee)
+    console.print(f"\n[{colour}][bold]判定: {verdict}[/bold][/{colour}]")
+    console.print(
+        "[dim]Net は全コスト込み（メイカー手数料・ヘッジのテイカー手数料・"
+        "板を歩いたスリッページ・両脚のベーシス変動）を1往復あたり bps に直したもの。\n"
+        "ペーパー約定は板を突き抜ける約定を数えていないので、これでも上限値。[/dim]"
+    )
+    return 0
+
+
+async def _run_hedged(path, maker_inst, hedge_inst, args) -> dict:
+    """One pass over the recording with the maker and hedge books side by side."""
+    mm = build_maker(maker_inst, args)
+    attach_virtual_clock(mm)
+    hedge_view = MarketView(instrument=hedge_inst, depth=args.depth)
+    hedger = Hedger(
+        instrument=hedge_inst,
+        market=hedge_view,
+        config=HedgeConfig(
+            ratio=args.hedge_ratio, taker_bps=args.taker_bps, max_levels=args.depth
+        ),
+    )
+
+    for src, event in iter_tagged(path):
+        if src == args.hedge_source:
+            hedge_view.apply(event)
+            hedger.on_market()
+            continue
+        if src != args.maker_source:
+            continue
+        for fill in mm.on_event(event):
+            if fill.maker_owner == PAPER_OWNER:
+                sign = fill.aggressor.opposite.sign
+                hedger.on_maker_fill(sign, maker_inst.qty_f(fill.qty))
+        mm.requote()
+
+    s = mm.summary()
+    matched = min(s["bought"], s["sold"])
+    maker = mm.attribution
+    hedge = hedger.attribution
+    # One denominator for both legs: the maker notional actually turned over
+    # is what the whole exercise is trying to earn on.
+    mid = maker.last_mid_ticks
+    notional = matched * float(mid or 0) * float(maker_inst.tick_size)
+    scale = 10_000.0 / notional if notional > 0 else math.nan
+
+    return {
+        "fills": int(s["fills"]),
+        "hedges": int(hedger.hedges),
+        "skipped": int(hedger.skipped_no_book),
+        "maker_spread": maker.spread_capture * scale,
+        "maker_inventory": maker.inventory_pnl * scale,
+        "hedge_cross": hedge.spread_capture * scale,
+        "hedge_inventory": hedge.inventory_pnl * scale,
+        "fees": -(maker.fees + hedge.fees) * scale,
+        "net_bps": (maker.total + hedge.total) * scale,
+    }
 
 
 # Binance spot maker fees by VIP tier, for reading the breakeven column
@@ -1848,6 +2014,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="表ではなくタブ区切りで出す（折り返さないので貼り付けやすい）",
     )
     p_sw.set_defaults(func=cmd_sweep, headless=True)
+
+    p_hg = sub.add_parser("hedge", help="メイク＋即時ヘッジの最終損益テスト")
+    add_common(p_hg)
+    p_hg.add_argument("path", help="capture で録った .jsonl")
+    p_hg.add_argument("--maker-source", default="spot", help="どちらでメイクするか")
+    p_hg.add_argument("--hedge-source", default="perp", help="どちらでヘッジするか")
+    p_hg.add_argument("--hedge-ratio", type=float, default=1.0, help="0 でヘッジなし")
+    p_hg.add_argument("--maker-fees", default="0,1,2", help="試すメイカー手数料 bps")
+    p_hg.add_argument("--plain", action="store_true", help="タブ区切りで出す")
+    # min_edge_bps normally tracks the maker fee, which is right when trading
+    # and wrong here: it would make each fee level quote differently, so the
+    # three rows would compare three strategies rather than one strategy at
+    # three prices. Held at zero so only the cost varies.
+    p_hg.set_defaults(
+        func=cmd_hedge, headless=True, max_distance=0, requote_ms=100.0, min_edge_bps=0.0
+    )
 
     p_bt = sub.add_parser("backtest", help="headless synthetic run")
     add_common(p_bt)
