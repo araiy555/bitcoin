@@ -89,8 +89,10 @@ class TestHorizons:
         assert t.windows[0].n == 2
         assert t.windows[0].mean_bps == pytest.approx(0.0)
 
-    def test_default_horizons_are_one_ten_sixty(self):
-        assert [w.horizon_s for w in MarkOutTracker().windows] == [1.0, 10.0, 60.0]
+    def test_defaults_start_at_the_shortest_the_data_resolves(self):
+        # 100ms is the depth stream's own update interval: adverse selection
+        # faster than that is invisible here, and bounding it matters.
+        assert [w.horizon_s for w in MarkOutTracker().windows] == [0.1, 1.0, 10.0, 60.0]
 
 
 class TestWeighting:

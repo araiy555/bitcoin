@@ -92,7 +92,10 @@ class MarkOutTracker:
     quoted the same way.
     """
 
-    horizons_s: tuple[float, ...] = (1.0, 10.0, 60.0)
+    horizons_s: tuple[float, ...] = (0.1, 1.0, 10.0, 60.0)
+    """100ms is in there because it is the shortest thing this data can
+    resolve — the depth stream updates at 100ms — so it bounds how much of
+    the adverse selection is faster than we could ever react to."""
     windows: list[MarkOutWindow] = field(default_factory=list)
 
     def __post_init__(self) -> None:

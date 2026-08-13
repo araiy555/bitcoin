@@ -50,6 +50,16 @@ class PnLAttribution:
     fees: float = 0.0
     position_lots: int = 0
     last_mid_ticks: float | None = None
+
+    # How long the position was carried, which is the exposure the inventory
+    # term is the price of. A run that is flat 99% of the time and one that
+    # never goes flat can report the same inventory P&L for very different
+    # reasons, and only the second is a case for hedging.
+    elapsed_ns: int = 0
+    exposed_ns: int = 0
+    abs_position_ns: float = 0.0
+    last_clock_ns: int | None = None
+
     fills_priced: int = 0
     fills_unpriced: int = 0
     """Fills booked with no mid available. Their spread capture is unknowable,
@@ -61,8 +71,22 @@ class PnLAttribution:
     def _tick(self) -> float:
         return float(self.instrument.tick_size)
 
-    def on_mid(self, mid_ticks: float | None) -> None:
+    def on_clock(self, now_ns: int | None) -> None:
+        """Advance the exposure clock, crediting the position we held over it."""
+        if now_ns is None:
+            return
+        if self.last_clock_ns is not None:
+            elapsed = now_ns - self.last_clock_ns
+            if elapsed > 0:
+                self.elapsed_ns += elapsed
+                if self.position_lots:
+                    self.exposed_ns += elapsed
+                    self.abs_position_ns += abs(self.instrument.qty_f(self.position_lots)) * elapsed
+        self.last_clock_ns = now_ns
+
+    def on_mid(self, mid_ticks: float | None, now_ns: int | None = None) -> None:
         """Mark the carried position to a new mid."""
+        self.on_clock(now_ns)
         if mid_ticks is None or mid_ticks <= 0:
             return
         if self.last_mid_ticks is not None and self.position_lots:
@@ -78,13 +102,14 @@ class PnLAttribution:
         sign: int,
         fee: float,
         mid_ticks: float | None,
+        now_ns: int | None = None,
     ) -> None:
         """Book one of our fills. `sign` is +1 when we bought, -1 when we sold."""
         if qty_lots <= 0:
             return
         # Carry the existing position up to this moment before the fill
         # changes it, or the new size would be credited with an older move.
-        self.on_mid(mid_ticks)
+        self.on_mid(mid_ticks, now_ns)
 
         if mid_ticks is None or mid_ticks <= 0:
             self.fills_unpriced += 1
@@ -100,6 +125,21 @@ class PnLAttribution:
     def total(self) -> float:
         return self.spread_capture + self.inventory_pnl - self.fees
 
+    @property
+    def net_before_fees(self) -> float:
+        """What the strategy earned before the venue took its cut."""
+        return self.spread_capture + self.inventory_pnl
+
+    @property
+    def exposed_share(self) -> float:
+        """Fraction of the session spent holding a position at all."""
+        return self.exposed_ns / self.elapsed_ns if self.elapsed_ns else 0.0
+
+    @property
+    def mean_abs_position(self) -> float:
+        """Time-weighted average absolute position, in base units."""
+        return self.abs_position_ns / self.elapsed_ns if self.elapsed_ns else 0.0
+
     def per_round_trip_bps(self, matched_qty: float) -> dict[str, float]:
         """The same terms as basis points of the notional actually turned over."""
         mid = self.last_mid_ticks
@@ -112,6 +152,7 @@ class PnLAttribution:
         return {
             "spread_capture": self.spread_capture * scale,
             "inventory": self.inventory_pnl * scale,
+            "net_before_fees": self.net_before_fees * scale,
             "fees": -self.fees * scale,
             "total": self.total * scale,
         }
@@ -121,6 +162,9 @@ class PnLAttribution:
             "spread_capture": self.spread_capture,
             "inventory": self.inventory_pnl,
             "fees": self.fees,
+            "net_before_fees": self.net_before_fees,
             "total": self.total,
             "unpriced_fills": float(self.fills_unpriced),
+            "exposed_share": self.exposed_share,
+            "mean_abs_position": self.mean_abs_position,
         }

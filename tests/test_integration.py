@@ -295,3 +295,32 @@ class TestReplaySource:
         path = self.write(tmp_path, rows)
         events = await self.drain(ReplayFeed(BTC, path, speed=0.0, source="perp"))
         assert [e.trade_id for e in events] == [1, 2, 3]
+
+
+class TestExposureClockIsDeterministic:
+    """The exposure clock must never read the wall clock during a replay.
+
+    It did: the virtual clock falls back to wall time until the first stamped
+    event, so the opening interval spanned two clocks and differed by however
+    long the process took to get there.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_replay_reports_the_same_exposure_twice(self, tmp_path):
+        path = tmp_path / "cap.jsonl"
+        feed = SyntheticFeed(BTC, seed=5, tick_interval=0.0, max_events=800)
+        with JsonlRecorder(path) as rec:
+            async for event in feed.stream():
+                rec.write(event)
+
+        async def replay():
+            maker = build()
+            attach_virtual_clock(maker)
+            await run(ReplayFeed(BTC, path, speed=0.0), maker)
+            return maker.summary()["attribution"]
+
+        first, second = await replay(), await replay()
+        assert first["exposed_share"] == second["exposed_share"]
+        assert first["mean_abs_position"] == second["mean_abs_position"]
+        # A pair of zeros would agree without proving anything.
+        assert first["exposed_share"] > 0

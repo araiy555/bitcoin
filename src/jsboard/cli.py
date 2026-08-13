@@ -633,6 +633,18 @@ def _label(name: str, value) -> str:
     return "none" if value is None else str(value)
 
 
+def _markout_at(windows: list[dict], horizon_s: float) -> float:
+    """Adverse selection at one horizon, by value rather than by position.
+
+    Indexing into the list would silently return a different horizon the
+    moment the default set changes, which it just did.
+    """
+    for w in windows:
+        if abs(w["horizon_s"] - horizon_s) < 1e-9:
+            return w["mean_bps"]
+    return math.nan
+
+
 def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     """Reduce one replay to the handful of numbers worth comparing."""
     matched = min(s["bought"], s["sold"])
@@ -647,6 +659,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     at_touch = sum(n for d, n in placement.items() if d <= 0)
     markout = s.get("markout") or []
     bps = mm.attribution.per_round_trip_bps(matched)
+    a = s.get("attribution") or {}
     return {
         "fills": int(s["fills"]),
         "capture_bps": capture,
@@ -654,10 +667,15 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "realized": s["realized"],
         "total": s["total"],
         "touch_share": at_touch / total * 100.0,
-        "markout_10s": markout[1]["mean_bps"] if len(markout) > 1 else math.nan,
         "spread_bps": bps.get("spread_capture", math.nan),
         "inventory_bps": bps.get("inventory", math.nan),
+        "pre_fee_bps": bps.get("net_before_fees", math.nan),
+        "fee_bps": bps.get("fees", math.nan),
         "attributed_bps": bps.get("total", math.nan),
+        "markout_100ms": _markout_at(markout, 0.1),
+        "markout_1s": _markout_at(markout, 1.0),
+        "markout_10s": _markout_at(markout, 10.0),
+        "exposed_share": a.get("exposed_share", math.nan) * 100.0,
     }
 
 
@@ -718,30 +736,48 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
 
     # Best net edge first; rows that never filled have nothing to rank and go last.
     rows.sort(key=lambda r: (math.isnan(r["net_bps"]), -(r["net_bps"] or 0.0)))
-    table = Table(title=f"{instrument.symbol} — sweep ({path.name})")
+    columns = [
+        ("約定", "fills", "{:,.0f}"),
+        ("spread", "spread_bps", "{:+.2f}"),
+        ("在庫", "inventory_bps", "{:+.2f}"),
+        ("手数料前", "pre_fee_bps", "{:+.2f}"),
+        ("手数料", "fee_bps", "{:+.2f}"),
+        ("手数料後", "attributed_bps", "{:+.2f}"),
+        ("mo100ms", "markout_100ms", "{:+.2f}"),
+        ("mo1s", "markout_1s", "{:+.2f}"),
+        ("mo10s", "markout_10s", "{:+.2f}"),
+        ("在庫時間%", "exposed_share", "{:.0f}"),
+    ]
+
+    def cell(row: dict, key: str, fmt: str) -> str:
+        value = row[key]
+        return "—" if isinstance(value, float) and math.isnan(value) else fmt.format(value)
+
+    if args.plain:
+        # A rich table of this width wraps in most terminals, which makes the
+        # numbers unreadable and unpasteable. Tab-separated survives both.
+        head = [*names, *(c[0] for c in columns)]
+        console.print("\t".join(head), highlight=False)
+        for r in rows:
+            cells = [_label(n, r["settings"][n]) for n in names]
+            cells += [cell(r, key, fmt) for _, key, fmt in columns]
+            console.print("\t".join(cells), highlight=False)
+        return 0
+
+    table = Table(title=f"{instrument.symbol} — sweep ({path.name})", padding=(0, 1))
     for name in names:
         table.add_column(name.replace("_", " "), justify="right")
-    table.add_column("約定", justify="right")
-    table.add_column("touch%", justify="right")
-    table.add_column("スプレッド\n取り bps", justify="right")
-    table.add_column("在庫\nbps", justify="right")
-    table.add_column("逆選択\n10s bps", justify="right")
-    table.add_column("手数料後\n合計 bps", justify="right")
-    table.add_column(f"実現損益\n({instrument.quote})", justify="right")
+    for header, _, _ in columns:
+        table.add_column(header, justify="right")
 
     for r in rows:
         attributed = r["attributed_bps"]
         colour = "dim" if math.isnan(attributed) else ("green" if attributed > 0 else "red")
-        table.add_row(
-            *(_label(n, r["settings"][n]) for n in names),
-            f"{r['fills']:,}",
-            f"{r['touch_share']:.0f}%",
-            "—" if math.isnan(r["spread_bps"]) else f"{r['spread_bps']:+.2f}",
-            "—" if math.isnan(r["inventory_bps"]) else f"{r['inventory_bps']:+.2f}",
-            "—" if math.isnan(r["markout_10s"]) else f"{r['markout_10s']:+.2f}",
-            f"[{colour}]{'—' if math.isnan(attributed) else f'{attributed:+.2f}'}[/{colour}]",
-            f"{r['realized']:+.2f}",
-        )
+        cells = [_label(n, r["settings"][n]) for n in names]
+        for _, key, fmt in columns:
+            text = cell(r, key, fmt)
+            cells.append(f"[{colour}]{text}[/{colour}]" if key == "attributed_bps" else text)
+        table.add_row(*cells)
     console.print(table)
     console.print(
         "[dim]同じ1時間に対する再生なので、行どうしの比較は公平です。"
@@ -1781,6 +1817,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sw.add_argument(
         "--source", default=None,
         help="capture 録画のどちらを再生するか (spot / perp)",
+    )
+    p_sw.add_argument(
+        "--plain",
+        action="store_true",
+        help="表ではなくタブ区切りで出す（折り返さないので貼り付けやすい）",
     )
     p_sw.set_defaults(func=cmd_sweep, headless=True)
 

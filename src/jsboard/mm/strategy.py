@@ -87,6 +87,18 @@ class MarketMaker:
         # quote currency, so it cannot be a plain default_factory.
         self.attribution = PnLAttribution(self.instrument)
 
+    @property
+    def _data_time_ns(self) -> int | None:
+        """Time as the data sees it, or nothing before the first stamped event.
+
+        The virtual clock falls back to the wall clock until a timestamped
+        event arrives, so an interval spanning that switch is measured between
+        two different clocks — a gap that differs on every run and makes a
+        replay unrepeatable. Exposure is time at risk *in the market*, so the
+        market's own clock is also the right one to measure it on.
+        """
+        return self.market.last_update_ns or None
+
     # ------------------------------------------------------------ ingestion
 
     def on_event(self, event: FeedEvent) -> list[Fill]:
@@ -123,6 +135,7 @@ class MarketMaker:
                         sign=sign,
                         fee=fee / len(sides),
                         mid_ticks=mid,
+                        now_ns=self._data_time_ns,
                     )
             if fills:
                 self.stats.fills += len(fills)
@@ -136,7 +149,7 @@ class MarketMaker:
 
         mid_now = self.market.mid
         self.markout.poll(self.clock(), mid_now)
-        self.attribution.on_mid(mid_now)
+        self.attribution.on_mid(mid_now, self._data_time_ns)
         return fills
 
     # -------------------------------------------------------------- quoting

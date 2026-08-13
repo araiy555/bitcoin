@@ -147,3 +147,53 @@ class TestPerRoundTripBps:
 
     def test_nothing_matched_reports_nothing(self, attr):
         assert attr.per_round_trip_bps(0.0) == {}
+
+
+class TestExposureClock:
+    """How long the position was carried, which the inventory term is the price of."""
+
+    S = 1_000_000_000
+
+    def test_a_flat_session_is_never_exposed(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_mid(101, now_ns=10 * self.S)
+        assert attr.exposed_share == pytest.approx(0.0)
+        assert attr.mean_abs_position == pytest.approx(0.0)
+
+    def test_exposure_starts_at_the_fill_not_before(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_mid(100, now_ns=5 * self.S)  # flat for 5s
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100,
+                     now_ns=5 * self.S)
+        attr.on_mid(100, now_ns=10 * self.S)  # long for 5s
+        assert attr.exposed_share == pytest.approx(0.5)
+
+    def test_mean_position_is_time_weighted_not_fill_weighted(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=9 * self.S)  # 10 units for 9s
+        attr.on_fill(price_ticks=100, qty_lots=10, sign=-1, fee=0.0, mid_ticks=100,
+                     now_ns=9 * self.S)
+        attr.on_mid(100, now_ns=10 * self.S)  # flat for 1s
+        assert attr.mean_abs_position == pytest.approx(9.0)
+
+    def test_a_short_counts_as_exposure_too(self, attr):
+        attr.on_mid(100, now_ns=0)
+        attr.on_fill(price_ticks=100, qty_lots=4, sign=-1, fee=0.0, mid_ticks=100, now_ns=0)
+        attr.on_mid(100, now_ns=10 * self.S)
+        assert attr.exposed_share == pytest.approx(1.0)
+        assert attr.mean_abs_position == pytest.approx(4.0)
+
+    def test_time_is_ignored_when_no_clock_is_supplied(self, attr):
+        attr.on_mid(100)
+        attr.on_fill(price_ticks=99, qty_lots=10, sign=+1, fee=0.0, mid_ticks=100)
+        attr.on_mid(110)
+        assert attr.elapsed_ns == 0
+        assert attr.exposed_share == pytest.approx(0.0)
+        # ... and the P&L terms are unaffected by the missing clock.
+        assert attr.inventory_pnl == pytest.approx(100.0)
+
+    def test_a_clock_that_goes_backwards_does_not_subtract_time(self, attr):
+        attr.on_mid(100, now_ns=10 * self.S)
+        attr.on_mid(100, now_ns=1 * self.S)
+        assert attr.elapsed_ns == 0
