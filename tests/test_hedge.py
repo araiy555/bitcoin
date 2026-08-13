@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 
 from jsboard.core.market import MARKET_OWNER, MarketView
-from jsboard.core.types import Instrument, Side
+from jsboard.core.types import Instrument
 from jsboard.sim.hedge import HedgeConfig, Hedger
 
 INST = Instrument("HEDGE", tick_size=Decimal("1"), lot_size=Decimal("1"), base="H", quote="U")
