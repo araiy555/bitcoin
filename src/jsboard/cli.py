@@ -634,8 +634,16 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
     times and read as a result.
     """
     axes: dict[str, list] = {}
-    if args.distances:
-        axes["max_distance"] = _grid(args.distances, int)
+    # Preserve the historical default (distance sweep) only when the caller
+    # selected no other axis. An explicit latency experiment must not silently
+    # multiply into five quote-distance variants.
+    distances = args.distances
+    if distances is None and not any(
+        (args.sizes, getattr(args, "requotes", ""), getattr(args, "latencies", ""), args.axis)
+    ):
+        distances = "0,1,2,4,none"
+    if distances:
+        axes["max_distance"] = _grid(distances, int)
     if args.sizes:
         axes["size"] = _grid(args.sizes, str)
     if getattr(args, "requotes", ""):
@@ -2328,8 +2336,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sw.add_argument("path", help="a .jsonl recording from `capture`")
     p_sw.add_argument(
         "--distances",
-        default="0,1,2,4,none",
-        help="ticks behind the touch to try; 'none' = uncapped",
+        default=None,
+        help="ticks behind the touch to try; 'none' = uncapped (単独時の既定: 0,1,2,4,none)",
     )
     p_sw.add_argument(
         "--sizes",
