@@ -4,8 +4,8 @@
 経緯と実測結果は README にある。ここは「何がどう動くか」の一次資料。
 
 - 対象: Binance 現物 + Binance USDⓈ-M 無期限先物 + Bybit USDT無期限先物
-- 実装: Python 3.11+、22,368 行（src 13,352 / tests 7,697 / tools 1,319）
-- テスト: 633 件
+- 実装: Python 3.11+、22,696 行（src 13,549 / tests 7,828 / tools 1,319）
+- テスト: 636 件
 - **実発注の経路は存在しない。** API キーを受け取る箇所も、取引所へ注文を
   送る関数も無い。全コマンドは公開データの読み取りのみ。
 
@@ -24,6 +24,10 @@
 - 建玉/手仕舞い手数料、板歩き、Funding、借入、hedge遅延、fill-model誤差、
   safety marginを `CostBreakdown` で個別に保持し、GrossからExpected Netを計算
 - `xarb` は共通板歩き・品質・コスト判定を使用し、機械可読な拒否理由を集計する
+- `basis` は Binance 現物/無期限先物のlogベーシスを因果的にZスコア化し、
+  現物買い・先物売りを既定方向として、4脚の実板価格、全手数料、保有期限内の
+  予想Funding、執行余白がすべて残る候補だけをペーパー建玉する。現物ショートは
+  `--allow-spot-short` を明示しない限り `BORROW_UNAVAILABLE` で拒否する
 - `pair` / `dealer` / 即時hedgeも共通板歩きと品質・コスト判定を使用する
 
 `xarb` の追加オプション:
@@ -34,6 +38,16 @@ jsboard xarb capture.jsonl \
   --hedge-latency-buffer-bps 1 \
   --fill-model-buffer-bps 1 \
   --safety-margin-bps 1
+```
+
+`basis` の実行例:
+
+```bash
+jsboard basis capture.jsonl \
+  --lookback-minutes 30 --max-hold-hours 8 \
+  --spot-taker-bps 10 --perp-taker-bps 4 \
+  --hedge-latency-buffer-bps 1 \
+  --fill-model-buffer-bps 1 --safety-margin-bps 1
 ```
 
 この段階ではParquet変換、先行遅行、三角裁定、実注文はまだ実装していない。

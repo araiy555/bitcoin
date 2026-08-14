@@ -1,4 +1,4 @@
-"""Causal cross-exchange mean-reversion with executable two-leg prices.
+"""Causal two-market mean-reversion with executable two-leg prices.
 
 The signal is the rolling z-score of the Binance/Bybit log-mid spread.  The
 trade, however, is never priced at mid: both entry legs and both exit legs
@@ -45,6 +45,7 @@ class CrossArbConfig:
     taker_bps: dict[str, float] = field(
         default_factory=lambda: {"binance": 4.0, "bybit": 5.5}
     )
+    allowed_directions: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(slots=True)
@@ -92,19 +93,19 @@ class CrossArbStats:
     rejected_depth: int = 0
     rejected_cost: int = 0
     rejected_quality: int = 0
+    rejected_direction: int = 0
     entries: int = 0
     forced_exits: int = 0
     reject_codes: dict[str, int] = field(default_factory=dict)
 
 
 class CrossExchangeArb:
-    """One-position paper replay of a Binance/Bybit spread."""
-
-    SOURCES = ("binance", "bybit")
+    """One-position paper replay of any two comparable markets."""
 
     def __init__(self, instruments: dict[str, Instrument], config: CrossArbConfig) -> None:
-        if set(instruments) != set(self.SOURCES):
-            raise ValueError("cross arb requires binance and bybit instruments")
+        if len(instruments) != 2:
+            raise ValueError("cross arb requires exactly two instruments")
+        self.sources = tuple(instruments)
         if config.size_base <= 0 or config.lookback_s <= 0 or config.min_samples < 2:
             raise ValueError("size, lookback and min_samples must be positive")
         if config.entry_z <= config.exit_z or config.exit_z < 0:
@@ -122,8 +123,17 @@ class CrossExchangeArb:
             )
         ):
             raise ValueError("execution buffers must be non-negative")
-        if any(config.taker_bps.get(source, -1) < 0 for source in self.SOURCES):
+        if any(config.taker_bps.get(source, -1) < 0 for source in self.sources):
             raise ValueError("both taker fees must be non-negative")
+        if config.allowed_directions is not None:
+            valid = set(self.sources)
+            if any(
+                long_source not in valid
+                or short_source not in valid
+                or long_source == short_source
+                for long_source, short_source in config.allowed_directions
+            ):
+                raise ValueError("allowed directions must reference the two configured sources")
 
         self.instruments = instruments
         self.config = config
@@ -194,7 +204,7 @@ class CrossExchangeArb:
                     self.instruments[source].base and self.instruments[source].quote
                 ),
             )
-            for source in self.SOURCES
+            for source in self.sources
         )
         decision = assess_market_data(
             points,
@@ -269,16 +279,49 @@ class CrossExchangeArb:
             expected_exit_fees_bps=exit_fees * scale,
             entry_depth_slippage_bps=crossing_bps / 2.0,
             expected_exit_slippage_bps=crossing_bps / 2.0,
+            funding_bps=self._expected_funding_cost_bps(long_source, short_source, qty, reference),
             hedge_latency_buffer_bps=self.config.hedge_latency_buffer_bps,
             fill_model_buffer_bps=self.config.fill_model_buffer_bps,
             safety_margin_bps=self.config.safety_margin_bps,
         )
 
+    def _expected_funding_cost_bps(
+        self,
+        long_source: str,
+        short_source: str,
+        qty: float,
+        reference: float,
+    ) -> float:
+        """Return signed funding cost visible at entry within the hold horizon.
+
+        Positive is a cost and negative is a receipt.  Spot sources simply do
+        not have a ``MarkPrice`` and therefore contribute zero.
+        """
+        if reference <= 0:
+            return 0.0
+        cost_quote = 0.0
+        horizon_ns = self.now_ns + int(self.config.max_hold_s * 1e9)
+        for source, sign in ((long_source, 1), (short_source, -1)):
+            mark = self.marks.get(source)
+            if mark is None or not (self.now_ns < mark.next_funding_ns <= horizon_ns):
+                continue
+            price = mark.mark * float(self.instruments[source].tick_size)
+            cost_quote += sign * mark.funding_rate * price * qty
+        return cost_quote / reference * 10_000.0
+
     def _open(self, z: float, mean: float, spread: float) -> None:
         self.stats.signals += 1
+        source_a, source_b = self.sources
         long_source, short_source = (
-            ("bybit", "binance") if spread > mean else ("binance", "bybit")
+            (source_b, source_a) if spread > mean else (source_a, source_b)
         )
+        if (
+            self.config.allowed_directions is not None
+            and (long_source, short_source) not in self.config.allowed_directions
+        ):
+            self.stats.rejected_direction += 1
+            self._record_rejects((RejectCode.BORROW_UNAVAILABLE,))
+            return
         qty = self._common_qty()
         if qty <= 0:
             self.stats.rejected_depth += 1
@@ -373,11 +416,12 @@ class CrossExchangeArb:
         self.stats.observations += 1
         if not self._fresh():
             return None
-        mids = {source: self._mid_price(source) for source in self.SOURCES}
+        mids = {source: self._mid_price(source) for source in self.sources}
         if any(price is None or price <= 0 for price in mids.values()):
             return None
         self.stats.fresh += 1
-        spread = math.log(mids["binance"]) - math.log(mids["bybit"])
+        source_a, source_b = self.sources
+        spread = math.log(mids[source_a]) - math.log(mids[source_b])
         cutoff = self.now_ns - int(self.config.lookback_s * 1e9)
         while self.history and self.history[0][0] < cutoff:
             self.history.popleft()

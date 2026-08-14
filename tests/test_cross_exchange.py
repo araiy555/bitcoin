@@ -52,6 +52,37 @@ def warm(engine: CrossExchangeArb):
         update(engine, seconds, price)
 
 
+def basis_engine(*, allow_spot_short: bool = False) -> CrossExchangeArb:
+    return CrossExchangeArb(
+        {"perp": INST, "spot": INST},
+        CrossArbConfig(
+            size_base=1.0,
+            lookback_s=10.0,
+            min_samples=4,
+            entry_z=2.0,
+            exit_z=1.0,
+            max_hold_s=100.0,
+            min_expected_net_bps=0.0,
+            max_age_ms=100.0,
+            depth=5,
+            taker_bps={"spot": 0.0, "perp": 0.0},
+            allowed_directions=None if allow_spot_short else (("spot", "perp"),),
+        ),
+    )
+
+
+def update_basis(engine: CrossExchangeArb, seconds: int, perp_mid: float, spot_mid: float = 100.0):
+    now = BASE_NS + int(seconds * 1e9)
+    engine.apply("perp", book(perp_mid, now), now)
+    engine.apply("spot", book(spot_mid, now), now)
+    return engine.evaluate()
+
+
+def warm_basis(engine: CrossExchangeArb):
+    for seconds, price in ((0, 100.0), (2, 100.1), (4, 99.9), (6, 100.1), (8, 99.9)):
+        update_basis(engine, seconds, price)
+
+
 def test_cross_exchange_enters_only_after_causal_window_and_realises_four_legs():
     strategy = engine()
     warm(strategy)
@@ -149,6 +180,37 @@ def test_cross_exchange_accounts_for_funding_settlement_on_both_perps():
     assert strategy.trades[0].funding_quote == pytest.approx(0.08)
 
 
+def test_basis_enters_cash_and_carry_but_rejects_unborrowed_spot_short():
+    strategy = basis_engine()
+    warm_basis(strategy)
+    update_basis(strategy, 10, 110.0)
+    assert strategy.position is not None
+    assert strategy.position.long_source == "spot"
+    assert strategy.position.short_source == "perp"
+
+    reverse = basis_engine()
+    warm_basis(reverse)
+    update_basis(reverse, 10, 90.0)
+    assert reverse.position is None
+    assert reverse.stats.rejected_direction == 1
+    assert reverse.stats.reject_codes["BORROW_UNAVAILABLE"] == 1
+
+
+def test_basis_expected_funding_receipt_improves_entry_net():
+    strategy = basis_engine()
+    warm_basis(strategy)
+    now = BASE_NS + int(9 * 1e9)
+    strategy.apply(
+        "perp",
+        MarkPrice(1000, 1000, 0.001, BASE_NS + int(11 * 1e9), now),
+        now,
+    )
+    update_basis(strategy, 10, 110.0)
+    assert strategy.position is not None
+    # A positive funding rate is received by the short perpetual leg.
+    assert strategy.position.expected_net_bps > 900.0
+
+
 @pytest.mark.asyncio
 async def test_xarb_cli_replays_tagged_capture(tmp_path, capsys):
     path = tmp_path / "xarb.jsonl"
@@ -202,3 +264,72 @@ async def test_xarb_cli_replays_tagged_capture(tmp_path, capsys):
     assert "取引所間Zスコア" in output
     assert "完了取引 : 1" in output
     assert "往復全コスト" in output
+
+
+@pytest.mark.asyncio
+async def test_basis_cli_replays_spot_perp_capture(tmp_path, capsys):
+    path = tmp_path / "basis.jsonl"
+    rows = []
+    points = (
+        (0, 100.0),
+        (2, 100.1),
+        (4, 99.9),
+        (6, 100.1),
+        (8, 99.9),
+        (10, 110.0),
+        (12, 100.0),
+    )
+    for seconds, perp_mid in points:
+        now = BASE_NS + int(seconds * 1e9)
+        for source, mid in (("perp", perp_mid), ("spot", 100.0)):
+            row = _encode(book(mid, now))
+            row.update({"src": source, "rx_ns": now})
+            rows.append(row)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    common = {
+        "symbol": "BTCUSDT",
+        "tick_size": "0.1",
+        "lot_size": "0.1",
+        "base": "BTC",
+        "quote": "USDT",
+    }
+    path.with_suffix(".jsonl.meta.json").write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "spot": {**common, "market": "spot"},
+                    "perp": {**common, "market": "perp"},
+                }
+            }
+        )
+    )
+    args = build_parser().parse_args(
+        [
+            "basis",
+            str(path),
+            "--size-base",
+            "1",
+            "--lookback-minutes",
+            str(10 / 60),
+            "--min-samples",
+            "4",
+            "--entry-z",
+            "2",
+            "--exit-z",
+            "1",
+            "--spot-taker-bps",
+            "0",
+            "--perp-taker-bps",
+            "0",
+            "--min-expected-net-bps",
+            "0",
+            "--sample-ms",
+            "0",
+            "--plain",
+        ]
+    )
+    assert await args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "現物–先物ベーシス" in output
+    assert "完了取引 : 1" in output
+    assert "Funding" in output

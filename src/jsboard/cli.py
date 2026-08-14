@@ -2172,6 +2172,33 @@ async def cmd_xcapture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _replay_two_market_capture(
+    path: Path,
+    engine: CrossExchangeArb,
+    instruments: dict[str, Instrument],
+    sample_ms: float,
+) -> None:
+    """Stream a tagged capture and show coarse progress for large recordings."""
+    interval_ns = int(sample_ms * 1e6)
+    last_eval_ns = 0
+    event_count = 0
+    for source, received_ns, event in iter_tagged_timed(path):
+        if source not in instruments:
+            continue
+        event_count += 1
+        if event_count % 100_000 == 0:
+            console.print(f"[dim]解析中: {event_count:,}イベント[/dim]")
+        observable_ns = received_ns or getattr(event, "ts_ns", 0)
+        if received_ns:
+            event = replace(event, ts_ns=received_ns)
+        engine.apply(source, event, observable_ns)
+        if observable_ns and observable_ns - last_eval_ns < interval_ns:
+            continue
+        engine.evaluate()
+        last_eval_ns = observable_ns
+    engine.finalize()
+
+
 async def cmd_xarb(args: argparse.Namespace) -> int:
     """Replay a causal Binance/Bybit spread strategy with four real crosses."""
     path = Path(args.path)
@@ -2207,20 +2234,7 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         taker_bps={"binance": args.binance_taker_bps, "bybit": args.bybit_taker_bps},
     )
     engine = CrossExchangeArb(instruments, config)
-    interval_ns = int(args.sample_ms * 1e6)
-    last_eval_ns = 0
-    for source, received_ns, event in iter_tagged_timed(path):
-        if source not in instruments:
-            continue
-        observable_ns = received_ns or getattr(event, "ts_ns", 0)
-        if received_ns:
-            event = replace(event, ts_ns=received_ns)
-        engine.apply(source, event, observable_ns)
-        if observable_ns and observable_ns - last_eval_ns < interval_ns:
-            continue
-        engine.evaluate()
-        last_eval_ns = observable_ns
-    engine.finalize()
+    _replay_two_market_capture(path, engine, instruments, args.sample_ms)
     summary = engine.summary()
 
     console.rule("[bold cyan]取引所間Zスコア — 実板・往復全コスト replay")
@@ -2313,6 +2327,117 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         console.print(
             "\n[green][bold]判定: この録画では往復全コスト後プラスです。[/bold][/green]\n"
             "[yellow]まだ同じ1録画の研究結果です。別期間で固定条件を再検証するまで実運用しません。[/yellow]"
+        )
+    console.rule()
+    return 0
+
+
+async def cmd_basis(args: argparse.Namespace) -> int:
+    """Replay Binance spot/perpetual basis with executable four-leg prices."""
+    path = Path(args.path)
+    if not path.exists():
+        raise ConfigError(f"{path} がありません。先に capture を実行してください。")
+    meta_path = path.with_suffix(path.suffix + ".meta.json")
+    if not meta_path.exists():
+        raise ConfigError(f"{meta_path.name} がありません。captureの録画が必要です。")
+    sources = json.loads(meta_path.read_text()).get("sources") or {}
+    if not {"spot", "perp"}.issubset(sources):
+        raise ConfigError("basisにはspotとperpを同時に含むcapture録画が必要です。")
+    # The first source is the spread numerator, so this is log(perp)-log(spot).
+    instruments = {
+        source: _instrument_from_spec(sources[source]) for source in ("perp", "spot")
+    }
+    if any(value < 0 for value in (args.spot_taker_bps, args.perp_taker_bps)):
+        raise ConfigError("taker手数料は0以上で指定してください。")
+    if args.sample_ms < 0:
+        raise ConfigError("--sample-msは0以上で指定してください。")
+    allowed_directions = None if args.allow_spot_short else (("spot", "perp"),)
+    config = CrossArbConfig(
+        size_base=args.size_base,
+        lookback_s=args.lookback_minutes * 60.0,
+        min_samples=args.min_samples,
+        entry_z=args.entry_z,
+        exit_z=args.exit_z,
+        max_hold_s=args.max_hold_hours * 3600.0,
+        min_expected_net_bps=args.min_expected_net_bps,
+        max_age_ms=args.max_age_ms,
+        max_skew_ms=args.max_skew_ms,
+        depth=args.depth,
+        hedge_latency_buffer_bps=args.hedge_latency_buffer_bps,
+        fill_model_buffer_bps=args.fill_model_buffer_bps,
+        safety_margin_bps=args.safety_margin_bps,
+        taker_bps={"spot": args.spot_taker_bps, "perp": args.perp_taker_bps},
+        allowed_directions=allowed_directions,
+    )
+    engine = CrossExchangeArb(instruments, config)
+    _replay_two_market_capture(path, engine, instruments, args.sample_ms)
+    summary = engine.summary()
+    stats = engine.stats
+
+    console.rule("[bold cyan]Binance現物–先物ベーシス — 実板・全コスト replay")
+    console.print(
+        f"  データ : {path.name}\n"
+        f"  契約   : Binance {instruments['spot'].symbol} spot/perpetual\n"
+        f"  数量   : {args.size_base:g} {instruments['spot'].base}\n"
+        f"  信号   : 過去{args.lookback_minutes:g}分のlog(perp/spot) / "
+        f"|z|≥{args.entry_z:g}で建て、|z|≤{args.exit_z:g}で閉じる\n"
+        f"  方向   : {'現物ショートも許可' if args.allow_spot_short else '現物買い・先物売りのみ'}\n"
+        f"  期限   : {args.max_hold_hours:g}時間\n"
+        f"  費用   : 現物 {args.spot_taker_bps:g}bps + 先物 {args.perp_taker_bps:g}bpsを"
+        "建玉・手仕舞いの4脚に計上\n"
+        f"  執行   : depth {args.depth}段の実板歩き / 両板age≤{args.max_age_ms:g}ms / "
+        f"skew≤{args.max_skew_ms:g}ms\n"
+        f"  余白   : hedge遅延 {args.hedge_latency_buffer_bps:g}bps + "
+        f"約定モデル {args.fill_model_buffer_bps:g}bps + "
+        f"安全余白 {args.safety_margin_bps:g}bps\n"
+        "  funding: 保有期限内に到来する予想率をEntry判定し、通過時は実績損益に計上"
+    )
+    console.print(
+        f"\n  観測 {stats.observations:,} / 同時に新鮮 {stats.fresh:,} / "
+        f"学習窓完成 {stats.warm:,}\n"
+        f"  信号 {stats.signals:,} / コスト不足 {stats.rejected_cost:,} / "
+        f"現物ショート不可 {stats.rejected_direction:,} / 板不足 {stats.rejected_depth:,} / "
+        f"品質不良 {stats.rejected_quality:,} / 建玉 {stats.entries:,}"
+    )
+    if stats.reject_codes:
+        console.print(
+            "  拒否理由: "
+            + " / ".join(f"{code}={count:,}" for code, count in sorted(stats.reject_codes.items()))
+        )
+    if engine.trades:
+        console.print("long\tshort\tentry_z\texit_z\thold_s\texpected\tnet_bps\treason")
+        for trade in engine.trades[-20:]:
+            console.print(
+                f"{trade.long_source}\t{trade.short_source}\t{trade.entry_z:+.2f}\t"
+                f"{trade.exit_z:+.2f}\t{trade.hold_s:.1f}\t{trade.expected_net_bps:+.2f}\t"
+                f"{trade.net_bps:+.2f}\t{trade.exit_reason}",
+                highlight=False,
+            )
+    console.print(
+        f"\n  完了取引 : {int(summary['trades']):,}\n"
+        f"  Gross    : {summary['gross_quote']:+.4f} USDT\n"
+        f"  Funding  : {summary['funding_quote']:+.4f} USDT\n"
+        f"  手数料   : {summary['fees_quote']:.4f} USDT\n"
+        f"  Net      : {summary['net_quote']:+.4f} USDT / {summary['net_bps']:+.2f}bps\n"
+        f"  勝率     : {summary['win_rate'] * 100:.1f}%\n"
+        f"  最大DD   : {summary['max_drawdown_quote']:.4f} USDT"
+    )
+    trades = int(summary["trades"])
+    if stats.warm == 0:
+        console.print("\n[yellow][bold]判定: 学習窓が完成していません。[/bold][/yellow]")
+    elif trades == 0:
+        console.print(
+            "\n[yellow][bold]判定: ベーシスとFundingは往復全コストを超えませんでした。"
+            "[/bold][/yellow]"
+        )
+    elif trades < 30:
+        console.print("\n[yellow][bold]判定: 30取引未満のため未判定です。[/bold][/yellow]")
+    elif summary["net_quote"] <= 0:
+        console.print("\n[red][bold]判定: 全コスト後で赤字のため不採用です。[/bold][/red]")
+    else:
+        console.print(
+            "\n[green][bold]判定: この録画では全コスト後プラスです。[/bold][/green]\n"
+            "[yellow]別期間のOut-of-sampleで再検証するまで実運用しません。[/yellow]"
         )
     console.rule()
     return 0
@@ -3717,6 +3842,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_xarb.add_argument("--depth", type=int, default=20)
     p_xarb.add_argument("--plain", action="store_true")
     p_xarb.set_defaults(func=cmd_xarb)
+
+    p_basis = sub.add_parser(
+        "basis", help="Binance現物・無期限先物ベーシスを実板・Funding込みで再生する"
+    )
+    p_basis.add_argument("path", help="captureで作ったspot/perp同時録画.jsonl")
+    p_basis.add_argument("--size-base", type=float, default=0.001)
+    p_basis.add_argument("--lookback-minutes", type=float, default=30.0)
+    p_basis.add_argument("--min-samples", type=int, default=300)
+    p_basis.add_argument("--entry-z", type=float, default=2.0)
+    p_basis.add_argument("--exit-z", type=float, default=0.25)
+    p_basis.add_argument("--max-hold-hours", type=float, default=8.0)
+    p_basis.add_argument("--min-expected-net-bps", type=float, default=1.0)
+    p_basis.add_argument("--spot-taker-bps", type=float, default=10.0)
+    p_basis.add_argument("--perp-taker-bps", type=float, default=4.0)
+    p_basis.add_argument("--max-age-ms", type=float, default=250.0)
+    p_basis.add_argument("--max-skew-ms", type=float, default=250.0)
+    p_basis.add_argument("--hedge-latency-buffer-bps", type=float, default=1.0)
+    p_basis.add_argument("--fill-model-buffer-bps", type=float, default=1.0)
+    p_basis.add_argument("--safety-margin-bps", type=float, default=1.0)
+    p_basis.add_argument("--sample-ms", type=float, default=100.0)
+    p_basis.add_argument("--depth", type=int, default=20)
+    p_basis.add_argument(
+        "--allow-spot-short",
+        action="store_true",
+        help="現物の借入可能性を別途確認できる場合だけ逆方向を許可する",
+    )
+    p_basis.add_argument("--plain", action="store_true")
+    p_basis.set_defaults(func=cmd_basis)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")
