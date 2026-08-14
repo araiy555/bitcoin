@@ -2268,14 +2268,43 @@ def _parse_hour_list(value: str, option: str) -> list[int]:
     return list(dict.fromkeys(parsed))
 
 
+def _parse_positive_float_list(value: str, option: str) -> list[float]:
+    try:
+        parsed = [float(item) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ConfigError(f"{option} は数値をカンマ区切りで指定してください") from exc
+    if not parsed or any(item <= 0 for item in parsed):
+        raise ConfigError(f"{option} は0より大きい値を1つ以上指定してください")
+    return list(dict.fromkeys(parsed))
+
+
 async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
     """Run residual-reversion portfolios with costs and chronological selection."""
     root = Path(args.data_dir)
     lookbacks = _parse_hour_list(args.lookbacks, "--lookbacks")
     holds = _parse_hour_list(args.holds, "--holds")
-    configs = [statarb.StrategyConfig(lb, hold) for lb in lookbacks for hold in holds]
+    if args.strategy == "loser-btc":
+        entry_zs = _parse_positive_float_list(args.entry_zs, "--entry-zs")
+        configs = [
+            statarb.StrategyConfig(lb, hold, strategy="loser_btc", entry_z=entry_z)
+            for lb in lookbacks
+            for hold in holds
+            for entry_z in entry_zs
+        ]
+        strategy_description = (
+            "残差が指定σ以上下落した銘柄だけ買い、推定beta分のBTCを売る"
+        )
+    else:
+        configs = [
+            statarb.StrategyConfig(lb, hold, strategy="symmetric")
+            for lb in lookbacks
+            for hold in holds
+        ]
+        strategy_description = "BTC betaを除いた相対騰落率の下位20%買い・上位20%売り"
     if args.fees < 0 or args.slippage_bps < 0:
         raise ConfigError("--fees と --slippage-bps は0以上で指定してください")
+    if args.min_train_trades <= 0:
+        raise ConfigError("--min-train-trades は1以上で指定してください")
 
     console.rule("[bold cyan]中速・市場中立 statarb — バックテスト")
     try:
@@ -2296,7 +2325,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
 
     console.print(
         f"  データ : {manifest['start']} 〜 {manifest['end']} / {len(prices)}銘柄\n"
-        "  戦略   : BTC betaを除いた相対騰落率の下位20%買い・上位20%売り\n"
+        f"  戦略   : {strategy_description}\n"
         f"  コスト : 片道 fee {args.fees:g}bps + 滑り {args.slippage_bps:g}bps "
         f"→ 往復 {2 * (args.fees + args.slippage_bps):g}bps\n"
         f"  funding: {'実現履歴を計上' if args.funding else '計上しない'}\n"
@@ -2313,6 +2342,8 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
     table.add_column("lookback", justify="right")
     table.add_column("hold", justify="right")
+    if args.strategy == "loser-btc":
+        table.add_column("出動", justify="right")
     table.add_column("取引", justify="right")
     table.add_column("価格", justify="right")
     table.add_column("funding", justify="right")
@@ -2323,9 +2354,13 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
     table.add_column("最大DD", justify="right")
     for result in sorted(results, key=lambda row: row.total_bps, reverse=True):
         colour = "green" if result.total_bps > 0 else "red"
-        table.add_row(
+        cells = [
             f"{result.config.lookback_h}h",
             f"{result.config.hold_h}h",
+        ]
+        if args.strategy == "loser-btc":
+            cells.append(f"≤-{result.config.entry_z:g}σ")
+        cells.extend([
             f"{result.trades:,}",
             f"{result.price_bps:+.1f}",
             f"{result.funding_bps:+.1f}",
@@ -2334,7 +2369,8 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
             f"[{colour}]{result.annual_bps / 100:+.1f}%[/{colour}]",
             f"{result.win_rate:.1%}",
             f"-{result.max_drawdown_bps / 100:.1f}%",
-        )
+        ])
+        table.add_row(*cells)
     console.print(table)
     best = max(results, key=lambda row: row.total_bps)
     console.print(
@@ -2344,17 +2380,27 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
 
     if args.walk_forward:
         try:
-            folds, out = statarb.walk_forward(results)
+            folds, out = statarb.walk_forward(
+                results,
+                min_train_bps=args.min_train_bps,
+                min_train_trades=args.min_train_trades,
+            )
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
         console.print("\n  [bold]Walk-forward（過去だけで設定を選び、次期間で採点）[/bold]")
         for index, fold in enumerate(folds, 1):
             end = datetime.fromtimestamp(fold.test_end_hour * 3600, tz=UTC).date()
-            console.print(
-                f"    fold {index}: {fold.selected.label} / "
-                f"train {fold.train_bps:+.1f} → test {fold.test_bps:+.1f}bps "
-                f"({fold.test_trades}回, 〜{end})"
-            )
+            if fold.selected is None:
+                console.print(
+                    f"    fold {index}: CASH（取引なし） / "
+                    f"best train {fold.train_bps:+.1f}bps → test +0.0bps (〜{end})"
+                )
+            else:
+                console.print(
+                    f"    fold {index}: {fold.selected.label} / "
+                    f"train {fold.train_bps:+.1f} → test {fold.test_bps:+.1f}bps "
+                    f"({fold.test_trades}回, 〜{end})"
+                )
         colour = "green" if out.total_bps > 0 else "red"
         console.print(
             f"  未使用期間合計: [{colour}][bold]{out.total_bps:+.1f}bps[/bold][/{colour}] "
@@ -2366,7 +2412,10 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
                 f"{month} {value:+.1f}" for month, value in sorted(out.monthly_bps.items())
             )
             console.print(f"  未使用期間の月別Net(bps): {monthly}")
-        if out.total_bps > 0 and all(fold.test_bps > 0 for fold in folds):
+        if (
+            out.total_bps > 0
+            and all(fold.selected is not None and fold.test_bps > 0 for fold in folds)
+        ):
             console.print(
                 "\n  [green]全foldが全コスト後プラスです。[/green]\n"
                 "  [dim]まだ同じデータで候補を選んだ研究結果です。設定を固定して、\n"
@@ -2375,7 +2424,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         else:
             console.print(
                 "\n  [red]未使用期間で安定したプラスを確認できません。[/red]\n"
-                "  [dim]この相対反転ルールは採用しません。手数料を消した表示へ\n"
+                "  [dim]この戦略ルールは採用しません。手数料を消した表示へ\n"
                 "  変更して黒字に見せることもしません。[/dim]"
             )
     console.print(
@@ -2983,8 +3032,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_sa_dl.set_defaults(func=cmd_statarb_download)
 
     p_sa_bt = sa_sub.add_parser("backtest", help="全コスト込みで相対反転を検証する")
+    p_sa_bt.add_argument(
+        "--strategy",
+        default="symmetric",
+        choices=("symmetric", "loser-btc"),
+        help="対称反転、または下落異常だけを買ってBTCでヘッジ",
+    )
     p_sa_bt.add_argument("--lookbacks", default="6h,12h,24h,72h")
     p_sa_bt.add_argument("--holds", default="4h,8h,24h")
+    p_sa_bt.add_argument(
+        "--entry-zs",
+        default="1,1.5,2,2.5",
+        help="loser-btcが出動する残差下落σの候補",
+    )
     p_sa_bt.add_argument("--fees", type=float, default=4.0, help="片道手数料 bps")
     p_sa_bt.add_argument(
         "--slippage-bps", type=float, default=1.0, help="片道の想定スリッページ bps"
@@ -2992,6 +3052,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_sa_bt.add_argument("--funding", action="store_true", help="実現fundingを損益へ含める")
     p_sa_bt.add_argument(
         "--walk-forward", action="store_true", help="過去だけで設定を選び次期間で採点する"
+    )
+    p_sa_bt.add_argument(
+        "--min-train-bps",
+        type=float,
+        default=0.0,
+        help="学習Netがこの値以下なら次期間は取引しない",
+    )
+    p_sa_bt.add_argument(
+        "--min-train-trades",
+        type=int,
+        default=30,
+        help="設定選択に必要な過去取引数",
     )
     p_sa_bt.add_argument("--data-dir", default=str(statarb.DEFAULT_ROOT))
     p_sa_bt.set_defaults(func=cmd_statarb_backtest)

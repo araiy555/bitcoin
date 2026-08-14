@@ -44,10 +44,15 @@ class ArchivePart:
 class StrategyConfig:
     lookback_h: int
     hold_h: int
+    strategy: str = "symmetric"
+    entry_z: float = 0.0
 
     @property
     def label(self) -> str:
-        return f"lookback={self.lookback_h}h hold={self.hold_h}h"
+        base = f"lookback={self.lookback_h}h hold={self.hold_h}h"
+        if self.strategy == "loser_btc":
+            return f"{base} entry≤-{self.entry_z:g}σ"
+        return base
 
 
 @dataclass(slots=True)
@@ -85,7 +90,7 @@ class Performance:
 class WalkForwardFold:
     train_end_hour: int
     test_end_hour: int
-    selected: StrategyConfig
+    selected: StrategyConfig | None
     train_bps: float
     test_bps: float
     test_trades: int
@@ -451,7 +456,13 @@ def simulate_config(
     beta_window_h: int = 168,
     side_fraction: float = 0.20,
 ) -> list[TradeReturn]:
-    """Non-overlapping equal-gross long/short residual-reversion portfolios."""
+    """Non-overlapping beta-neutral residual-reversion portfolios.
+
+    ``symmetric`` buys the bottom residual quintile and shorts the top one.
+    ``loser_btc`` buys only cross-sectionally extreme losers and shorts BTC in
+    the amount required to remove their estimated market beta.  The latter is
+    a direct test of the long-side-only effect found by the first experiment.
+    """
     btc = prices.get("BTCUSDT")
     if not btc:
         raise ValueError("BTCUSDTがありません。市場要因を除去できません")
@@ -486,19 +497,41 @@ def simulate_config(
         if len(ranked) < 4:
             continue
         ranked.sort()
-        count = max(1, int(len(ranked) * side_fraction))
-        longs = tuple(symbol for _, symbol, _ in ranked[:count])
-        shorts = tuple(symbol for _, symbol, _ in ranked[-count:])
-        long_beta = statistics.fmean(beta for _, _, beta in ranked[:count])
-        short_beta = statistics.fmean(beta for _, _, beta in ranked[-count:])
-        beta_sum = long_beta + short_beta
-        if beta_sum <= 1e-12:
-            long_weight = short_weight = 0.5
+        if config.strategy == "loser_btc":
+            residuals = [residual for residual, _, _ in ranked]
+            dispersion = statistics.pstdev(residuals)
+            if dispersion <= 1e-12:
+                continue
+            centre = statistics.fmean(residuals)
+            cutoff = centre - config.entry_z * dispersion
+            selected = [row for row in ranked if row[0] <= cutoff]
+            if not selected:
+                continue
+            longs = tuple(symbol for _, symbol, _ in selected)
+            shorts = ("BTCUSDT",)
+            long_beta = statistics.fmean(beta for _, _, beta in selected)
+            # Long gross + short gross = 1, while
+            # long_weight*long_beta == short_weight*BTC_beta(1).
+            long_weight = 1.0 / (1.0 + long_beta)
+            short_weight = long_beta / (1.0 + long_beta)
+        elif config.strategy == "symmetric":
+            count = max(1, int(len(ranked) * side_fraction))
+            selected = ranked[:count]
+            short_selected = ranked[-count:]
+            longs = tuple(symbol for _, symbol, _ in selected)
+            shorts = tuple(symbol for _, symbol, _ in short_selected)
+            long_beta = statistics.fmean(beta for _, _, beta in selected)
+            short_beta = statistics.fmean(beta for _, _, beta in short_selected)
+            beta_sum = long_beta + short_beta
+            if beta_sum <= 1e-12:
+                long_weight = short_weight = 0.5
+            else:
+                # Total gross stays at 1x while BTC beta is neutralised:
+                # long_weight*long_beta == short_weight*short_beta.
+                long_weight = short_beta / beta_sum
+                short_weight = long_beta / beta_sum
         else:
-            # Total gross stays at 1x while BTC beta is neutralised:
-            # long_weight*long_beta == short_weight*short_beta.
-            long_weight = short_beta / beta_sum
-            short_weight = long_beta / beta_sum
+            raise ValueError(f"unknown statarb strategy: {config.strategy}")
         long_return = statistics.fmean(
             prices[s][hour + config.hold_h] / prices[s][hour] - 1.0 for s in longs
         )
@@ -601,8 +634,20 @@ def run_backtests(
     return results
 
 
-def walk_forward(results: list[Performance], folds: int = 3) -> tuple[list[WalkForwardFold], Performance]:
-    """Expanding-window parameter selection; only subsequent returns are scored."""
+def walk_forward(
+    results: list[Performance],
+    folds: int = 3,
+    *,
+    min_train_bps: float = 0.0,
+    min_train_trades: int = 30,
+) -> tuple[list[WalkForwardFold], Performance]:
+    """Expanding-window selection with cash as a real alternative.
+
+    A parameter set is never forced into the next period merely because it is
+    the least bad.  If every sufficiently sampled candidate earned no more
+    than ``min_train_bps`` on data available at the time, that fold holds cash
+    and contributes exactly zero to the out-of-sample result.
+    """
     all_returns = [row for result in results for row in result.returns]
     if not all_returns:
         raise ValueError("walk-forwardに使える取引がありません")
@@ -619,8 +664,33 @@ def walk_forward(results: list[Performance], folds: int = 3) -> tuple[list[WalkF
         scored = []
         for result in results:
             train = [row for row in result.returns if row.hour < test_start]
-            scored.append((sum(row.net_bps for row in train), result, train))
-        _, chosen, train = max(scored, key=lambda item: item[0])
+            if len(train) >= min_train_trades:
+                scored.append((sum(row.net_bps for row in train), result, train))
+        if not scored:
+            fold_rows.append(
+                WalkForwardFold(
+                    train_end_hour=test_start,
+                    test_end_hour=test_end,
+                    selected=None,
+                    train_bps=0.0,
+                    test_bps=0.0,
+                    test_trades=0,
+                )
+            )
+            continue
+        best_train_bps, chosen, train = max(scored, key=lambda item: item[0])
+        if best_train_bps <= min_train_bps:
+            fold_rows.append(
+                WalkForwardFold(
+                    train_end_hour=test_start,
+                    test_end_hour=test_end,
+                    selected=None,
+                    train_bps=best_train_bps,
+                    test_bps=0.0,
+                    test_trades=0,
+                )
+            )
+            continue
         test = [row for row in chosen.returns if test_start <= row.hour < test_end]
         selected_returns.extend(test)
         fold_rows.append(
@@ -628,14 +698,16 @@ def walk_forward(results: list[Performance], folds: int = 3) -> tuple[list[WalkF
                 train_end_hour=test_start,
                 test_end_hour=test_end,
                 selected=chosen.config,
-                train_bps=sum(row.net_bps for row in train),
+                train_bps=best_train_bps,
                 test_bps=sum(row.net_bps for row in test),
                 test_trades=len(test),
             )
         )
     observed_days = max(1.0, (last - warmup_end) / 24.0)
     summary = summarise_performance(
-        StrategyConfig(0, 0), selected_returns, observed_days=observed_days
+        StrategyConfig(0, 0, strategy="walk_forward"),
+        selected_returns,
+        observed_days=observed_days,
     )
     return fold_rows, summary
 

@@ -9,12 +9,15 @@ import pytest
 from jsboard.cli import build_parser
 from jsboard.research.statarb import (
     StrategyConfig,
+    TradeReturn,
     archive_parts,
     kline_url,
     load_dataset,
     load_hourly_closes,
     parse_hours,
     simulate_config,
+    summarise_performance,
+    walk_forward,
 )
 
 
@@ -31,6 +34,10 @@ def test_statarb_commands_are_real_cli_commands():
             "4h,8h,24h",
             "--fees",
             "4",
+            "--strategy",
+            "loser-btc",
+            "--entry-zs",
+            "1,1.5,2",
             "--funding",
             "--walk-forward",
         ]
@@ -39,6 +46,7 @@ def test_statarb_commands_are_real_cli_commands():
     assert backtest.func.__name__ == "cmd_statarb_backtest"
     assert backtest.funding is True
     assert backtest.walk_forward is True
+    assert backtest.strategy == "loser-btc"
 
 
 @pytest.mark.parametrize(
@@ -136,6 +144,78 @@ def test_positive_funding_is_paid_by_long_and_received_by_short():
     )
     # Half-weight long pays 10bps, half-weight short receives 20bps.
     assert trades[0].funding_bps == pytest.approx(5.0)
+
+
+def _loser_prices():
+    prices = {
+        symbol: {hour: 100.0 for hour in range(26)}
+        for symbol in ("BTCUSDT", "AUSDT", "BUSDT", "CUSDT", "DUSDT")
+    }
+    prices["AUSDT"][24] = 90.0
+    prices["BUSDT"][24] = 99.0
+    prices["CUSDT"][24] = 100.0
+    prices["DUSDT"][24] = 101.0
+    return prices
+
+
+def test_loser_btc_only_buys_extreme_loser_and_hedges_with_btc():
+    trades = simulate_config(
+        _loser_prices(),
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=1.0),
+        fee_bps=4.0,
+        slippage_bps=1.0,
+        include_funding=False,
+        beta_window_h=24,
+    )
+    assert len(trades) == 1
+    assert trades[0].long_symbols == ("AUSDT",)
+    assert trades[0].short_symbols == ("BTCUSDT",)
+    assert trades[0].net_bps > 0
+
+
+def test_loser_btc_holds_cash_when_no_residual_crosses_entry_z():
+    trades = simulate_config(
+        _loser_prices(),
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=3.0),
+        fee_bps=4.0,
+        slippage_bps=1.0,
+        include_funding=False,
+        beta_window_h=24,
+    )
+    assert trades == []
+
+
+def _negative_return(hour):
+    return TradeReturn(
+        hour=hour,
+        price_bps=9.0,
+        long_price_bps=9.0,
+        short_price_bps=0.0,
+        funding_bps=0.0,
+        cost_bps=10.0,
+        net_bps=-1.0,
+        long_symbols=("AUSDT",),
+        short_symbols=("BTCUSDT",),
+    )
+
+
+def test_walk_forward_chooses_cash_instead_of_least_bad_strategy():
+    results = []
+    for lookback in (6, 12):
+        rows = [_negative_return(hour) for hour in range(0, 1001, 10)]
+        results.append(
+            summarise_performance(
+                StrategyConfig(lookback, 24, strategy="loser_btc", entry_z=1.0),
+                rows,
+                observed_days=42,
+            )
+        )
+    folds, summary = walk_forward(results, min_train_trades=1)
+    assert all(fold.selected is None for fold in folds)
+    assert all(fold.test_trades == 0 for fold in folds)
+    assert summary.total_bps == 0.0
 
 
 def test_load_dataset_explains_required_download(tmp_path):
