@@ -362,7 +362,7 @@ def _timestamp_ms(value: str) -> int:
 
 def load_hourly_market(
     paths: Iterable[Path], start: date, end: date
-) -> tuple[dict[int, float], dict[int, float]]:
+) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
     """Hourly signal closes and the next bar open used for causal execution.
 
     A signal for hour H uses the final kline close inside H.  Its executable
@@ -376,6 +376,7 @@ def load_hourly_market(
     )
     latest: dict[int, tuple[int, float]] = {}
     next_open: dict[int, tuple[int, float]] = {}
+    quote_volume: dict[int, float] = {}
     for path in sorted(paths):
         with zipfile.ZipFile(path) as zf:
             for name in zf.namelist():
@@ -397,6 +398,13 @@ def load_hourly_market(
                             previous = latest.get(hour)
                             if previous is None or stamp > previous[0]:
                                 latest[hour] = (stamp, close)
+                            if len(row) > 7:
+                                try:
+                                    volume = float(row[7])
+                                except ValueError:
+                                    volume = 0.0
+                                if volume > 0:
+                                    quote_volume[hour] = quote_volume.get(hour, 0.0) + volume
                         # The first kline of hour H is the first executable
                         # price after the signal made at the end of H-1.
                         signal_hour = hour - 1
@@ -407,12 +415,13 @@ def load_hourly_market(
     return (
         {hour: value[1] for hour, value in latest.items()},
         {hour: value[1] for hour, value in next_open.items()},
+        quote_volume,
     )
 
 
 def load_hourly_closes(paths: Iterable[Path], start: date, end: date) -> dict[int, float]:
     """Compatibility helper used by earlier research and tests."""
-    closes, _ = load_hourly_market(paths, start, end)
+    closes, _, _ = load_hourly_market(paths, start, end)
     return closes
 
 
@@ -442,6 +451,7 @@ def load_dataset(
     dict,
     dict[str, dict[int, float]],
     dict[str, dict[int, float]],
+    dict[str, dict[int, float]],
     dict[str, tuple[list[int], list[float]]],
 ]:
     manifest_path = root / "manifest.json"
@@ -455,19 +465,82 @@ def load_dataset(
     interval = manifest["interval"]
     prices: dict[str, dict[int, float]] = {}
     execution: dict[str, dict[int, float]] = {}
+    quote_volume: dict[str, dict[int, float]] = {}
     funding: dict[str, tuple[list[int], list[float]]] = {}
     for row in manifest["universe"]:
         symbol = row["symbol"]
         paths = (root / "klines" / symbol / interval).rglob("*.zip")
-        closes, next_opens = load_hourly_market(paths, start, end)
+        closes, next_opens, hourly_volume = load_hourly_market(paths, start, end)
         if closes:
             prices[symbol] = closes
         if next_opens:
             execution[symbol] = next_opens
+        if hourly_volume:
+            quote_volume[symbol] = hourly_volume
         funding_path = root / "funding" / f"{symbol}.json"
         if funding_path.exists():
             funding[symbol] = load_funding(funding_path)
-    return manifest, prices, execution, funding
+    return manifest, prices, execution, quote_volume, funding
+
+
+def build_point_in_time_universe(
+    prices: dict[str, dict[int, float]],
+    quote_volume: dict[str, dict[int, float]],
+    *,
+    top: int,
+    volume_window_h: int,
+    min_history_h: int,
+    min_volume_coverage: float = 0.8,
+) -> dict[int, frozenset[str]]:
+    """Select liquid symbols using information available at each signal hour.
+
+    Ranking uses completed quote volume observations through the signal hour.
+    A symbol cannot enter until ``min_history_h`` hours after its first observed
+    close, which prevents newly listed contracts from dominating the test.
+    BTC is retained separately as the hedge and is never counted in ``top``.
+    """
+    if top <= 0 or volume_window_h <= 0 or min_history_h < 0:
+        raise ValueError("topとvolume_window_hは正、min_history_hは0以上が必要です")
+    if not 0 < min_volume_coverage <= 1:
+        raise ValueError("min_volume_coverageは0より大きく1以下が必要です")
+    btc = prices.get("BTCUSDT")
+    if not btc:
+        raise ValueError("BTCUSDTがありません。時点別ユニバースを作れません")
+
+    # Prefix arrays make every trailing-volume lookup O(log n), avoiding a
+    # window-sized sum for every symbol at every hour.
+    histories: dict[str, tuple[list[int], list[float]]] = {}
+    first_price: dict[str, int] = {}
+    for symbol, series in quote_volume.items():
+        if symbol == "BTCUSDT" or symbol not in prices or not series:
+            continue
+        hours = sorted(hour for hour, value in series.items() if value > 0)
+        if not hours:
+            continue
+        prefix = [0.0]
+        for hour in hours:
+            prefix.append(prefix[-1] + series[hour])
+        histories[symbol] = (hours, prefix)
+        first_price[symbol] = min(prices[symbol])
+
+    required_observations = max(1, math.ceil(volume_window_h * min_volume_coverage))
+    selected: dict[int, frozenset[str]] = {}
+    for hour in sorted(btc):
+        window_start = hour - volume_window_h + 1
+        ranked: list[tuple[float, str]] = []
+        for symbol, (hours, prefix) in histories.items():
+            if hour - first_price[symbol] < min_history_h:
+                continue
+            left = bisect.bisect_left(hours, window_start)
+            right = bisect.bisect_right(hours, hour)
+            if right - left < required_observations:
+                continue
+            trailing_volume = prefix[right] - prefix[left]
+            if trailing_volume > 0:
+                ranked.append((trailing_volume, symbol))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        selected[hour] = frozenset(symbol for _, symbol in ranked[:top])
+    return selected
 
 
 def _beta(prices: dict[int, float], btc: dict[int, float], hour: int, window: int) -> float:
@@ -527,6 +600,7 @@ def simulate_config(
     target_vol_pct: float = 0.0,
     beta_window_h: int = 168,
     side_fraction: float = 0.20,
+    eligible_by_hour: dict[int, frozenset[str]] | None = None,
 ) -> list[TradeReturn]:
     """Non-overlapping beta-neutral residual-reversion portfolios.
 
@@ -565,7 +639,14 @@ def simulate_config(
             continue
         btc_move = math.log(btc_now / btc_start)
         ranked: list[tuple[float, str, float]] = []
+        eligible = (
+            eligible_by_hour.get(hour, frozenset())
+            if eligible_by_hour is not None
+            else None
+        )
         for symbol in symbols:
+            if eligible is not None and symbol not in eligible:
+                continue
             series = prices[symbol]
             p0 = series.get(hour - config.lookback_h)
             p1 = series.get(hour)
@@ -784,6 +865,7 @@ def run_backtests(
     slippage_bps: float,
     include_funding: bool,
     target_vol_pct: float = 0.0,
+    eligible_by_hour: dict[int, frozenset[str]] | None = None,
 ) -> list[Performance]:
     if not prices:
         return []
@@ -801,6 +883,7 @@ def run_backtests(
             slippage_bps=slippage_bps,
             include_funding=include_funding,
             target_vol_pct=target_vol_pct,
+            eligible_by_hour=eligible_by_hour,
         )
         results.append(summarise_performance(config, returns, observed_days=days))
     return results

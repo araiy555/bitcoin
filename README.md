@@ -677,6 +677,35 @@ fundingを、ロングは支払い・ショートは受け取りとして計上�
 上場廃止銘柄が抜けるので結果は上限寄りであり、プラスでも直ちに実運用しない。
 設定を固定し、`--end`をずらした別期間でも全コスト後プラスを確認する。
 
+現在上位30銘柄を過去1年ずっと採用する先読みを減らすには、候補を広めに別保存し、
+各時点の過去quote volumeだけで上位30を選ぶ。初回観測後30日未満の銘柄も除外する。
+
+```bash
+.venv/bin/jsboard statarb download \
+  --days 365 \
+  --top 100 \
+  --data-dir data/statarb-wide
+
+.venv/bin/jsboard statarb backtest \
+  --data-dir data/statarb-wide \
+  --point-in-time-universe \
+  --universe-top 30 \
+  --volume-lookback 7d \
+  --min-history-days 30 \
+  --strategy loser-btc \
+  --lookbacks 6h,12h,24h,72h \
+  --holds 4h,8h,24h \
+  --entry-zs 1,1.5,2,2.5 \
+  --fees 4 \
+  --target-vol 20 \
+  --funding \
+  --walk-forward
+```
+
+`--point-in-time-universe` の順位は各シグナル時刻までに完了した時間足の売買代金だけを
+使い、未来の出来高を参照しない。ただし候補100銘柄自体は取得時点で上場中の契約なので、
+過去に上場廃止された銘柄が欠ける残余の生存者バイアスは消えない。
+
 このコマンドにもAPIキー、注文送信、実資金の取引経路はない。
 
 ### 下落異常だけを買い、BTCでヘッジする再検証

@@ -11,6 +11,7 @@ from jsboard.research.statarb import (
     StrategyConfig,
     TradeReturn,
     archive_parts,
+    build_point_in_time_universe,
     kline_url,
     load_dataset,
     load_hourly_closes,
@@ -41,6 +42,13 @@ def test_statarb_commands_are_real_cli_commands():
             "1,1.5,2",
             "--funding",
             "--walk-forward",
+            "--point-in-time-universe",
+            "--universe-top",
+            "20",
+            "--volume-lookback",
+            "14d",
+            "--min-history-days",
+            "45",
         ]
     )
     assert download.func.__name__ == "cmd_statarb_download"
@@ -49,6 +57,10 @@ def test_statarb_commands_are_real_cli_commands():
     assert backtest.walk_forward is True
     assert backtest.strategy == "loser-btc"
     assert backtest.target_vol == 20.0
+    assert backtest.point_in_time_universe is True
+    assert backtest.universe_top == 20
+    assert backtest.volume_lookback == "14d"
+    assert backtest.min_history_days == 45
 
 
 @pytest.mark.parametrize(
@@ -78,9 +90,9 @@ def test_archive_parts_use_monthly_files_then_daily_open_month():
 def test_load_hourly_closes_keeps_last_five_minute_close(tmp_path):
     path = tmp_path / "bars.zip"
     rows = [
-        [1704067200000, 100, 101, 99, 100.5],  # 00:00
-        [1704070500000, 100, 102, 99, 101.5],  # 00:55
-        [1704070800000, 101, 103, 100, 102.5],  # 01:00
+        [1704067200000, 100, 101, 99, 100.5, 1, 2, 10],  # 00:00
+        [1704070500000, 100, 102, 99, 101.5, 1, 2, 20],  # 00:55
+        [1704070800000, 101, 103, 100, 102.5, 1, 2, 30],  # 01:00
     ]
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
@@ -88,11 +100,38 @@ def test_load_hourly_closes_keeps_last_five_minute_close(tmp_path):
         zf.writestr("BTCUSDT-5m.csv", buffer.getvalue())
 
     prices = load_hourly_closes([path], date(2024, 1, 1), date(2024, 1, 1))
-    _, execution = load_hourly_market([path], date(2024, 1, 1), date(2024, 1, 1))
+    _, execution, quote_volume = load_hourly_market(
+        [path], date(2024, 1, 1), date(2024, 1, 1)
+    )
     first_hour = 1704067200 // 3600
     assert prices[first_hour] == 101.5
     assert prices[first_hour + 1] == 102.5
     assert execution[first_hour] == 101.0
+    assert quote_volume[first_hour] == 30.0
+    assert quote_volume[first_hour + 1] == 30.0
+
+
+def test_point_in_time_universe_uses_only_past_volume_and_minimum_history():
+    prices = {
+        symbol: {hour: 100.0 for hour in range(8)}
+        for symbol in ("BTCUSDT", "AUSDT", "BUSDT")
+    }
+    quote_volume = {
+        "AUSDT": {hour: 10.0 for hour in range(8)},
+        "BUSDT": {**{hour: 1.0 for hour in range(6)}, 6: 1_000.0, 7: 1_000.0},
+    }
+    universe = build_point_in_time_universe(
+        prices,
+        quote_volume,
+        top=1,
+        volume_window_h=3,
+        min_history_h=3,
+        min_volume_coverage=1.0,
+    )
+    assert universe[2] == frozenset()
+    assert universe[3] == frozenset({"AUSDT"})
+    assert universe[5] == frozenset({"AUSDT"})
+    assert universe[6] == frozenset({"BUSDT"})
 
 
 def test_residual_reversion_longs_loser_and_shorts_winner_after_costs():
@@ -224,6 +263,32 @@ def test_loser_btc_holds_cash_when_no_residual_crosses_entry_z():
     assert trades == []
 
 
+def test_simulation_never_trades_symbol_outside_point_in_time_universe():
+    trades = simulate_config(
+        _loser_prices(),
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=1.0),
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        include_funding=False,
+        beta_window_h=24,
+        eligible_by_hour={24: frozenset({"BUSDT", "CUSDT", "DUSDT"})},
+    )
+    assert trades == []
+
+    no_universe = simulate_config(
+        _loser_prices(),
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=1.0),
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        include_funding=False,
+        beta_window_h=24,
+        eligible_by_hour={},
+    )
+    assert no_universe == []
+
+
 def _negative_return(hour):
     return TradeReturn(
         hour=hour,
@@ -286,8 +351,9 @@ def test_manifest_is_plain_json_contract(tmp_path):
         "universe": [],
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    loaded, prices, execution, funding = load_dataset(tmp_path)
+    loaded, prices, execution, quote_volume, funding = load_dataset(tmp_path)
     assert loaded == manifest
     assert prices == {}
     assert execution == {}
+    assert quote_volume == {}
     assert funding == {}

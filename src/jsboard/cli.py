@@ -20,6 +20,7 @@ import itertools
 import json
 import logging
 import math
+import statistics
 import sys
 import time
 from dataclasses import replace
@@ -2322,10 +2323,16 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         raise ConfigError("--fees、--slippage-bps、--target-vol は0以上で指定してください")
     if args.min_train_trades <= 0:
         raise ConfigError("--min-train-trades は1以上で指定してください")
+    if args.universe_top <= 0 or args.min_history_days < 0:
+        raise ConfigError("--universe-top は1以上、--min-history-days は0以上で指定してください")
+    try:
+        volume_window_h = statarb.parse_hours(args.volume_lookback)
+    except ValueError as exc:
+        raise ConfigError(f"--volume-lookback: {exc}") from exc
 
     console.rule("[bold cyan]中速・市場中立 statarb — バックテスト")
     try:
-        manifest, prices, execution, funding = statarb.load_dataset(root)
+        manifest, prices, execution, quote_volume, funding = statarb.load_dataset(root)
     except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
         raise ConfigError(str(exc)) from exc
     if len(prices) < 5:
@@ -2334,6 +2341,30 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         )
     if len(execution) < 5:
         raise ConfigError("次の5分足openを読めません。downloadデータを確認してください")
+    eligible_by_hour = None
+    universe_description = "取得時の固定銘柄"
+    if args.point_in_time_universe:
+        try:
+            eligible_by_hour = statarb.build_point_in_time_universe(
+                prices,
+                quote_volume,
+                top=args.universe_top,
+                volume_window_h=volume_window_h,
+                min_history_h=args.min_history_days * 24,
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        usable = [len(symbols) for symbols in eligible_by_hour.values() if len(symbols) >= 4]
+        if not usable:
+            raise ConfigError(
+                "時点別ユニバースでBTC以外の候補が4銘柄以上になる時点がありません。"
+                "--topを増やして再取得するか、期間を延ばしてください"
+            )
+        universe_description = (
+            f"各時点の過去{args.volume_lookback} quote volume上位{args.universe_top} / "
+            f"初回観測後{args.min_history_days}日未満除外 / "
+            f"有効時点平均{statistics.fmean(usable):.1f}銘柄"
+        )
     if args.funding:
         missing = sorted(set(prices) - set(funding))
         if missing:
@@ -2349,6 +2380,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         f"→ 往復 {2 * (args.fees + args.slippage_bps):g}bps\n"
         f"  執行   : シグナル確定後、次の5分足openで建て・手仕舞い\n"
         f"  リスク : 年率vol {args.target_vol:g}%へ縮小（1倍を上限）/ 複利資産\n"
+        f"  銘柄   : {universe_description}\n"
         f"  funding: {'実現履歴を計上' if args.funding else '計上しない'}\n"
     )
     results = statarb.run_backtests(
@@ -2360,6 +2392,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         slippage_bps=args.slippage_bps,
         include_funding=args.funding,
         target_vol_pct=args.target_vol,
+        eligible_by_hour=eligible_by_hour,
     )
 
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
@@ -2455,10 +2488,17 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
                 "  [dim]この戦略ルールは採用しません。手数料を消した表示へ\n"
                 "  変更して黒字に見せることもしません。[/dim]"
             )
-    console.print(
-        "\n  [yellow]注意:[/yellow] 銘柄は取得時点の流動性で選ぶため、上場廃止銘柄を含まない"
-        "生存者バイアスがあります。結果は上限寄りに読んでください。"
-    )
+    if args.point_in_time_universe:
+        console.print(
+            "\n  [yellow]注意:[/yellow] 各時点の銘柄順位と上場直後の混入は補正しました。"
+            "ただし取得候補は現在上場中の銘柄なので、上場廃止銘柄がない残余の"
+            "生存者バイアスはあります。"
+        )
+    else:
+        console.print(
+            "\n  [yellow]注意:[/yellow] 銘柄は取得時点の流動性で固定され、上場廃止銘柄も"
+            "含まないため生存者バイアスがあります。結果は上限寄りに読んでください。"
+        )
     console.rule()
     return 0
 
@@ -3098,6 +3138,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="設定選択に必要な過去取引数",
+    )
+    p_sa_bt.add_argument(
+        "--point-in-time-universe",
+        action="store_true",
+        help="各時点の過去出来高だけで取引候補を選ぶ",
+    )
+    p_sa_bt.add_argument(
+        "--universe-top", type=int, default=30, help="各時点で採用するBTC以外の銘柄数"
+    )
+    p_sa_bt.add_argument(
+        "--volume-lookback", default="7d", help="銘柄順位に使う過去quote volume期間"
+    )
+    p_sa_bt.add_argument(
+        "--min-history-days",
+        type=int,
+        default=30,
+        help="初回観測後、この日数未満の銘柄を除外",
     )
     p_sa_bt.add_argument("--data-dir", default=str(statarb.DEFAULT_ROOT))
     p_sa_bt.set_defaults(func=cmd_statarb_backtest)
