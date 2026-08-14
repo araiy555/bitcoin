@@ -94,6 +94,38 @@ def test_cross_exchange_rejects_stale_other_venue():
     assert strategy.stats.fresh == 0
 
 
+def test_cross_exchange_rejects_receive_time_skew_with_machine_readable_reason():
+    strategy = engine()
+    now = BASE_NS
+    strategy.apply("binance", book(100.0, now), now)
+    strategy.apply("bybit", book(100.0, now + 500_000_000), now + 500_000_000)
+    strategy.config = CrossArbConfig(
+        size_base=1.0, lookback_s=10.0, min_samples=4, entry_z=2.0, exit_z=1.0,
+        max_hold_s=100.0, min_expected_net_bps=0.0, max_age_ms=1_000.0,
+        max_skew_ms=100.0, depth=5, taker_bps={"binance": 0.0, "bybit": 0.0},
+    )
+    assert strategy.evaluate() is None
+    assert strategy.stats.reject_codes["SKEW"] == 1
+
+
+def test_execution_buffers_are_part_of_expected_net():
+    strategy = CrossExchangeArb(
+        {"binance": INST, "bybit": INST},
+        CrossArbConfig(
+            size_base=1.0, lookback_s=10.0, min_samples=4, entry_z=2.0, exit_z=1.0,
+            max_hold_s=100.0, min_expected_net_bps=1_000.0, max_age_ms=100.0,
+            depth=5, taker_bps={"binance": 0.0, "bybit": 0.0},
+            hedge_latency_buffer_bps=10.0, fill_model_buffer_bps=10.0,
+            safety_margin_bps=10.0,
+        ),
+    )
+    warm(strategy)
+    update(strategy, 10, 110.0)
+    assert strategy.position is None
+    assert strategy.stats.rejected_cost == 1
+    assert strategy.stats.reject_codes["NET_NEGATIVE"] == 1
+
+
 def test_cross_exchange_accounts_for_funding_settlement_on_both_perps():
     strategy = engine()
     warm(strategy)

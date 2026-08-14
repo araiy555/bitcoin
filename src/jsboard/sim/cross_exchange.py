@@ -14,9 +14,17 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from ..core.market import MarketView
-from ..core.types import Instrument
+from ..core.pretrade import (
+    BookWalk,
+    CostBreakdown,
+    MarketDataPoint,
+    RejectCode,
+    assess_costs,
+    assess_market_data,
+    walk_book,
+)
+from ..core.types import Instrument, Side
 from ..feed.base import FeedEvent, MarkPrice
-from .hedge import HedgeConfig, Hedger, HedgeResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +37,11 @@ class CrossArbConfig:
     max_hold_s: float = 1800.0
     min_expected_net_bps: float = 1.0
     max_age_ms: float = 250.0
+    max_skew_ms: float = 250.0
     depth: int = 20
+    hedge_latency_buffer_bps: float = 0.0
+    fill_model_buffer_bps: float = 0.0
+    safety_margin_bps: float = 0.0
     taker_bps: dict[str, float] = field(
         default_factory=lambda: {"binance": 4.0, "bybit": 5.5}
     )
@@ -79,8 +91,10 @@ class CrossArbStats:
     signals: int = 0
     rejected_depth: int = 0
     rejected_cost: int = 0
+    rejected_quality: int = 0
     entries: int = 0
     forced_exits: int = 0
+    reject_codes: dict[str, int] = field(default_factory=dict)
 
 
 class CrossExchangeArb:
@@ -97,8 +111,17 @@ class CrossExchangeArb:
             raise ValueError("entry_z must be greater than non-negative exit_z")
         if config.max_hold_s <= 0 or config.min_expected_net_bps < 0:
             raise ValueError("max_hold must be positive and expected edge non-negative")
-        if config.max_age_ms < 0 or config.depth <= 0:
-            raise ValueError("max_age_ms must be non-negative and depth positive")
+        if config.max_age_ms < 0 or config.max_skew_ms < 0 or config.depth <= 0:
+            raise ValueError("age/skew must be non-negative and depth positive")
+        if any(
+            value < 0
+            for value in (
+                config.hedge_latency_buffer_bps,
+                config.fill_model_buffer_bps,
+                config.safety_margin_bps,
+            )
+        ):
+            raise ValueError("execution buffers must be non-negative")
         if any(config.taker_bps.get(source, -1) < 0 for source in self.SOURCES):
             raise ValueError("both taker fees must be non-negative")
 
@@ -108,14 +131,6 @@ class CrossExchangeArb:
         self.markets = {
             source: MarketView(instrument=instrument, depth=config.depth, clock=self._clock)
             for source, instrument in instruments.items()
-        }
-        self.walkers = {
-            source: Hedger(
-                instruments[source],
-                self.markets[source],
-                HedgeConfig(taker_bps=config.taker_bps[source], max_levels=config.depth),
-            )
-            for source in self.SOURCES
         }
         self.history: deque[tuple[int, float]] = deque()
         self.position: CrossArbPosition | None = None
@@ -165,7 +180,36 @@ class CrossExchangeArb:
         return mid * float(self.instruments[source].tick_size)
 
     def _fresh(self) -> bool:
-        return all(self.markets[source].age_ms <= self.config.max_age_ms for source in self.SOURCES)
+        points = tuple(
+            MarketDataPoint(
+                source=source,
+                updated_ns=self.markets[source].last_update_ns,
+                book_valid=(
+                    self.markets[source].mid is not None
+                    and self.markets[source].spread_ticks is not None
+                    and self.markets[source].spread_ticks >= 0
+                ),
+                feed_state=self.markets[source].status,
+                metadata_valid=bool(
+                    self.instruments[source].base and self.instruments[source].quote
+                ),
+            )
+            for source in self.SOURCES
+        )
+        decision = assess_market_data(
+            points,
+            now_ns=self.now_ns,
+            max_age_ms=self.config.max_age_ms,
+            max_skew_ms=self.config.max_skew_ms,
+        )
+        if not decision.allowed:
+            self.stats.rejected_quality += 1
+            self._record_rejects(decision.reject_codes)
+        return decision.allowed
+
+    def _record_rejects(self, codes: tuple[RejectCode, ...]) -> None:
+        for code in codes:
+            self.stats.reject_codes[code.value] = self.stats.reject_codes.get(code.value, 0) + 1
 
     def _common_qty(self) -> float:
         quantities = [
@@ -173,17 +217,24 @@ class CrossExchangeArb:
         ]
         return min(quantities)
 
-    def _walk(self, source: str, sign: int, qty_base: float) -> HedgeResult | None:
-        result = self.walkers[source].walk(sign, qty_base)
-        tolerance = max(1e-12, float(self.instruments[source].lot_size) / 2.0)
-        if result.filled_base <= 0 or result.unfilled_base > tolerance:
+    def _walk(self, source: str, sign: int, qty_base: float) -> BookWalk | None:
+        result = walk_book(
+            self.markets[source].snapshot(self.config.depth),
+            self.instruments[source],
+            Side.BUY if sign > 0 else Side.SELL,
+            qty_base,
+            max_levels=self.config.depth,
+        )
+        if not result.complete:
             return None
         return result
 
-    def _human_price(self, source: str, result: HedgeResult) -> float:
-        return result.avg_price_ticks * float(self.instruments[source].tick_size)
+    def _human_price(self, source: str, result: BookWalk) -> float:
+        return result.price(self.instruments[source])
 
-    def _round_trip_cost_bps(self, long_source: str, short_source: str, qty: float) -> float | None:
+    def _round_trip_costs(
+        self, long_source: str, short_source: str, qty: float
+    ) -> CostBreakdown | None:
         long_buy = self._walk(long_source, +1, qty)
         long_sell = self._walk(long_source, -1, qty)
         short_sell = self._walk(short_source, -1, qty)
@@ -203,15 +254,25 @@ class CrossExchangeArb:
             prices["long_buy"] - prices["long_sell"]
             + prices["short_buy"] - prices["short_sell"]
         )
-        fees = qty * (
-            (prices["long_buy"] + prices["long_sell"])
-            * self.config.taker_bps[long_source]
-            / 10_000.0
-            + (prices["short_sell"] + prices["short_buy"])
-            * self.config.taker_bps[short_source]
-            / 10_000.0
+        entry_fees = qty * (
+            prices["long_buy"] * self.config.taker_bps[long_source]
+            + prices["short_sell"] * self.config.taker_bps[short_source]
+        ) / 10_000.0
+        exit_fees = qty * (
+            prices["long_sell"] * self.config.taker_bps[long_source]
+            + prices["short_buy"] * self.config.taker_bps[short_source]
+        ) / 10_000.0
+        scale = 10_000.0 / reference
+        crossing_bps = crossing * scale
+        return CostBreakdown(
+            entry_fees_bps=entry_fees * scale,
+            expected_exit_fees_bps=exit_fees * scale,
+            entry_depth_slippage_bps=crossing_bps / 2.0,
+            expected_exit_slippage_bps=crossing_bps / 2.0,
+            hedge_latency_buffer_bps=self.config.hedge_latency_buffer_bps,
+            fill_model_buffer_bps=self.config.fill_model_buffer_bps,
+            safety_margin_bps=self.config.safety_margin_bps,
         )
-        return (crossing + fees) / reference * 10_000.0
 
     def _open(self, z: float, mean: float, spread: float) -> None:
         self.stats.signals += 1
@@ -221,21 +282,29 @@ class CrossExchangeArb:
         qty = self._common_qty()
         if qty <= 0:
             self.stats.rejected_depth += 1
+            self._record_rejects((RejectCode.NO_DEPTH,))
             return
-        round_trip_cost = self._round_trip_cost_bps(long_source, short_source, qty)
-        if round_trip_cost is None:
+        costs = self._round_trip_costs(long_source, short_source, qty)
+        if costs is None:
             self.stats.rejected_depth += 1
+            self._record_rejects((RejectCode.NO_DEPTH,))
             return
         convergence_bps = abs(spread - mean) * 10_000.0
-        expected_net = convergence_bps - round_trip_cost
-        if expected_net < self.config.min_expected_net_bps:
+        decision = assess_costs(
+            convergence_bps,
+            costs,
+            min_expected_net_bps=self.config.min_expected_net_bps,
+        )
+        if not decision.accepted:
             self.stats.rejected_cost += 1
+            self._record_rejects(decision.reject_codes)
             return
 
         long_fill = self._walk(long_source, +1, qty)
         short_fill = self._walk(short_source, -1, qty)
         if long_fill is None or short_fill is None:
             self.stats.rejected_depth += 1
+            self._record_rejects((RejectCode.NO_DEPTH,))
             return
         long_price = self._human_price(long_source, long_fill)
         short_price = self._human_price(short_source, short_fill)
@@ -252,7 +321,7 @@ class CrossExchangeArb:
             long_entry=long_price,
             short_entry=short_price,
             entry_fees=entry_fees,
-            expected_net_bps=expected_net,
+            expected_net_bps=decision.expected_net_bps,
         )
         self.stats.entries += 1
 
@@ -264,6 +333,7 @@ class CrossExchangeArb:
         short_exit = self._walk(position.short_source, +1, position.qty_base)
         if long_exit is None or short_exit is None:
             self.stats.rejected_depth += 1
+            self._record_rejects((RejectCode.NO_DEPTH,))
             return False
         long_price = self._human_price(position.long_source, long_exit)
         short_price = self._human_price(position.short_source, short_exit)

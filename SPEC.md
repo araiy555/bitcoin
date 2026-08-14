@@ -3,11 +3,40 @@
 現時点の実装をすべて記述したもの。設計判断の *理由* は各ソースの docstring に、
 経緯と実測結果は README にある。ここは「何がどう動くか」の一次資料。
 
-- 対象: Binance 現物 + USDⓈ-M 無期限先物、単一取引所
-- 実装: Python 3.11+、8,284 行（src 4,855 / tests 3,071 / tools 358）
-- テスト: 390 件
+- 対象: Binance 現物 + Binance USDⓈ-M 無期限先物 + Bybit USDT無期限先物
+- 実装: Python 3.11+、22,368 行（src 13,352 / tests 7,697 / tools 1,319）
+- テスト: 633 件
 - **実発注の経路は存在しない。** API キーを受け取る箇所も、取引所へ注文を
   送る関数も無い。全コマンドは公開データの読み取りのみ。
+
+---
+
+## CMR-001 共通プリトレード基盤（P1/P2）
+
+`docs/CROSS_MARKET_REQUIREMENTS.md` の最初の実装として、戦略ごとに重複していた
+データ品質、板歩き、コスト判定を `core/pretrade.py` に集約した。
+
+- `capture` / `xcapture` の各行にschema version、capture ID、event sequence、venue、
+  market type、instrument ID、取引所時刻、単調受信時刻、wall時刻を付与する。旧来の
+  `src` / `rx_ns` も残し、既存録画と新録画を同じreaderで再生できる
+- 複数市場のmetadata、feed状態、book妥当性、age、receive-time skewを共通ゲートで判定
+- 指定base数量をtick/lot整数のまま複数板レベルで歩き、深さ不足を約定にしない
+- 建玉/手仕舞い手数料、板歩き、Funding、借入、hedge遅延、fill-model誤差、
+  safety marginを `CostBreakdown` で個別に保持し、GrossからExpected Netを計算
+- `xarb` は共通板歩き・品質・コスト判定を使用し、機械可読な拒否理由を集計する
+- `pair` / `dealer` / 即時hedgeも共通板歩きと品質・コスト判定を使用する
+
+`xarb` の追加オプション:
+
+```bash
+jsboard xarb capture.jsonl \
+  --max-age-ms 250 --max-skew-ms 250 \
+  --hedge-latency-buffer-bps 1 \
+  --fill-model-buffer-bps 1 \
+  --safety-margin-bps 1
+```
+
+この段階ではParquet変換、先行遅行、三角裁定、実注文はまだ実装していない。
 
 ---
 

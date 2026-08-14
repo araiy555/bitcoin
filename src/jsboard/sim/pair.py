@@ -17,6 +17,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core.market import MarketView
+from ..core.pretrade import (
+    CostBreakdown,
+    MarketDataPoint,
+    RejectCode,
+    assess_costs,
+    assess_market_data,
+)
 from ..core.types import Instrument, Side
 from ..mm.quoter import Quote, QuoteSet
 from .hedge import Hedger
@@ -52,6 +59,8 @@ class PairEdge:
     net_bps: float
     executable: bool = True
     reason: str = "ok"
+    costs: CostBreakdown | None = None
+    reject_codes: tuple[RejectCode, ...] = ()
 
 
 @dataclass(slots=True)
@@ -83,6 +92,12 @@ class PairQuoteGate:
     taker_bps: float = 4.0
     min_net_bps: float = 0.0
     max_hedge_age_ms: float = 250.0
+    max_market_skew_ms: float = 250.0
+    expected_exit_fees_bps: float = 0.0
+    expected_exit_slippage_bps: float = 0.0
+    hedge_latency_buffer_bps: float = 0.0
+    fill_model_buffer_bps: float = 0.0
+    safety_margin_bps: float = 0.0
     clock: Callable[[], int] | None = None
     stats: PairGateStats = field(default_factory=PairGateStats)
 
@@ -91,12 +106,30 @@ class PairQuoteGate:
             return self.clock()
         return max(self.maker_market.last_update_ns, self.hedge_market.last_update_ns)
 
-    def _book_is_fresh(self) -> bool:
-        updated = self.hedge_market.last_update_ns
-        if not updated:
-            return False
-        age_ms = max(0.0, (self._now_ns() - updated) / 1e6)
-        return age_ms <= self.max_hedge_age_ms
+    @staticmethod
+    def _book_valid(market: MarketView) -> bool:
+        spread = market.spread_ticks
+        return market.mid is not None and spread is not None and spread >= 0
+
+    def _quality(self):
+        return assess_market_data(
+            tuple(
+                MarketDataPoint(
+                    source=source,
+                    updated_ns=market.last_update_ns,
+                    book_valid=self._book_valid(market),
+                    feed_state=market.status,
+                    metadata_valid=bool(instrument.base and instrument.quote),
+                )
+                for source, market, instrument in (
+                    ("maker", self.maker_market, self.maker_instrument),
+                    ("hedge", self.hedge_market, self.hedge_instrument),
+                )
+            ),
+            now_ns=self._now_ns(),
+            max_age_ms=self.max_hedge_age_ms,
+            max_skew_ms=self.max_market_skew_ms,
+        )
 
     def edge(self, quote: Quote) -> PairEdge:
         """Price one proposed maker quote against visible hedge depth."""
@@ -107,11 +140,23 @@ class PairQuoteGate:
             return PairEdge(
                 quote.side, maker_price, 0.0, qty_base, 0.0, 0.0, float("-inf"),
                 executable=False, reason="hedge book missing",
+                reject_codes=(RejectCode.BOOK_GAP,),
             )
-        if not self._book_is_fresh():
+        quality = self._quality()
+        if not quality.allowed:
+            if RejectCode.METADATA_INVALID in quality.reject_codes:
+                reason = "instrument metadata invalid"
+            elif RejectCode.FEED_DEGRADED in quality.reject_codes:
+                reason = "feed degraded"
+            elif RejectCode.BOOK_GAP in quality.reject_codes:
+                reason = "market book invalid"
+            elif RejectCode.STALE in quality.reject_codes:
+                reason = "hedge book stale"
+            else:
+                reason = "market data skew"
             return PairEdge(
                 quote.side, maker_price, 0.0, qty_base, 0.0, 0.0, float("-inf"),
-                executable=False, reason="hedge book stale",
+                executable=False, reason=reason, reject_codes=quality.reject_codes,
             )
 
         walked = self.hedger.walk(-quote.side.sign, qty_base)
@@ -122,6 +167,7 @@ class PairQuoteGate:
             return PairEdge(
                 quote.side, maker_price, 0.0, qty_base, 0.0, 0.0, float("-inf"),
                 executable=False, reason="insufficient hedge depth",
+                reject_codes=(RejectCode.NO_DEPTH,),
             )
 
         hedge_price = walked.avg_price_ticks * float(self.hedge_instrument.tick_size)
@@ -131,6 +177,7 @@ class PairQuoteGate:
             return PairEdge(
                 quote.side, maker_price, hedge_price, qty_base, 0.0, 0.0,
                 float("-inf"), executable=False, reason="zero maker notional",
+                reject_codes=(RejectCode.MIN_NOTIONAL,),
             )
 
         # Buy maker / sell hedge: hedge - maker.  Sell maker / buy hedge:
@@ -141,6 +188,15 @@ class PairQuoteGate:
             + hedge_notional * self.taker_bps / 10_000.0
         )
         scale = 10_000.0 / maker_notional
+        costs = CostBreakdown(
+            entry_fees_bps=fees * scale,
+            expected_exit_fees_bps=self.expected_exit_fees_bps,
+            expected_exit_slippage_bps=self.expected_exit_slippage_bps,
+            hedge_latency_buffer_bps=self.hedge_latency_buffer_bps,
+            fill_model_buffer_bps=self.fill_model_buffer_bps,
+            safety_margin_bps=self.safety_margin_bps,
+        )
+        decision = assess_costs(gross_quote * scale, costs)
         return PairEdge(
             side=quote.side,
             maker_price=maker_price,
@@ -148,7 +204,9 @@ class PairQuoteGate:
             qty_base=qty_base,
             gross_bps=gross_quote * scale,
             fee_bps=fees * scale,
-            net_bps=(gross_quote - fees) * scale,
+            net_bps=decision.expected_net_bps,
+            costs=costs,
+            reject_codes=decision.reject_codes,
         )
 
     def filter(self, quotes: QuoteSet) -> QuoteSet:

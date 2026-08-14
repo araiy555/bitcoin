@@ -274,14 +274,29 @@ SOURCE_KEY = "src"
 RX_KEY = "rx_ns"
 """When this process received the line, as distinct from the exchange time."""
 
-ENVELOPE_KEYS = (SOURCE_KEY, RX_KEY)
+ENVELOPE_KEYS = (
+    SOURCE_KEY,
+    RX_KEY,
+    "schema_version",
+    "capture_id",
+    "event_seq",
+    "venue",
+    "market_type",
+    "symbol_native",
+    "instrument_id",
+    "event_type",
+    "ts_exchange_ns",
+    "ts_receive_ns",
+    "ts_wall_ns",
+    "connection_id",
+    "source_mode",
+)
 """Keys `capture` adds around an encoded event, which are not event fields.
 
-They describe the recording rather than the market — which feed a line came
-from, and when this process received it. Passing them to an event constructor
-is a TypeError, so the reader strips them and the writer adds only these.
-Anything new a capture wants to record belongs in this tuple as well, or the
-recording stops being replayable.
+They describe the recording rather than the market. Passing them to an event
+constructor is a TypeError, so every reader strips the complete versioned
+envelope. ``src`` and ``rx_ns`` remain for old recordings and old commands;
+the longer names are the canonical CMR-001 schema.
 """
 
 
@@ -393,6 +408,12 @@ def _encode(event: FeedEvent) -> dict:
 
 
 def _decode(row: dict) -> FeedEvent:
+    # Be defensive at the codec boundary.  Most readers strip the capture
+    # envelope before calling us, but direct callers and older tools may hand
+    # over the complete row.
+    row = dict(row)
+    for key in ENVELOPE_KEYS:
+        row.pop(key, None)
     kind = row.pop("k")
     cls = _KINDS[kind]
     if cls is TradeTick:

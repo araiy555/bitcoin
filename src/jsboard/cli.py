@@ -2199,7 +2199,11 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         max_hold_s=args.max_hold_minutes * 60.0,
         min_expected_net_bps=args.min_expected_net_bps,
         max_age_ms=args.max_age_ms,
+        max_skew_ms=args.max_skew_ms,
         depth=args.depth,
+        hedge_latency_buffer_bps=args.hedge_latency_buffer_bps,
+        fill_model_buffer_bps=args.fill_model_buffer_bps,
+        safety_margin_bps=args.safety_margin_bps,
         taker_bps={"binance": args.binance_taker_bps, "bybit": args.bybit_taker_bps},
     )
     engine = CrossExchangeArb(instruments, config)
@@ -2229,7 +2233,11 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         f"  期限   : {args.max_hold_minutes:g}分\n"
         f"  費用   : Binance {args.binance_taker_bps:g}bps + "
         f"Bybit {args.bybit_taker_bps:g}bpsを建玉・手仕舞いの4脚すべてに計上\n"
-        f"  執行   : depth {args.depth}段の実板歩き / 両板age≤{args.max_age_ms:g}ms\n"
+        f"  執行   : depth {args.depth}段の実板歩き / 両板age≤{args.max_age_ms:g}ms / "
+        f"skew≤{args.max_skew_ms:g}ms\n"
+        f"  余白   : hedge遅延 {args.hedge_latency_buffer_bps:g}bps + "
+        f"約定モデル {args.fill_model_buffer_bps:g}bps + "
+        f"安全余白 {args.safety_margin_bps:g}bps\n"
         "  funding: 決済直前に観測できた予測率を、決済時刻通過時だけ計上"
     )
 
@@ -2238,8 +2246,14 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         f"\n  観測 {stats.observations:,} / 同時に新鮮 {stats.fresh:,} / "
         f"学習窓完成 {stats.warm:,}\n"
         f"  信号 {stats.signals:,} / コスト不足で拒否 {stats.rejected_cost:,} / "
-        f"板不足で拒否 {stats.rejected_depth:,} / 建玉 {stats.entries:,}"
+        f"板不足で拒否 {stats.rejected_depth:,} / 品質で拒否 {stats.rejected_quality:,} / "
+        f"建玉 {stats.entries:,}"
     )
+    if stats.reject_codes:
+        console.print(
+            "  拒否理由: "
+            + " / ".join(f"{code}={count:,}" for code, count in sorted(stats.reject_codes.items()))
+        )
     if engine.trades:
         rows = engine.trades[-20:]
         if args.plain:
@@ -3695,6 +3709,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_xarb.add_argument("--binance-taker-bps", type=float, default=4.0)
     p_xarb.add_argument("--bybit-taker-bps", type=float, default=5.5)
     p_xarb.add_argument("--max-age-ms", type=float, default=250.0)
+    p_xarb.add_argument("--max-skew-ms", type=float, default=250.0)
+    p_xarb.add_argument("--hedge-latency-buffer-bps", type=float, default=0.0)
+    p_xarb.add_argument("--fill-model-buffer-bps", type=float, default=0.0)
+    p_xarb.add_argument("--safety-margin-bps", type=float, default=0.0)
     p_xarb.add_argument("--sample-ms", type=float, default=100.0)
     p_xarb.add_argument("--depth", type=int, default=20)
     p_xarb.add_argument("--plain", action="store_true")

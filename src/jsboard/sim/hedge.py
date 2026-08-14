@@ -32,7 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..core.market import MarketView
-from ..core.types import Instrument
+from ..core.pretrade import walk_book
+from ..core.types import Instrument, Side
 from ..mm.attribution import PnLAttribution
 from ..mm.inventory import FeeSchedule
 
@@ -93,30 +94,19 @@ class Hedger:
         depth is consumed; whatever the book cannot supply comes back as
         unfilled rather than being filled at a price nobody showed.
         """
-        snapshot = self.market.book.snapshot(self.config.max_levels)
-        levels = snapshot.asks if sign > 0 else snapshot.bids
-        remaining = self.instrument.to_lots(qty_base)
-        if remaining <= 0:
-            return HedgeResult()
-
-        filled = 0
-        cost = 0.0
-        for level in levels:
-            if remaining <= 0:
-                break
-            take = min(level.qty, remaining)
-            if take <= 0:
-                continue
-            cost += level.price * take
-            filled += take
-            remaining -= take
-
-        if filled <= 0:
+        walked = walk_book(
+            self.market.snapshot(self.config.max_levels),
+            self.instrument,
+            Side.BUY if sign > 0 else Side.SELL,
+            qty_base,
+            max_levels=self.config.max_levels,
+        )
+        if walked.filled_lots <= 0:
             return HedgeResult(unfilled_base=qty_base)
         return HedgeResult(
-            filled_base=self.instrument.qty_f(filled),
-            avg_price_ticks=cost / filled,
-            unfilled_base=self.instrument.qty_f(remaining),
+            filled_base=walked.filled_base(self.instrument),
+            avg_price_ticks=walked.avg_price_ticks,
+            unfilled_base=walked.unfilled_base(self.instrument),
         )
 
     def on_maker_fill(self, maker_sign: int, qty_base: float) -> HedgeResult:

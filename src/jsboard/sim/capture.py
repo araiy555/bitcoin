@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,12 +87,43 @@ class MultiCapture:
         self.flush_every = flush_every
         self.stats: dict[str, SourceStats] = {name: SourceStats() for name in sources}
 
+    @staticmethod
+    def _source_context(name: str, feed: Feed) -> dict[str, str]:
+        """Derive stable envelope labels without teaching feeds about storage."""
+        class_name = type(feed).__name__.lower()
+        if name in {"binance", "bybit"}:
+            venue, market = name, "perp"
+        elif name in {"spot", "perp"}:
+            venue, market = "binance", name
+        else:
+            venue, market = name, ""
+        if "synthetic" in class_name:
+            source_mode = "synthetic"
+        elif "replay" in class_name:
+            source_mode = "replay"
+        elif any(token in class_name for token in ("binance", "bybit")):
+            source_mode = "ws"
+        else:
+            source_mode = "unknown"
+        instrument = feed.instrument
+        pair = f"{instrument.base}/{instrument.quote}" if instrument.base and instrument.quote else instrument.symbol
+        instrument_id = f"{pair}:{market}" if market else pair
+        return {
+            "venue": venue,
+            "market_type": market,
+            "symbol_native": instrument.symbol,
+            "instrument_id": instrument_id,
+            "source_mode": source_mode,
+        }
+
     async def run(
         self, *, duration_s: float | None = None, max_events: int | None = None
     ) -> CaptureResult:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        queue: asyncio.Queue[tuple[str, FeedEvent, int] | None] = asyncio.Queue(maxsize=100_000)
+        queue: asyncio.Queue[tuple[str, FeedEvent, int, int] | None] = asyncio.Queue(maxsize=100_000)
         started = time.time_ns()
+        capture_id = uuid.uuid4().hex
+        contexts = {name: self._source_context(name, feed) for name, feed in self.sources.items()}
         reason = "stopped"
 
         producers = [
@@ -118,10 +150,24 @@ class MultiCapture:
                     if item is None:
                         continue
 
-                    name, event, received_ns = item
+                    name, event, received_ns, monotonic_ns = item
                     row = _encode(event)
                     row[SOURCE_KEY] = name
                     row[RX_KEY] = received_ns
+                    context = contexts[name]
+                    row.update(
+                        {
+                            "schema_version": "1.0",
+                            "capture_id": capture_id,
+                            "event_seq": written + 1,
+                            **context,
+                            "event_type": row["k"],
+                            "ts_exchange_ns": row.get("ts_ns"),
+                            "ts_receive_ns": monotonic_ns,
+                            "ts_wall_ns": received_ns,
+                            "connection_id": f"{capture_id}:{name}",
+                        }
+                    )
                     fh.write(json.dumps(row) + "\n")
                     written += 1
 
@@ -157,7 +203,10 @@ class MultiCapture:
         stream = feed.stream()
         try:
             async for event in stream:
-                await queue.put((name, event, time.time_ns()))
+                # Wall time keeps legacy replay compatible with exchange epoch
+                # stamps. Monotonic time is the canonical receive clock for
+                # cross-market ordering inside one capture.
+                await queue.put((name, event, time.time_ns(), time.monotonic_ns()))
         except asyncio.CancelledError:
             raise
         finally:

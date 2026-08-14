@@ -303,6 +303,27 @@ async def test_the_event_callback_sees_the_source_and_the_event(tmp_path):
     assert seen == [("spot", tick)]
 
 
+async def test_capture_writes_the_versioned_common_envelope(tmp_path):
+    out = tmp_path / "cap.jsonl"
+    tick = TradeTick(price=1, qty=1, aggressor=Side.BUY, ts_ns=123)
+    await MultiCapture({"spot": ScriptedFeed(INST, [tick])}, out).run(max_events=1)
+
+    row = read_rows(out)[0]
+    assert row["schema_version"] == "1.0"
+    assert row["event_seq"] == 1
+    assert row["venue"] == "binance"
+    assert row["market_type"] == "spot"
+    assert row["symbol_native"] == INST.symbol
+    # This fixture intentionally has no base/quote metadata; never invent it
+    # from the symbol when the exchange spec did not provide it.
+    assert row["instrument_id"] == "BTCUSDT:spot"
+    assert row["event_type"] == "trade"
+    assert row["ts_exchange_ns"] == 123
+    assert row["ts_receive_ns"] > 0
+    assert row["ts_wall_ns"] == row["rx_ns"]
+    assert row["capture_id"] in row["connection_id"]
+
+
 # --------------------------------------------------------------------- meta
 
 
