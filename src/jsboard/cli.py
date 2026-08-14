@@ -627,8 +627,9 @@ def _cast_like(current) -> object:
 def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
     """Every setting being varied, as {argument name: values to try}.
 
-    `--distances` and `--sizes` are the two axes worth a shorthand; `--axis`
-    reaches the rest. A name that is not an actual setting is refused rather
+    Common quote-placement and latency experiments have shorthands;
+    `--axis` reaches every other setting. A name that is not an actual setting
+    is refused rather
     than ignored, since a typo would otherwise run the same configuration N
     times and read as a result.
     """
@@ -637,6 +638,10 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
         axes["max_distance"] = _grid(args.distances, int)
     if args.sizes:
         axes["size"] = _grid(args.sizes, str)
+    if getattr(args, "requotes", ""):
+        axes["requote_ms"] = _grid(args.requotes, float)
+    if getattr(args, "latencies", ""):
+        axes["latency_ms"] = _grid(args.latencies, float)
 
     for spec in args.axis or []:
         name, sep, values = spec.partition("=")
@@ -726,7 +731,10 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
     instrument = _instrument_for_recording(path, args)
     axes = _sweep_axes(args)
     if not axes:
-        raise ConfigError("掃引する軸がありません。--distances か --axis を指定してください。")
+        raise ConfigError(
+            "掃引する軸がありません。--distances / --requotes / --latencies / --axis "
+            "のいずれかを指定してください。"
+        )
 
     names = list(axes)
     combos = list(itertools.product(*(axes[n] for n in names)))
@@ -2327,6 +2335,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--sizes",
         default="",
         help="quote sizes to try (default: just --size)",
+    )
+    p_sw.add_argument(
+        "--requotes",
+        default="",
+        help="再計算間隔msの一覧（例: 100,50,20,10）",
+    )
+    p_sw.add_argument(
+        "--latencies",
+        default="",
+        help="注文到着遅延msの一覧（例: 20,10,5,2）",
     )
     p_sw.add_argument(
         "--axis",
