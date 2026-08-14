@@ -64,8 +64,10 @@ class TradeReturn:
     funding_bps: float
     cost_bps: float
     net_bps: float
+    gross_scale: float
     long_symbols: tuple[str, ...]
     short_symbols: tuple[str, ...]
+    symbol_bps: dict[str, float]
 
 
 @dataclass(slots=True)
@@ -82,6 +84,12 @@ class Performance:
     short_price_bps: float
     funding_bps: float
     cost_bps: float
+    final_equity: float
+    bankrupt: bool
+    largest_win_bps: float
+    largest_loss_bps: float
+    top10_profit_share: float
+    symbol_bps: dict[str, float]
     monthly_bps: dict[str, float]
     returns: list[TradeReturn]
 
@@ -352,14 +360,22 @@ def _timestamp_ms(value: str) -> int:
     return stamp
 
 
-def load_hourly_closes(paths: Iterable[Path], start: date, end: date) -> dict[int, float]:
-    """Read Binance kline ZIPs and retain the final close observed each UTC hour."""
+def load_hourly_market(
+    paths: Iterable[Path], start: date, end: date
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Hourly signal closes and the next bar open used for causal execution.
+
+    A signal for hour H uses the final kline close inside H.  Its executable
+    price is the open of the first archive kline in H+1, stored under key H.
+    Thus the backtest never observes a close and fills at that same close.
+    """
     start_h = int(datetime.combine(start, datetime.min.time(), tzinfo=UTC).timestamp() // 3600)
     end_h = int(
         datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=UTC).timestamp()
         // 3600
     )
     latest: dict[int, tuple[int, float]] = {}
+    next_open: dict[int, tuple[int, float]] = {}
     for path in sorted(paths):
         with zipfile.ZipFile(path) as zf:
             for name in zf.namelist():
@@ -370,16 +386,34 @@ def load_hourly_closes(paths: Iterable[Path], start: date, end: date) -> dict[in
                             continue
                         try:
                             stamp = _timestamp_ms(row[0])
+                            open_price = float(row[1])
                             close = float(row[4])
                         except ValueError:
                             continue
                         hour = stamp // 3_600_000
-                        if not (start_h <= hour < end_h) or close <= 0:
+                        if close <= 0 or open_price <= 0:
                             continue
-                        previous = latest.get(hour)
-                        if previous is None or stamp > previous[0]:
-                            latest[hour] = (stamp, close)
-    return {hour: value[1] for hour, value in latest.items()}
+                        if start_h <= hour < end_h:
+                            previous = latest.get(hour)
+                            if previous is None or stamp > previous[0]:
+                                latest[hour] = (stamp, close)
+                        # The first kline of hour H is the first executable
+                        # price after the signal made at the end of H-1.
+                        signal_hour = hour - 1
+                        if start_h <= signal_hour < end_h:
+                            previous_open = next_open.get(signal_hour)
+                            if previous_open is None or stamp < previous_open[0]:
+                                next_open[signal_hour] = (stamp, open_price)
+    return (
+        {hour: value[1] for hour, value in latest.items()},
+        {hour: value[1] for hour, value in next_open.items()},
+    )
+
+
+def load_hourly_closes(paths: Iterable[Path], start: date, end: date) -> dict[int, float]:
+    """Compatibility helper used by earlier research and tests."""
+    closes, _ = load_hourly_market(paths, start, end)
+    return closes
 
 
 def load_funding(path: Path) -> tuple[list[int], list[float]]:
@@ -402,7 +436,14 @@ def _funding_between(series: tuple[list[int], list[float]], start_h: int, end_h:
     return prefix[right] - prefix[left]
 
 
-def load_dataset(root: Path = DEFAULT_ROOT) -> tuple[dict, dict[str, dict[int, float]], dict[str, tuple[list[int], list[float]]]]:
+def load_dataset(
+    root: Path = DEFAULT_ROOT,
+) -> tuple[
+    dict,
+    dict[str, dict[int, float]],
+    dict[str, dict[int, float]],
+    dict[str, tuple[list[int], list[float]]],
+]:
     manifest_path = root / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -413,17 +454,20 @@ def load_dataset(root: Path = DEFAULT_ROOT) -> tuple[dict, dict[str, dict[int, f
     end = date.fromisoformat(manifest["end"])
     interval = manifest["interval"]
     prices: dict[str, dict[int, float]] = {}
+    execution: dict[str, dict[int, float]] = {}
     funding: dict[str, tuple[list[int], list[float]]] = {}
     for row in manifest["universe"]:
         symbol = row["symbol"]
         paths = (root / "klines" / symbol / interval).rglob("*.zip")
-        closes = load_hourly_closes(paths, start, end)
+        closes, next_opens = load_hourly_market(paths, start, end)
         if closes:
             prices[symbol] = closes
+        if next_opens:
+            execution[symbol] = next_opens
         funding_path = root / "funding" / f"{symbol}.json"
         if funding_path.exists():
             funding[symbol] = load_funding(funding_path)
-    return manifest, prices, funding
+    return manifest, prices, execution, funding
 
 
 def _beta(prices: dict[int, float], btc: dict[int, float], hour: int, window: int) -> float:
@@ -445,14 +489,42 @@ def _beta(prices: dict[int, float], btc: dict[int, float], hour: int, window: in
     return min(3.0, max(0.0, value))
 
 
+def _portfolio_annual_vol(
+    prices: dict[str, dict[int, float]],
+    longs: tuple[str, ...],
+    shorts: tuple[str, ...],
+    long_weight: float,
+    short_weight: float,
+    hour: int,
+    window: int,
+) -> float:
+    """Trailing beta-hedged hourly volatility, annualised without look-ahead."""
+    returns: list[float] = []
+    for h in range(hour - window + 1, hour + 1):
+        if any(h - 1 not in prices[s] or h not in prices[s] for s in (*longs, *shorts)):
+            continue
+        long_return = statistics.fmean(
+            math.log(prices[s][h] / prices[s][h - 1]) for s in longs
+        )
+        short_return = statistics.fmean(
+            math.log(prices[s][h] / prices[s][h - 1]) for s in shorts
+        )
+        returns.append(long_weight * long_return - short_weight * short_return)
+    if len(returns) < max(24, window // 3):
+        return 0.0
+    return statistics.pstdev(returns) * math.sqrt(24 * 365)
+
+
 def simulate_config(
     prices: dict[str, dict[int, float]],
     funding: dict[str, tuple[list[int], list[float]]],
     config: StrategyConfig,
     *,
+    execution_prices: dict[str, dict[int, float]] | None = None,
     fee_bps: float,
     slippage_bps: float,
     include_funding: bool,
+    target_vol_pct: float = 0.0,
     beta_window_h: int = 168,
     side_fraction: float = 0.20,
 ) -> list[TradeReturn]:
@@ -466,6 +538,10 @@ def simulate_config(
     btc = prices.get("BTCUSDT")
     if not btc:
         raise ValueError("BTCUSDTがありません。市場要因を除去できません")
+    execution = execution_prices or prices
+    btc_execution = execution.get("BTCUSDT")
+    if not btc_execution:
+        raise ValueError("BTCUSDTの次足約定価格がありません")
     symbols = sorted(symbol for symbol in prices if symbol != "BTCUSDT")
     if len(symbols) < 4:
         raise ValueError("BTC以外に最低4銘柄必要です")
@@ -474,13 +550,18 @@ def simulate_config(
     first = min(btc)
     last = max(btc)
     start = first + max(beta_window_h, config.lookback_h)
-    cost = 2.0 * (fee_bps + slippage_bps)  # entry and exit over 1x gross
+    full_gross_cost = 2.0 * (fee_bps + slippage_bps)
     trades: list[TradeReturn] = []
 
     for hour in range(start, last - config.hold_h + 1, config.hold_h):
         btc_start = btc.get(hour - config.lookback_h)
         btc_now = btc.get(hour)
-        if btc_start is None or btc_now is None:
+        if (
+            btc_start is None
+            or btc_now is None
+            or hour not in btc_execution
+            or hour + config.hold_h not in btc_execution
+        ):
             continue
         btc_move = math.log(btc_now / btc_start)
         ranked: list[tuple[float, str, float]] = []
@@ -488,8 +569,13 @@ def simulate_config(
             series = prices[symbol]
             p0 = series.get(hour - config.lookback_h)
             p1 = series.get(hour)
-            p2 = series.get(hour + config.hold_h)
-            if p0 is None or p1 is None or p2 is None:
+            executable = execution.get(symbol, {})
+            if (
+                p0 is None
+                or p1 is None
+                or hour not in executable
+                or hour + config.hold_h not in executable
+            ):
                 continue
             beta = _beta(series, btc, hour, beta_window_h)
             residual = math.log(p1 / p0) - beta * btc_move
@@ -532,30 +618,74 @@ def simulate_config(
                 short_weight = long_beta / beta_sum
         else:
             raise ValueError(f"unknown statarb strategy: {config.strategy}")
+        annual_vol = _portfolio_annual_vol(
+            prices,
+            longs,
+            shorts,
+            long_weight,
+            short_weight,
+            hour,
+            beta_window_h,
+        )
+        gross_scale = 1.0
+        if target_vol_pct > 0 and annual_vol > 0:
+            gross_scale = min(1.0, target_vol_pct / 100.0 / annual_vol)
         long_return = statistics.fmean(
-            prices[s][hour + config.hold_h] / prices[s][hour] - 1.0 for s in longs
+            execution[s][hour + config.hold_h] / execution[s][hour] - 1.0 for s in longs
         )
         short_return = statistics.fmean(
-            prices[s][hour + config.hold_h] / prices[s][hour] - 1.0 for s in shorts
+            execution[s][hour + config.hold_h] / execution[s][hour] - 1.0 for s in shorts
         )
-        long_price_bps = long_weight * long_return * 10_000.0
-        short_price_bps = -short_weight * short_return * 10_000.0
+        long_price_bps = gross_scale * long_weight * long_return * 10_000.0
+        short_price_bps = -gross_scale * short_weight * short_return * 10_000.0
         price_bps = long_price_bps + short_price_bps
 
         funding_bps = 0.0
+        funding_start = hour + 1
+        funding_end = hour + config.hold_h + 1
         if include_funding:
             long_funding = statistics.fmean(
-                _funding_between(funding.get(s, ([], [0.0])), hour, hour + config.hold_h)
+                _funding_between(funding.get(s, ([], [0.0])), funding_start, funding_end)
                 for s in longs
             )
             short_funding = statistics.fmean(
-                _funding_between(funding.get(s, ([], [0.0])), hour, hour + config.hold_h)
+                _funding_between(funding.get(s, ([], [0.0])), funding_start, funding_end)
                 for s in shorts
             )
             # Longs pay positive funding; shorts receive it.
-            funding_bps = (
+            funding_bps = gross_scale * (
                 -long_weight * long_funding + short_weight * short_funding
             ) * 10_000.0
+        cost = full_gross_cost * gross_scale
+        symbol_bps: dict[str, float] = {}
+        for symbol in longs:
+            weight = gross_scale * long_weight / len(longs)
+            symbol_funding = (
+                _funding_between(funding.get(symbol, ([], [0.0])), funding_start, funding_end)
+                if include_funding
+                else 0.0
+            )
+            symbol_bps[symbol] = (
+                weight
+                * (execution[symbol][hour + config.hold_h] / execution[symbol][hour] - 1.0)
+                * 10_000.0
+                - weight * symbol_funding * 10_000.0
+                - full_gross_cost * weight
+            )
+        for symbol in shorts:
+            weight = gross_scale * short_weight / len(shorts)
+            symbol_funding = (
+                _funding_between(funding.get(symbol, ([], [0.0])), funding_start, funding_end)
+                if include_funding
+                else 0.0
+            )
+            symbol_bps[symbol] = symbol_bps.get(symbol, 0.0) + (
+                -weight
+                * (execution[symbol][hour + config.hold_h] / execution[symbol][hour] - 1.0)
+                * 10_000.0
+                + weight * symbol_funding * 10_000.0
+                - full_gross_cost * weight
+            )
         trades.append(
             TradeReturn(
                 hour=hour,
@@ -565,8 +695,10 @@ def simulate_config(
                 funding_bps=funding_bps,
                 cost_bps=cost,
                 net_bps=price_bps + funding_bps - cost,
+                gross_scale=gross_scale,
                 long_symbols=longs,
                 short_symbols=shorts,
+                symbol_bps=symbol_bps,
             )
         )
     return trades
@@ -578,31 +710,67 @@ def summarise_performance(
     *,
     observed_days: float,
 ) -> Performance:
-    total = sum(row.net_bps for row in returns)
-    equity = peak = drawdown = 0.0
+    equity = peak = 1.0
+    drawdown = 0.0
+    bankrupt = False
+    processed: list[TradeReturn] = []
+    price_bps = long_price_bps = short_price_bps = funding_bps = cost_bps = 0.0
+    symbol_bps: dict[str, float] = {}
+    positive_contributions: list[float] = []
     monthly: dict[str, float] = {}
     for row in returns:
-        equity += row.net_bps
+        before = equity
+        contribution = before * row.net_bps
+        price_bps += before * row.price_bps
+        long_price_bps += before * row.long_price_bps
+        short_price_bps += before * row.short_price_bps
+        funding_bps += before * row.funding_bps
+        cost_bps += before * row.cost_bps
+        for symbol, value in row.symbol_bps.items():
+            symbol_bps[symbol] = symbol_bps.get(symbol, 0.0) + before * value
+        equity = before * max(0.0, 1.0 + row.net_bps / 10_000.0)
         peak = max(peak, equity)
-        drawdown = max(drawdown, peak - equity)
+        drawdown = max(drawdown, (peak - equity) / peak if peak > 0 else 1.0)
         month = datetime.fromtimestamp(row.hour * 3600, tz=UTC).strftime("%Y-%m")
-        monthly[month] = monthly.get(month, 0.0) + row.net_bps
-    n = len(returns)
+        monthly[month] = monthly.get(month, 0.0) + contribution
+        if contribution > 0:
+            positive_contributions.append(contribution)
+        processed.append(row)
+        if equity <= 0:
+            bankrupt = True
+            break
+    n = len(processed)
+    total = (equity - 1.0) * 10_000.0
+    if equity <= 0:
+        annual = -10_000.0
+    else:
+        try:
+            annual = (equity ** (365.0 / observed_days) - 1.0) * 10_000.0
+        except OverflowError:
+            annual = math.inf
+    positive_total = sum(positive_contributions)
+    top10 = sum(sorted(positive_contributions, reverse=True)[:10])
     return Performance(
         config=config,
         trades=n,
         total_bps=total,
-        annual_bps=total * 365.0 / observed_days if observed_days > 0 else 0.0,
-        avg_bps=total / n if n else 0.0,
-        win_rate=sum(row.net_bps > 0 for row in returns) / n if n else 0.0,
-        max_drawdown_bps=drawdown,
-        price_bps=sum(row.price_bps for row in returns),
-        long_price_bps=sum(row.long_price_bps for row in returns),
-        short_price_bps=sum(row.short_price_bps for row in returns),
-        funding_bps=sum(row.funding_bps for row in returns),
-        cost_bps=sum(row.cost_bps for row in returns),
+        annual_bps=annual,
+        avg_bps=statistics.fmean(row.net_bps for row in processed) if n else 0.0,
+        win_rate=sum(row.net_bps > 0 for row in processed) / n if n else 0.0,
+        max_drawdown_bps=drawdown * 10_000.0,
+        price_bps=price_bps,
+        long_price_bps=long_price_bps,
+        short_price_bps=short_price_bps,
+        funding_bps=funding_bps,
+        cost_bps=cost_bps,
+        final_equity=equity,
+        bankrupt=bankrupt,
+        largest_win_bps=max((row.net_bps for row in processed), default=0.0),
+        largest_loss_bps=min((row.net_bps for row in processed), default=0.0),
+        top10_profit_share=top10 / positive_total if positive_total > 0 else 0.0,
+        symbol_bps=symbol_bps,
         monthly_bps=monthly,
-        returns=returns,
+        returns=processed,
     )
 
 
@@ -611,9 +779,11 @@ def run_backtests(
     funding: dict[str, tuple[list[int], list[float]]],
     configs: Iterable[StrategyConfig],
     *,
+    execution_prices: dict[str, dict[int, float]] | None = None,
     fee_bps: float,
     slippage_bps: float,
     include_funding: bool,
+    target_vol_pct: float = 0.0,
 ) -> list[Performance]:
     if not prices:
         return []
@@ -626,9 +796,11 @@ def run_backtests(
             prices,
             funding,
             config,
+            execution_prices=execution_prices,
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             include_funding=include_funding,
+            target_vol_pct=target_vol_pct,
         )
         results.append(summarise_performance(config, returns, observed_days=days))
     return results
@@ -657,15 +829,25 @@ def walk_forward(
     test_span = last - warmup_end
     selected_returns: list[TradeReturn] = []
     fold_rows: list[WalkForwardFold] = []
+    walk_bankrupt = False
 
     for index in range(folds):
         test_start = warmup_end + test_span * index // folds
         test_end = warmup_end + test_span * (index + 1) // folds
+        if walk_bankrupt:
+            fold_rows.append(
+                WalkForwardFold(test_start, test_end, None, 0.0, 0.0, 0)
+            )
+            continue
         scored = []
         for result in results:
             train = [row for row in result.returns if row.hour < test_start]
             if len(train) >= min_train_trades:
-                scored.append((sum(row.net_bps for row in train), result, train))
+                train_days = max(1.0, (test_start - first) / 24.0)
+                train_perf = summarise_performance(
+                    result.config, train, observed_days=train_days
+                )
+                scored.append((train_perf.total_bps, result, train))
         if not scored:
             fold_rows.append(
                 WalkForwardFold(
@@ -692,15 +874,21 @@ def walk_forward(
             )
             continue
         test = [row for row in chosen.returns if test_start <= row.hour < test_end]
-        selected_returns.extend(test)
+        test_perf = summarise_performance(
+            chosen.config,
+            test,
+            observed_days=max(1.0, (test_end - test_start) / 24.0),
+        )
+        selected_returns.extend(test_perf.returns)
+        walk_bankrupt = test_perf.bankrupt
         fold_rows.append(
             WalkForwardFold(
                 train_end_hour=test_start,
                 test_end_hour=test_end,
                 selected=chosen.config,
                 train_bps=best_train_bps,
-                test_bps=sum(row.net_bps for row in test),
-                test_trades=len(test),
+                test_bps=test_perf.total_bps,
+                test_trades=test_perf.trades,
             )
         )
     observed_days = max(1.0, (last - warmup_end) / 24.0)

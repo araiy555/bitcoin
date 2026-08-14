@@ -2278,6 +2278,23 @@ def _parse_positive_float_list(value: str, option: str) -> list[float]:
     return list(dict.fromkeys(parsed))
 
 
+def _print_statarb_diagnostics(label: str, result: statarb.Performance) -> None:
+    profitable = sorted(result.symbol_bps.items(), key=lambda item: item[1], reverse=True)
+    losing = sorted(result.symbol_bps.items(), key=lambda item: item[1])
+    top = ", ".join(f"{symbol} {value:+.1f}" for symbol, value in profitable[:5]) or "—"
+    bottom = ", ".join(f"{symbol} {value:+.1f}" for symbol, value in losing[:5]) or "—"
+    console.print(
+        f"\n  [bold]{label}の耐久性[/bold]\n"
+        f"    最終資産 : {result.final_equity:.3f}倍"
+        f"{' / [red]資金枯渇[/red]' if result.bankrupt else ''}\n"
+        f"    最大1回 : {result.largest_win_bps / 100:+.2f}% / "
+        f"最小1回 {result.largest_loss_bps / 100:+.2f}%\n"
+        f"    上位10取引 / 全利益 : {result.top10_profit_share:.1%}\n"
+        f"    銘柄寄与 上位 : {top}\n"
+        f"    銘柄寄与 下位 : {bottom}"
+    )
+
+
 async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
     """Run residual-reversion portfolios with costs and chronological selection."""
     root = Path(args.data_dir)
@@ -2301,20 +2318,22 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
             for hold in holds
         ]
         strategy_description = "BTC betaを除いた相対騰落率の下位20%買い・上位20%売り"
-    if args.fees < 0 or args.slippage_bps < 0:
-        raise ConfigError("--fees と --slippage-bps は0以上で指定してください")
+    if args.fees < 0 or args.slippage_bps < 0 or args.target_vol < 0:
+        raise ConfigError("--fees、--slippage-bps、--target-vol は0以上で指定してください")
     if args.min_train_trades <= 0:
         raise ConfigError("--min-train-trades は1以上で指定してください")
 
     console.rule("[bold cyan]中速・市場中立 statarb — バックテスト")
     try:
-        manifest, prices, funding = statarb.load_dataset(root)
+        manifest, prices, execution, funding = statarb.load_dataset(root)
     except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
         raise ConfigError(str(exc)) from exc
     if len(prices) < 5:
         raise ConfigError(
             f"価格を読めたのが{len(prices)}銘柄だけです。downloadの完了状況を確認してください"
         )
+    if len(execution) < 5:
+        raise ConfigError("次の5分足openを読めません。downloadデータを確認してください")
     if args.funding:
         missing = sorted(set(prices) - set(funding))
         if missing:
@@ -2328,15 +2347,19 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         f"  戦略   : {strategy_description}\n"
         f"  コスト : 片道 fee {args.fees:g}bps + 滑り {args.slippage_bps:g}bps "
         f"→ 往復 {2 * (args.fees + args.slippage_bps):g}bps\n"
+        f"  執行   : シグナル確定後、次の5分足openで建て・手仕舞い\n"
+        f"  リスク : 年率vol {args.target_vol:g}%へ縮小（1倍を上限）/ 複利資産\n"
         f"  funding: {'実現履歴を計上' if args.funding else '計上しない'}\n"
     )
     results = statarb.run_backtests(
         prices,
         funding,
         configs,
+        execution_prices=execution,
         fee_bps=args.fees,
         slippage_bps=args.slippage_bps,
         include_funding=args.funding,
+        target_vol_pct=args.target_vol,
     )
 
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
@@ -2349,7 +2372,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
     table.add_column("funding", justify="right")
     table.add_column("コスト", justify="right")
     table.add_column("Net", justify="right")
-    table.add_column("年率換算", justify="right")
+    table.add_column("年率CAGR", justify="right")
     table.add_column("勝率", justify="right")
     table.add_column("最大DD", justify="right")
     for result in sorted(results, key=lambda row: row.total_bps, reverse=True):
@@ -2377,6 +2400,7 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
         f"\n  全期間最良 {best.config.label}: long {best.long_price_bps:+.1f}bps / "
         f"short {best.short_price_bps:+.1f}bps / funding {best.funding_bps:+.1f}bps"
     )
+    _print_statarb_diagnostics("全期間最良", best)
 
     if args.walk_forward:
         try:
@@ -2412,12 +2436,16 @@ async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
                 f"{month} {value:+.1f}" for month, value in sorted(out.monthly_bps.items())
             )
             console.print(f"  未使用期間の月別Net(bps): {monthly}")
+        _print_statarb_diagnostics("未使用期間", out)
         if (
             out.total_bps > 0
+            and not out.bankrupt
+            and out.max_drawdown_bps <= 2_000
             and all(fold.selected is not None and fold.test_bps > 0 for fold in folds)
         ):
             console.print(
                 "\n  [green]全foldが全コスト後プラスです。[/green]\n"
+                "  [green]複利最大DDも20%以内です。[/green]\n"
                 "  [dim]まだ同じデータで候補を選んだ研究結果です。設定を固定して、\n"
                 "  期間を後ろへずらした再検証を通るまで実運用しません。[/dim]"
             )
@@ -3048,6 +3076,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sa_bt.add_argument("--fees", type=float, default=4.0, help="片道手数料 bps")
     p_sa_bt.add_argument(
         "--slippage-bps", type=float, default=1.0, help="片道の想定スリッページ bps"
+    )
+    p_sa_bt.add_argument(
+        "--target-vol",
+        type=float,
+        default=20.0,
+        help="過去168時間から推定する年率vol目標。0で縮小なし",
     )
     p_sa_bt.add_argument("--funding", action="store_true", help="実現fundingを損益へ含める")
     p_sa_bt.add_argument(

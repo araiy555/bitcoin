@@ -14,6 +14,7 @@ from jsboard.research.statarb import (
     kline_url,
     load_dataset,
     load_hourly_closes,
+    load_hourly_market,
     parse_hours,
     simulate_config,
     summarise_performance,
@@ -47,6 +48,7 @@ def test_statarb_commands_are_real_cli_commands():
     assert backtest.funding is True
     assert backtest.walk_forward is True
     assert backtest.strategy == "loser-btc"
+    assert backtest.target_vol == 20.0
 
 
 @pytest.mark.parametrize(
@@ -86,9 +88,11 @@ def test_load_hourly_closes_keeps_last_five_minute_close(tmp_path):
         zf.writestr("BTCUSDT-5m.csv", buffer.getvalue())
 
     prices = load_hourly_closes([path], date(2024, 1, 1), date(2024, 1, 1))
+    _, execution = load_hourly_market([path], date(2024, 1, 1), date(2024, 1, 1))
     first_hour = 1704067200 // 3600
     assert prices[first_hour] == 101.5
     assert prices[first_hour + 1] == 102.5
+    assert execution[first_hour] == 101.0
 
 
 def test_residual_reversion_longs_loser_and_shorts_winner_after_costs():
@@ -128,10 +132,10 @@ def test_positive_funding_is_paid_by_long_and_received_by_short():
     prices["BUSDT"][24] = 95.0
     prices["CUSDT"][24] = 105.0
     prices["DUSDT"][24] = 110.0
-    # Prefix arrays correspond to one settlement at hour 25.
+    # Prefix arrays correspond to one settlement after entry, at hour 26.
     funding = {
-        "AUSDT": ([25], [0.0, 0.001]),
-        "DUSDT": ([25], [0.0, 0.002]),
+        "AUSDT": ([26], [0.0, 0.001]),
+        "DUSDT": ([26], [0.0, 0.002]),
     }
     trades = simulate_config(
         prices,
@@ -174,6 +178,39 @@ def test_loser_btc_only_buys_extreme_loser_and_hedges_with_btc():
     assert trades[0].net_bps > 0
 
 
+def test_loser_btc_executes_at_next_bar_open_not_observed_signal_close():
+    prices = _loser_prices()
+    execution = {symbol: dict(series) for symbol, series in prices.items()}
+    # The signal observes A at 90, but the first tradable price is 95.
+    execution["AUSDT"][24] = 95.0
+    trades = simulate_config(
+        prices,
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=1.0),
+        execution_prices=execution,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        include_funding=False,
+        beta_window_h=24,
+    )
+    assert trades[0].long_price_bps == pytest.approx(0.5 * (100 / 95 - 1) * 10_000)
+
+
+def test_target_vol_only_scales_risk_down_and_scales_cost_with_it():
+    trades = simulate_config(
+        _loser_prices(),
+        {},
+        StrategyConfig(1, 1, strategy="loser_btc", entry_z=1.0),
+        fee_bps=4.0,
+        slippage_bps=1.0,
+        include_funding=False,
+        target_vol_pct=20.0,
+        beta_window_h=24,
+    )
+    assert 0.0 < trades[0].gross_scale < 1.0
+    assert trades[0].cost_bps == pytest.approx(10.0 * trades[0].gross_scale)
+
+
 def test_loser_btc_holds_cash_when_no_residual_crosses_entry_z():
     trades = simulate_config(
         _loser_prices(),
@@ -196,8 +233,10 @@ def _negative_return(hour):
         funding_bps=0.0,
         cost_bps=10.0,
         net_bps=-1.0,
+        gross_scale=1.0,
         long_symbols=("AUSDT",),
         short_symbols=("BTCUSDT",),
+        symbol_bps={"AUSDT": -1.0},
     )
 
 
@@ -218,6 +257,21 @@ def test_walk_forward_chooses_cash_instead_of_least_bad_strategy():
     assert summary.total_bps == 0.0
 
 
+def test_compound_account_stops_after_bankruptcy():
+    fatal = _negative_return(1)
+    fatal.net_bps = -11_000.0
+    fatal.price_bps = -10_990.0
+    recovery = _negative_return(2)
+    recovery.net_bps = 50_000.0
+    result = summarise_performance(
+        StrategyConfig(6, 24), [fatal, recovery], observed_days=30
+    )
+    assert result.bankrupt is True
+    assert result.final_equity == 0.0
+    assert result.total_bps == -10_000.0
+    assert result.trades == 1
+
+
 def test_load_dataset_explains_required_download(tmp_path):
     with pytest.raises(FileNotFoundError, match="statarb download"):
         load_dataset(tmp_path)
@@ -232,7 +286,8 @@ def test_manifest_is_plain_json_contract(tmp_path):
         "universe": [],
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    loaded, prices, funding = load_dataset(tmp_path)
+    loaded, prices, execution, funding = load_dataset(tmp_path)
     assert loaded == manifest
     assert prices == {}
+    assert execution == {}
     assert funding == {}
