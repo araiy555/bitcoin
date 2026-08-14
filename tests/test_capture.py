@@ -24,7 +24,7 @@ from jsboard.feed.base import (
     OpenInterest,
     TradeTick,
 )
-from jsboard.feed.replay import _decode
+from jsboard.feed.replay import _decode, iter_tagged_timed
 from jsboard.sim.capture import MultiCapture, write_meta
 
 INST = Instrument("BTCUSDT", tick_size=Decimal("0.01"), lot_size=Decimal("0.00001"))
@@ -90,6 +90,27 @@ async def test_receive_time_is_stored_beside_exchange_time(tmp_path):
     row = read_rows(out)[0]
     assert row["ts_ns"] == 1_000
     assert row["rx_ns"] > 1_000_000_000_000_000  # a real wall-clock stamp
+
+
+def test_timed_reader_uses_receive_time_and_falls_back_for_old_rows(tmp_path):
+    path = tmp_path / "timed.jsonl"
+    rows = [
+        {
+            "src": "spot", "rx_ns": 9_000, "k": "trade", "price": 1,
+            "qty": 1, "aggressor": 1, "trade_id": 1, "ts_ns": 100,
+        },
+        {
+            "src": "perp", "k": "trade", "price": 2, "qty": 1,
+            "aggressor": -1, "trade_id": 2, "ts_ns": 200,
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    timed = list(iter_tagged_timed(path))
+    assert [(src, received) for src, received, _ in timed] == [
+        ("spot", 9_000),
+        ("perp", 200),
+    ]
 
 
 async def test_rows_stay_decodable_after_the_capture_tags_them(tmp_path):

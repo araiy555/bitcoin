@@ -22,6 +22,7 @@ import logging
 import math
 import sys
 import time
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -36,7 +37,7 @@ from .feed import multi
 from .feed.base import DepthDelta, DepthSnapshot, Feed, TradeTick
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
-from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged
+from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged, iter_tagged_timed
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig
@@ -68,6 +69,7 @@ from .research.scan import (
 )
 from .sim.capture import MultiCapture, write_meta
 from .sim.hedge import HedgeConfig, Hedger
+from .sim.pair import CrossMarketFairValue, PairQuoteGate
 from .sim.paper import PAPER_OWNER, PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .ui.board import Board
@@ -240,12 +242,15 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
         risk=risk,
         toxicity=ToxicityGate(
             ToxicityConfig(
-                threshold=args.toxicity_threshold,
-                pull_threshold=args.toxicity_pull_threshold,
-                depth_levels=args.toxicity_depth,
-                flow_weight=args.toxicity_flow_weight,
-                book_weight=args.toxicity_book_weight,
-                microprice_weight=args.toxicity_microprice_weight,
+                # Some programmatic callers build a minimal Namespace rather
+                # than going through argparse.  Keep the pre-toxicity API
+                # compatible by applying the CLI defaults here as well.
+                threshold=getattr(args, "toxicity_threshold", 0.0),
+                pull_threshold=getattr(args, "toxicity_pull_threshold", 0.90),
+                depth_levels=getattr(args, "toxicity_depth", 5),
+                flow_weight=getattr(args, "toxicity_flow_weight", 0.50),
+                book_weight=getattr(args, "toxicity_book_weight", 0.30),
+                microprice_weight=getattr(args, "toxicity_microprice_weight", 0.20),
             )
         ),
         config=StrategyConfig(requote_interval_ms=args.requote_ms),
@@ -1394,6 +1399,233 @@ async def _run_hedged(path, maker_inst, hedge_inst, args) -> dict:
     }
 
 
+async def cmd_pair(args: argparse.Namespace) -> int:
+    """Price the maker venue from a second book and hedge every fill.
+
+    Unlike ``hedge``, this does not quote first and ask whether hedging helped
+    afterwards.  A proposed order reaches the paper venue only when the
+    visible hedge depth clears maker fee, taker fee and the requested safety
+    margin at that moment.
+    """
+    path = Path(args.path)
+    if not path.exists():
+        console.print(f"[red]{path} がありません。[/red]")
+        return 1
+
+    meta_path = path.with_suffix(path.suffix + ".meta.json")
+    if not meta_path.exists():
+        raise ConfigError(f"{meta_path.name} がありません。capture で録った録画が要ります。")
+    sources = json.loads(meta_path.read_text()).get("sources") or {}
+    if args.maker_source == args.hedge_source:
+        raise ConfigError("--maker-source と --hedge-source は別の市場を指定してください。")
+    for option, name in (("maker", args.maker_source), ("hedge", args.hedge_source)):
+        if name not in sources:
+            raise ConfigError(
+                f"--{option}-source {name} は録画にありません。"
+                f"使えるのは: {', '.join(sorted(sources))}"
+            )
+
+    maker_inst = _instrument_from_spec(sources[args.maker_source])
+    hedge_inst = _instrument_from_spec(sources[args.hedge_source])
+    if maker_inst.base and hedge_inst.base and maker_inst.base != hedge_inst.base:
+        raise ConfigError(
+            f"ベース資産が違います: {maker_inst.base} / {hedge_inst.base}。"
+            "同じ数量をヘッジできません。"
+        )
+    if maker_inst.quote and hedge_inst.quote and maker_inst.quote != hedge_inst.quote:
+        raise ConfigError(
+            f"建て通貨が違います: {maker_inst.quote} / {hedge_inst.quote}。"
+            "為替換算なしでは比較できません。"
+        )
+
+    adjusted = _prepare_sweep_defaults(maker_inst, args, {})
+    if adjusted:
+        console.print(
+            "[dim]録画銘柄のlotに合わせて未指定値を自動調整: "
+            + "  ".join(adjusted)
+            + "[/dim]"
+        )
+
+    console.print(
+        f"{path.name} — ヘッジ市場から価格を作る相対価値MM\n"
+        f"  メイク: {args.maker_source} {maker_inst.symbol} "
+        f"tick={maker_inst.tick_size} lot={maker_inst.lot_size}\n"
+        f"  ヘッジ: {args.hedge_source} {hedge_inst.symbol} "
+        f"tick={hedge_inst.tick_size} lot={hedge_inst.lot_size}\n"
+        f"  条件  : maker + taker({args.taker_bps:g}bps) + 板歩き後に "
+        f"{args.pair_edge_bps:g}bps 以上 / hedge age ≤ {args.max_hedge_age_ms:g}ms\n"
+        f"  更新  : requote {args.requote_ms:g}ms / hedge latency {args.hedge_latency_ms:g}ms"
+    )
+
+    rows = []
+    for maker_bps in _grid(args.maker_fees, float):
+        run_args = argparse.Namespace(**vars(args))
+        run_args.maker_bps = maker_bps
+        _check_sizes(maker_inst, run_args)
+        row = await _run_pair(path, maker_inst, hedge_inst, run_args)
+        row["maker_bps"] = maker_bps
+        rows.append(row)
+
+    columns = [
+        ("maker", "maker_bps", "{:g}"),
+        ("候補%", "pass_share", "{:.1f}"),
+        ("最良edge", "best_edge", "{:+.2f}"),
+        ("約定", "fills", "{:,.0f}"),
+        ("ヘッジ", "hedges", "{:,.0f}"),
+        ("未ヘッジ", "skipped", "{:,.0f}"),
+        ("make.spread", "maker_spread", "{:+.2f}"),
+        ("make.在庫", "maker_inventory", "{:+.2f}"),
+        ("hedge.cross", "hedge_cross", "{:+.2f}"),
+        ("basis", "hedge_inventory", "{:+.2f}"),
+        ("手数料", "fees", "{:+.2f}"),
+        ("Net bps", "net_bps", "{:+.2f}"),
+    ]
+
+    def cell(row, key, fmt):
+        value = row[key]
+        return "—" if not math.isfinite(value) else fmt.format(value)
+
+    if args.plain:
+        console.print("\t".join(c[0] for c in columns), highlight=False)
+        for row in rows:
+            console.print("\t".join(cell(row, key, fmt) for _, key, fmt in columns), highlight=False)
+    else:
+        table = Table(title=f"{maker_inst.symbol} — 相対価値MM＋即時ヘッジ", padding=(0, 1))
+        for header, _, _ in columns:
+            table.add_column(header, justify="right")
+        for row in rows:
+            cells = [cell(row, key, fmt) for _, key, fmt in columns]
+            net = row["net_bps"]
+            colour = "dim" if not math.isfinite(net) else ("green" if net > 0 else "red")
+            cells[-1] = f"[{colour}]{cells[-1]}[/{colour}]"
+            table.add_row(*cells)
+        console.print(table)
+
+    if all(row["quotes_passed"] == 0 for row in rows):
+        console.print(
+            "\n[yellow][bold]判定: この録画には、指定した執行コスト後に出せる注文がありません。[/bold][/yellow]\n"
+            "[dim]損したのではなく、条件外なので一度もリスクを取りません。"
+            "別銘柄か別期間を capture して同じ判定へ回します。[/dim]"
+        )
+    elif all(row["fills"] == 0 for row in rows):
+        console.print(
+            "\n[yellow][bold]判定: 価格差はありましたが、注文の順番が回らず約定していません。[/bold][/yellow]\n"
+            "[dim]録画を長くするか、候補%が高い別銘柄を比較してください。[/dim]"
+        )
+    else:
+        profitable = [row for row in rows if math.isfinite(row["net_bps"]) and row["net_bps"] > 0]
+        if profitable:
+            console.print(
+                "\n[green][bold]判定: 全執行コスト後でプラスの行があります。[/bold][/green]\n"
+                "[dim]同じ設定を固定し、別時間の録画で out-of-sample 検証してください。[/dim]"
+            )
+        else:
+            console.print(
+                "\n[red][bold]判定: 価格差を事前選別しても、約定後の全コストで赤字です。[/bold][/red]\n"
+                "[dim]この録画・銘柄では採用しません。[/dim]"
+            )
+    return 0
+
+
+async def _run_pair(path: Path, maker_inst: Instrument, hedge_inst: Instrument, args) -> dict:
+    maker = build_maker(maker_inst, args)
+    hedge_view = MarketView(instrument=hedge_inst, depth=args.depth)
+    hedger = Hedger(
+        instrument=hedge_inst,
+        market=hedge_view,
+        config=HedgeConfig(ratio=1.0, taker_bps=args.taker_bps, max_levels=args.depth),
+    )
+
+    now_ns = [0]
+
+    def clock() -> int:
+        return now_ns[0] or time.time_ns()
+
+    maker.clock = clock
+    maker.venue.clock = clock
+    maker.market.clock = clock
+    hedge_view.clock = clock
+    maker.fair_value = CrossMarketFairValue(maker_inst, hedge_inst, hedge_view)  # type: ignore[assignment]
+    gate = PairQuoteGate(
+        maker_instrument=maker_inst,
+        hedge_instrument=hedge_inst,
+        maker_market=maker.market,
+        hedge_market=hedge_view,
+        hedger=hedger,
+        maker_bps=args.maker_bps,
+        taker_bps=args.taker_bps,
+        min_net_bps=args.pair_edge_bps,
+        max_hedge_age_ms=args.max_hedge_age_ms,
+        clock=clock,
+    )
+    maker.quote_filter = gate.filter
+
+    maker_turnover = 0.0
+    pending_hedges: list[tuple[int, int, float]] = []
+
+    def flush_hedges() -> None:
+        ready = [item for item in pending_hedges if item[0] <= clock()]
+        if not ready:
+            return
+        pending_hedges[:] = [item for item in pending_hedges if item[0] > clock()]
+        for _due_ns, sign, qty_base in ready:
+            hedger.on_maker_fill(sign, qty_base)
+
+    for src, received_ns, event in iter_tagged_timed(path):
+        if received_ns:
+            # Receive timestamps are monotonic in a capture.  Preserve that
+            # property for old hand-built fixtures whose event clocks may not be.
+            now_ns[0] = max(now_ns[0], received_ns)
+            # Execution can react only when this process received an update.
+            # Re-stamp the replay event so requote intervals, staleness and
+            # inventory age all live on that same observable clock.
+            event = replace(event, ts_ns=now_ns[0])
+        if src == args.hedge_source:
+            hedge_view.apply(event)
+            hedger.on_market()
+            flush_hedges()
+            # Reference-market changes are precisely when a cross-market
+            # maker must cancel or move a stale quote.
+            maker.requote()
+            continue
+        if src != args.maker_source:
+            continue
+
+        flush_hedges()
+        for fill in maker.on_event(event):
+            if fill.maker_owner != PAPER_OWNER:
+                continue
+            maker_turnover += maker_inst.notional(fill.price, fill.qty)
+            sign = fill.aggressor.opposite.sign
+            due_ns = clock() + int(args.hedge_latency_ms * 1e6)
+            pending_hedges.append((due_ns, sign, maker_inst.qty_f(fill.qty)))
+            flush_hedges()
+        maker.requote()
+
+    maker.flatten()
+    make_attr = maker.attribution
+    hedge_attr = hedger.attribution
+    scale = 10_000.0 / maker_turnover if maker_turnover > 0 else math.nan
+    best_edge = gate.stats.best_net_bps
+    if not math.isfinite(best_edge):
+        best_edge = math.nan
+    return {
+        "fills": int(maker.position.fill_count),
+        "hedges": int(hedger.hedges),
+        "skipped": int(hedger.skipped_no_book + len(pending_hedges)),
+        "quotes_tested": int(gate.stats.quotes_tested),
+        "quotes_passed": int(gate.stats.quotes_passed),
+        "pass_share": gate.stats.pass_share * 100.0,
+        "best_edge": best_edge,
+        "maker_spread": make_attr.spread_capture * scale,
+        "maker_inventory": make_attr.inventory_pnl * scale,
+        "hedge_cross": hedge_attr.spread_capture * scale,
+        "hedge_inventory": hedge_attr.inventory_pnl * scale,
+        "fees": -(make_attr.fees + hedge_attr.fees) * scale,
+        "net_bps": (make_attr.total + hedge_attr.total) * scale,
+    }
+
+
 # Binance spot maker fees by VIP tier, for reading the breakeven column
 # against something concrete. Check the current schedule before relying on it.
 BINANCE_MAKER_TIERS = ((10.0, "VIP0"), (9.0, "VIP1"), (8.0, "VIP2"), (4.2, "VIP3"),
@@ -2480,6 +2712,36 @@ def build_parser() -> argparse.ArgumentParser:
     # three prices. Held at zero so only the cost varies.
     p_hg.set_defaults(
         func=cmd_hedge, headless=True, max_distance=0, requote_ms=100.0, min_edge_bps=0.0
+    )
+
+    p_pair = sub.add_parser(
+        "pair", help="ヘッジ市場で価格を作り、全コスト後プラスの注文だけ出す"
+    )
+    add_common(p_pair)
+    p_pair.add_argument("path", help="spot と perp を同時に capture した .jsonl")
+    p_pair.add_argument("--maker-source", default="spot", help="指値を置く市場")
+    p_pair.add_argument("--hedge-source", default="perp", help="即時ヘッジする市場")
+    p_pair.add_argument("--maker-fees", default="0,1,2", help="試すメイカー手数料 bps")
+    p_pair.add_argument(
+        "--pair-edge-bps", type=float, default=0.0,
+        help="maker/taker/板歩きを引いた後に必要な安全余白",
+    )
+    p_pair.add_argument(
+        "--max-hedge-age-ms", type=float, default=250.0,
+        help="これより古いヘッジ板では注文を出さない",
+    )
+    p_pair.add_argument(
+        "--hedge-latency-ms", type=float, default=2.0,
+        help="maker約定からhedge注文が市場へ届くまでの遅延",
+    )
+    p_pair.add_argument("--plain", action="store_true", help="タブ区切りで出す")
+    p_pair.set_defaults(
+        func=cmd_pair,
+        headless=True,
+        levels=1,
+        max_distance=0,
+        requote_ms=100.0,
+        min_edge_bps=0.0,
     )
 
     p_tri = sub.add_parser("triage", help="手数料・tick・スプレッドだけで全銘柄を一次審査")

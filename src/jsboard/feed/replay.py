@@ -245,6 +245,29 @@ def iter_tagged(path: str | Path):
             yield src, _decode(raw)
 
 
+def iter_tagged_timed(path: str | Path):
+    """Yield ``(source, receive_time_ns, event)`` in observable order.
+
+    Cross-market decisions must use the time this process knew each update,
+    not compare exchange clocks from two different products.  Old recordings
+    without ``rx_ns`` remain usable by falling back to the event timestamp.
+    """
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            src = raw.pop(SOURCE_KEY, None)
+            received_ns = raw.pop(RX_KEY, None)
+            for key in ENVELOPE_KEYS:
+                raw.pop(key, None)
+            event = _decode(raw)
+            if received_ns is None:
+                received_ns = getattr(event, "ts_ns", 0)
+            yield src, int(received_ns or 0), event
+
+
 SOURCE_KEY = "src"
 """Which venue a captured line came from."""
 

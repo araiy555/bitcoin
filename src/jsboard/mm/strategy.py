@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..core.market import MARKET_OWNER, MarketView
@@ -91,6 +92,13 @@ class MarketMaker:
     last_decision: RiskDecision | None = None
     last_toxicity: ToxicityDecision | None = None
     recent_fills: list[Fill] = field(default_factory=list)
+    quote_filter: Callable[[QuoteSet], QuoteSet] | None = None
+    """Optional final gate applied before orders reach the venue.
+
+    Cross-market strategies use this to reject a proposed quote when its
+    immediately executable hedge does not clear all costs.  The ordinary
+    single-book strategy leaves it unset and is unchanged.
+    """
 
     def __post_init__(self) -> None:
         # The attribution needs the instrument to convert ticks and lots into
@@ -234,6 +242,9 @@ class MarketMaker:
                 reason="; ".join(reasons),
             )
             self.stats.last_decision = f"ONE_SIDED: {desired.reason}"
+
+        if self.quote_filter is not None:
+            desired = self.quote_filter(desired)
 
         self._reconcile(desired)
         self.last_quotes = desired
