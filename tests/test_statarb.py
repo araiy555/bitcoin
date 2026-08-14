@@ -5,8 +5,10 @@ import zipfile
 from datetime import date
 
 import pytest
+from aiohttp import ClientResponseError
 
 from jsboard.cli import build_parser
+from jsboard.research import statarb
 from jsboard.research.statarb import (
     StrategyConfig,
     TradeReturn,
@@ -340,6 +342,62 @@ def test_compound_account_stops_after_bankruptcy():
 def test_load_dataset_explains_required_download(tmp_path):
     with pytest.raises(FileNotFoundError, match="statarb download"):
         load_dataset(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_download_dataset_isolates_one_symbol_http_failure(tmp_path, monkeypatch):
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def fake_select_universe(top, *, session):
+        assert top == 3
+        return [
+            {"symbol": "BTCUSDT", "base": "BTC"},
+            {"symbol": "ETHUSDT", "base": "ETH"},
+            {"symbol": "GWEIUSDT", "base": "GWEI"},
+        ]
+
+    async def fake_archive(symbol, interval, part, *, root, session):
+        return True
+
+    async def fake_funding(symbol, start, end, *, root, session):
+        if symbol == "GWEIUSDT":
+            raise ClientResponseError(None, (), status=403, message="Forbidden")
+        return 10
+
+    monkeypatch.setattr(statarb, "make_session", SessionContext)
+    monkeypatch.setattr(statarb, "select_universe", fake_select_universe)
+    monkeypatch.setattr(statarb, "_fetch_archive", fake_archive)
+    monkeypatch.setattr(statarb, "_fetch_funding", fake_funding)
+
+    progress = []
+    manifest = await statarb.download_dataset(
+        days=1,
+        top=3,
+        end=date(2024, 1, 1),
+        root=tmp_path,
+        progress=lambda symbol, done, total: progress.append((symbol, done, total)),
+    )
+
+    assert {row["symbol"] for row in manifest["universe"]} == {
+        "BTCUSDT",
+        "ETHUSDT",
+    }
+    assert manifest["failures"] == [
+        {
+            "symbol": "GWEIUSDT",
+            "archives": 1,
+            "funding": None,
+            "error_phase": "funding",
+            "error": "HTTP 403 Forbidden",
+        }
+    ]
+    assert len(progress) == 3
+    assert json.loads((tmp_path / "manifest.json").read_text()) == manifest
 
 
 def test_manifest_is_plain_json_contract(tmp_path):

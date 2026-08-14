@@ -2249,11 +2249,26 @@ async def cmd_statarb_download(args: argparse.Namespace) -> int:
             raise ConfigError(tls) from exc
         raise ConfigError(f"statarbデータ取得に失敗しました: {type(exc).__name__}: {exc}") from exc
 
-    available = sum(row["archives"] > 0 for row in manifest["files"])
+    available = len(manifest["universe"])
+    failures = manifest.get("failures", [])
     console.print(
         f"\n  [bold green]完了[/bold green]: {available}/{len(manifest['files'])}銘柄\n"
-        f"  次: [bold].venv/bin/jsboard statarb backtest --lookbacks 6h,12h,24h,72h "
-        "--holds 4h,8h,24h --fees 4 --funding --walk-forward[/bold]"
+    )
+    if failures:
+        console.print("  [yellow]取得失敗の銘柄は検証対象から除外しました:[/yellow]")
+        for row in failures:
+            if row.get("error"):
+                console.print(
+                    f"    {row['symbol']}: {row.get('error_phase', 'archive')} "
+                    f"{row['error']}"
+                )
+            else:
+                console.print(f"    {row['symbol']}: 期間内の価格アーカイブなし")
+    console.print(
+        "  [dim]途中まで取得済みのZIPは、同じコマンドを再実行しても再取得しません。[/dim]\n"
+        f"  次: [bold].venv/bin/jsboard statarb backtest --data-dir {root} "
+        "--lookbacks 6h,12h,24h,72h --holds 4h,8h,24h "
+        "--fees 4 --funding --walk-forward[/bold]"
     )
     console.rule()
     return 0

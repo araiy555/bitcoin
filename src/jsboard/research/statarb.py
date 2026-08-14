@@ -313,17 +313,32 @@ async def download_dataset(
 
         async def one(row: dict) -> dict:
             symbol = row["symbol"]
-            async with semaphore:
-                found = 0
-                for part in parts:
-                    found += int(
-                        await _fetch_archive(
-                            symbol, interval, part, root=root, session=session
+            found = 0
+            phase = "archive"
+            try:
+                async with semaphore:
+                    for part in parts:
+                        found += int(
+                            await _fetch_archive(
+                                symbol, interval, part, root=root, session=session
+                            )
                         )
+                    phase = "funding"
+                    funding = await _fetch_funding(
+                        symbol, start, end, root=root, session=session
                     )
-                funding = await _fetch_funding(
-                    symbol, start, end, root=root, session=session
-                )
+            except Exception as exc:  # noqa: BLE001 - isolate one bad remote symbol
+                if isinstance(exc, aiohttp.ClientResponseError):
+                    detail = f"HTTP {exc.status} {exc.message}".strip()
+                else:
+                    detail = f"{type(exc).__name__}: {exc}"
+                return {
+                    "symbol": symbol,
+                    "archives": found,
+                    "funding": None,
+                    "error_phase": phase,
+                    "error": detail,
+                }
             return {"symbol": symbol, "archives": found, "funding": funding}
 
         tasks = [asyncio.create_task(one(row)) for row in universe]
@@ -334,6 +349,11 @@ async def download_dataset(
             if progress:
                 progress(result["symbol"], done, len(tasks))
 
+    successful = {
+        row["symbol"] for row in results if row["archives"] > 0 and "error" not in row
+    }
+    active_universe = [row for row in universe if row["symbol"] in successful]
+    failures = [row for row in results if "error" in row or row["archives"] <= 0]
     manifest = {
         "version": 1,
         "downloaded_at": datetime.now(UTC).isoformat(),
@@ -343,8 +363,9 @@ async def download_dataset(
         "days": days,
         "interval": interval,
         "top": top,
-        "universe": universe,
+        "universe": active_universe,
         "files": sorted(results, key=lambda row: row["symbol"]),
+        "failures": sorted(failures, key=lambda row: row["symbol"]),
     }
     root.mkdir(parents=True, exist_ok=True)
     (root / "manifest.json").write_text(
