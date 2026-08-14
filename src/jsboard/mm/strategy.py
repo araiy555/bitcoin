@@ -24,6 +24,7 @@ from .inventory import Position
 from .markout import MarkOutTracker
 from .quoter import Quote, Quoter, QuoteSet
 from .risk import RiskAction, RiskDecision, RiskManager
+from .toxicity import ToxicityDecision, ToxicityGate
 
 
 @dataclass(slots=True)
@@ -56,6 +57,13 @@ class StrategyStats:
     queue_ahead_ratio_sum: float = 0.0
     queue_ahead_ratio_n: int = 0
 
+    toxicity_evaluations: int = 0
+    toxicity_one_sided: int = 0
+    toxicity_pulls: int = 0
+    toxicity_bid_blocks: int = 0
+    toxicity_ask_blocks: int = 0
+    last_toxicity_score: float = 0.0
+
     @property
     def mean_queue_ahead_ratio(self) -> float:
         """Size resting in front of a touch-joining quote, as a multiple of ours."""
@@ -73,6 +81,7 @@ class MarketMaker:
     quoter: Quoter = field(default_factory=Quoter)
     fair_value: FairValueEstimator = field(default_factory=FairValueEstimator)
     risk: RiskManager = field(default_factory=RiskManager)
+    toxicity: ToxicityGate = field(default_factory=ToxicityGate)
     config: StrategyConfig = field(default_factory=StrategyConfig)
     stats: StrategyStats = field(default_factory=StrategyStats)
     markout: MarkOutTracker = field(default_factory=MarkOutTracker)
@@ -80,6 +89,7 @@ class MarketMaker:
     clock: object = time.time_ns
     last_quotes: QuoteSet = field(default_factory=QuoteSet)
     last_decision: RiskDecision | None = None
+    last_toxicity: ToxicityDecision | None = None
     recent_fills: list[Fill] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -190,6 +200,16 @@ class MarketMaker:
             self.last_quotes = QuoteSet(reason=decision.reason)
             return self.last_quotes
 
+        toxicity = self.toxicity.evaluate(self.market)
+        self.last_toxicity = toxicity
+        self._record_toxicity(toxicity)
+        if toxicity.pulled:
+            cancelled = self.venue.cancel_all()
+            self.stats.orders_cancelled += cancelled
+            self.stats.last_decision = f"PULL: {toxicity.reason}"
+            self.last_quotes = QuoteSet(reason=toxicity.reason)
+            return self.last_quotes
+
         desired = self.quoter.quote(
             fair_value=self.fair_value.estimate(self.market),
             sigma_ticks=self.sigma_ticks,
@@ -198,19 +218,39 @@ class MarketMaker:
             best_ask=self.market.book.best_ask(),
         )
 
-        if decision.action is RiskAction.ONE_SIDED:
+        allowed = decision.allowed_sides & toxicity.allowed_sides
+        if allowed != frozenset({Side.BUY, Side.SELL}):
+            reasons = []
+            if decision.action is RiskAction.ONE_SIDED:
+                reasons.append(decision.reason)
+            if toxicity.one_sided:
+                reasons.append(toxicity.reason)
             desired = QuoteSet(
-                bids=desired.bids if decision.permits(Side.BUY) else (),
-                asks=desired.asks if decision.permits(Side.SELL) else (),
+                bids=desired.bids if Side.BUY in allowed else (),
+                asks=desired.asks if Side.SELL in allowed else (),
                 fair_value=desired.fair_value,
                 reservation=desired.reservation,
                 half_spread=desired.half_spread,
-                reason=decision.reason,
+                reason="; ".join(reasons),
             )
+            self.stats.last_decision = f"ONE_SIDED: {desired.reason}"
 
         self._reconcile(desired)
         self.last_quotes = desired
         return desired
+
+    def _record_toxicity(self, decision: ToxicityDecision) -> None:
+        """Count how often the filter removes quote exposure."""
+        self.stats.toxicity_evaluations += 1
+        self.stats.last_toxicity_score = decision.score
+        if decision.one_sided:
+            self.stats.toxicity_one_sided += 1
+        if decision.pulled:
+            self.stats.toxicity_pulls += 1
+        if not decision.permits(Side.BUY):
+            self.stats.toxicity_bid_blocks += 1
+        if not decision.permits(Side.SELL):
+            self.stats.toxicity_ask_blocks += 1
 
     def _reconcile(self, desired: QuoteSet) -> None:
         """Cancel what no longer belongs, keep what still does, place the rest."""
@@ -280,6 +320,18 @@ class MarketMaker:
     def summary(self) -> dict:
         mark = self.market.mid
         out = self.position.summary(mark)
+        tox_n = self.stats.toxicity_evaluations
+        toxicity = {
+            "threshold": self.toxicity.config.threshold,
+            "last_score": self.stats.last_toxicity_score,
+            "evaluations": tox_n,
+            "one_sided": self.stats.toxicity_one_sided,
+            "pulls": self.stats.toxicity_pulls,
+            "one_sided_share": self.stats.toxicity_one_sided / tox_n if tox_n else 0.0,
+            "pull_share": self.stats.toxicity_pulls / tox_n if tox_n else 0.0,
+            "bid_block_share": self.stats.toxicity_bid_blocks / tox_n if tox_n else 0.0,
+            "ask_block_share": self.stats.toxicity_ask_blocks / tox_n if tox_n else 0.0,
+        }
         out.update(
             {
                 "mid_ticks": mark,
@@ -301,6 +353,7 @@ class MarketMaker:
                 "prints_seen": self.venue.prints_seen,
                 "prints_at_our_price": self.venue.prints_at_our_price,
                 "queue_absorbed": self.instrument.qty_f(self.venue.queue_absorbed_lots),
+                "toxicity": toxicity,
             }
         )
         return out

@@ -95,3 +95,24 @@ def test_explicit_size_axis_is_not_silently_rewritten() -> None:
 
     assert _prepare_sweep_defaults(instrument, args, axes) == []
     assert axes["size"] == ["0.01", "100"]
+
+
+def test_toxicity_threshold_sweep_is_an_explicit_axis() -> None:
+    args = build_parser().parse_args(
+        [
+            "sweep",
+            "us.jsonl",
+            "--requotes",
+            "100",
+            "--latencies",
+            "2",
+            "--toxicity-thresholds",
+            "0,0.2,0.4,0.6,0.8",
+        ]
+    )
+
+    assert _sweep_axes(args) == {
+        "requote_ms": [100.0],
+        "latency_ms": [2.0],
+        "toxicity_threshold": [0.0, 0.2, 0.4, 0.6, 0.8],
+    }
