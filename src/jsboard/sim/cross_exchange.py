@@ -46,6 +46,7 @@ class CrossArbConfig:
         default_factory=lambda: {"binance": 4.0, "bybit": 5.5}
     )
     allowed_directions: tuple[tuple[str, str], ...] | None = None
+    require_funding_settlement: bool = False
 
 
 @dataclass(slots=True)
@@ -94,8 +95,11 @@ class CrossArbStats:
     rejected_cost: int = 0
     rejected_quality: int = 0
     rejected_direction: int = 0
+    rejected_funding: int = 0
     entries: int = 0
     forced_exits: int = 0
+    funding_candidates: int = 0
+    funding_settlements: int = 0
     reject_codes: dict[str, int] = field(default_factory=dict)
 
 
@@ -182,6 +186,7 @@ class CrossExchangeArb:
             -sign * previous.funding_rate * mark_price * position.qty_base
         )
         position.funding_settlements += 1
+        self.stats.funding_settlements += 1
 
     def _mid_price(self, source: str) -> float | None:
         mid = self.markets[source].mid
@@ -300,14 +305,26 @@ class CrossExchangeArb:
         if reference <= 0:
             return 0.0
         cost_quote = 0.0
+        included = False
         horizon_ns = self.now_ns + int(self.config.max_hold_s * 1e9)
         for source, sign in ((long_source, 1), (short_source, -1)):
             mark = self.marks.get(source)
             if mark is None or not (self.now_ns < mark.next_funding_ns <= horizon_ns):
                 continue
+            included = True
             price = mark.mark * float(self.instruments[source].tick_size)
             cost_quote += sign * mark.funding_rate * price * qty
+        if included:
+            self.stats.funding_candidates += 1
         return cost_quote / reference * 10_000.0
+
+    def _funding_due_within_horizon(self, long_source: str, short_source: str) -> bool:
+        horizon_ns = self.now_ns + int(self.config.max_hold_s * 1e9)
+        return any(
+            (mark := self.marks.get(source)) is not None
+            and self.now_ns < mark.next_funding_ns <= horizon_ns
+            for source in (long_source, short_source)
+        )
 
     def _open(self, z: float, mean: float, spread: float) -> None:
         self.stats.signals += 1
@@ -321,6 +338,12 @@ class CrossExchangeArb:
         ):
             self.stats.rejected_direction += 1
             self._record_rejects((RejectCode.BORROW_UNAVAILABLE,))
+            return
+        if self.config.require_funding_settlement and not self._funding_due_within_horizon(
+            long_source, short_source
+        ):
+            self.stats.rejected_funding += 1
+            self._record_rejects((RejectCode.FUNDING_UNAVAILABLE,))
             return
         qty = self._common_qty()
         if qty <= 0:
@@ -447,7 +470,11 @@ class CrossExchangeArb:
             return None
         if self.position is not None:
             held_s = (self.now_ns - self.position.opened_ns) / 1e9
-            if abs(z) <= self.config.exit_z:
+            funding_ready = (
+                not self.config.require_funding_settlement
+                or self.position.funding_settlements > 0
+            )
+            if abs(z) <= self.config.exit_z and funding_ready:
                 self._close(z, "mean")
             elif held_s >= self.config.max_hold_s:
                 self._close(z, "max hold")

@@ -2368,6 +2368,7 @@ async def cmd_basis(args: argparse.Namespace) -> int:
         safety_margin_bps=args.safety_margin_bps,
         taker_bps={"spot": args.spot_taker_bps, "perp": args.perp_taker_bps},
         allowed_directions=allowed_directions,
+        require_funding_settlement=args.require_funding,
     )
     engine = CrossExchangeArb(instruments, config)
     _replay_two_market_capture(path, engine, instruments, args.sample_ms)
@@ -2382,7 +2383,8 @@ async def cmd_basis(args: argparse.Namespace) -> int:
         f"  信号   : 過去{args.lookback_minutes:g}分のlog(perp/spot) / "
         f"|z|≥{args.entry_z:g}で建て、|z|≤{args.exit_z:g}で閉じる\n"
         f"  方向   : {'現物ショートも許可' if args.allow_spot_short else '現物買い・先物売りのみ'}\n"
-        f"  期限   : {args.max_hold_hours:g}時間\n"
+        f"  期限   : {args.max_hold_hours:g}時間"
+        f"{' / Funding通過まで平均回帰決済を禁止' if args.require_funding else ''}\n"
         f"  費用   : 現物 {args.spot_taker_bps:g}bps + 先物 {args.perp_taker_bps:g}bpsを"
         "建玉・手仕舞いの4脚に計上\n"
         f"  執行   : depth {args.depth}段の実板歩き / 両板age≤{args.max_age_ms:g}ms / "
@@ -2396,8 +2398,10 @@ async def cmd_basis(args: argparse.Namespace) -> int:
         f"\n  観測 {stats.observations:,} / 同時に新鮮 {stats.fresh:,} / "
         f"学習窓完成 {stats.warm:,}\n"
         f"  信号 {stats.signals:,} / コスト不足 {stats.rejected_cost:,} / "
-        f"現物ショート不可 {stats.rejected_direction:,} / 板不足 {stats.rejected_depth:,} / "
-        f"品質不良 {stats.rejected_quality:,} / 建玉 {stats.entries:,}"
+        f"現物ショート不可 {stats.rejected_direction:,} / Fundingなし {stats.rejected_funding:,} / "
+        f"板不足 {stats.rejected_depth:,} / "
+        f"品質不良 {stats.rejected_quality:,} / 建玉 {stats.entries:,}\n"
+        f"  Funding評価 {stats.funding_candidates:,} / 決済通過 {stats.funding_settlements:,}"
     )
     if stats.reject_codes:
         console.print(
@@ -2426,10 +2430,17 @@ async def cmd_basis(args: argparse.Namespace) -> int:
     if stats.warm == 0:
         console.print("\n[yellow][bold]判定: 学習窓が完成していません。[/bold][/yellow]")
     elif trades == 0:
-        console.print(
-            "\n[yellow][bold]判定: ベーシスとFundingは往復全コストを超えませんでした。"
-            "[/bold][/yellow]"
-        )
+        if stats.funding_candidates == 0:
+            console.print(
+                "\n[yellow][bold]判定: 短期ベーシスは往復全コストを超えませんでした。"
+                "[/bold][/yellow]\n"
+                "[dim]保有期限内のFundingが0件なので、Funding戦略はまだ未判定です。[/dim]"
+            )
+        else:
+            console.print(
+                "\n[yellow][bold]判定: ベーシスと予想Fundingは往復全コストを"
+                "超えませんでした。[/bold][/yellow]"
+            )
     elif trades < 30:
         console.print("\n[yellow][bold]判定: 30取引未満のため未判定です。[/bold][/yellow]")
     elif summary["net_quote"] <= 0:
@@ -2448,6 +2459,8 @@ async def cmd_capture(args: argparse.Namespace) -> int:
     if args.spot_only and args.perp_only:
         console.print("[red]--spot-only と --perp-only は同時に指定できません。[/red]")
         return 2
+    if args.basis_sample_ms < 0 or args.basis_depth <= 0:
+        raise ConfigError("--basis-sample-msは0以上、--basis-depthは1以上で指定してください。")
 
     sources: dict = {}
     specs: dict = {}
@@ -2493,7 +2506,13 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         console.print(f"[dim]perp  tick={perp.tick_size} lot={perp.lot_size}[/dim]")
 
     out = Path(args.out)
-    capture = MultiCapture(sources, out)
+    basis_sample_ms = args.basis_sample_ms if args.basis_sample_ms > 0 else None
+    capture = MultiCapture(
+        sources,
+        out,
+        basis_sample_ms=basis_sample_ms,
+        basis_depth=args.basis_depth,
+    )
 
     console.rule(f"[bold cyan]{args.symbol.upper()} を記録")
     console.print(
@@ -2501,6 +2520,11 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         f"  対象   : {', '.join(sources)}\n"
         f"  停止   : "
         + (f"{args.duration:.0f}秒後" if args.duration else "Ctrl-C まで")
+        + (
+            f"\n  圧縮   : ベーシス用 {args.basis_sample_ms:g}ms間隔・depth {args.basis_depth}段"
+            if basis_sample_ms is not None
+            else ""
+        )
         + "\n  [dim]取引所時刻と受信時刻の両方を記録します。前者は市場が何をしたか、\n"
         "  後者は戦略が何を知り得たか。片方だけでは後から問い直せません。[/dim]\n"
     )
@@ -2526,7 +2550,13 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         console.print("\n[yellow]中断しました。[/yellow]")
         return 130
 
-    meta = write_meta(out, specs)
+    meta = write_meta(
+        out,
+        specs,
+        capture_mode="basis_compact" if basis_sample_ms is not None else "full",
+        basis_sample_ms=basis_sample_ms,
+        basis_depth=args.basis_depth if basis_sample_ms is not None else None,
+    )
 
     console.print()
     console.rule("[bold cyan]記録完了")
@@ -3853,6 +3883,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_basis.add_argument("--entry-z", type=float, default=2.0)
     p_basis.add_argument("--exit-z", type=float, default=0.25)
     p_basis.add_argument("--max-hold-hours", type=float, default=8.0)
+    p_basis.add_argument(
+        "--require-funding",
+        action="store_true",
+        help="次回Fundingが期限内にある候補だけ入り、決済通過前の平均回帰Exitを禁止",
+    )
     p_basis.add_argument("--min-expected-net-bps", type=float, default=1.0)
     p_basis.add_argument("--spot-taker-bps", type=float, default=10.0)
     p_basis.add_argument("--perp-taker-bps", type=float, default=4.0)
@@ -3878,6 +3913,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--max-events", type=int, default=None)
     p_cap.add_argument("--spot-depth-ms", type=int, default=100, choices=(100, 1000))
     p_cap.add_argument("--perp-depth-ms", type=int, default=100, choices=(100, 250, 500))
+    p_cap.add_argument(
+        "--basis-sample-ms",
+        type=float,
+        default=0.0,
+        help="0より大きいと板を指定間隔のfull snapshotへ圧縮し、Funding用データだけ保存",
+    )
+    p_cap.add_argument("--basis-depth", type=int, default=20, help="圧縮snapshotの板段数")
     p_cap.add_argument("--oi-interval", type=float, default=15.0, help="建玉残高の取得間隔（秒）")
     p_cap.add_argument("--spot-only", action="store_true")
     p_cap.add_argument("--perp-only", action="store_true")

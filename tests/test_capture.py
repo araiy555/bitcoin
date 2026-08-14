@@ -324,6 +324,34 @@ async def test_capture_writes_the_versioned_common_envelope(tmp_path):
     assert row["capture_id"] in row["connection_id"]
 
 
+@pytest.mark.asyncio
+async def test_basis_compact_mode_keeps_sampled_books_and_funding_only(tmp_path):
+    out = tmp_path / "compact.jsonl"
+    events = [
+        FeedStatus("live", ""),
+        DepthSnapshot(bids=((100, 5),), asks=((101, 5),), last_update_id=1, ts_ns=10),
+        DepthDelta(bids=((100, 7),), asks=(), first_id=2, final_id=2, ts_ns=20),
+        TradeTick(price=100, qty=1, aggressor=Side.BUY, ts_ns=30),
+        MarkPrice(mark=100, index=100, funding_rate=0.0001, next_funding_ns=50, ts_ns=40),
+        OpenInterest(lots=99, ts_ns=50),
+        Liquidation(price=100, qty=1, side=Side.SELL, ts_ns=60),
+    ]
+    feed = ScriptedFeed(PERP, events, gap_s=0.005, hang=True)
+    result = await MultiCapture(
+        {"perp": feed},
+        out,
+        basis_sample_ms=1.0,
+        basis_depth=20,
+    ).run(duration_s=0.08)
+
+    rows = read_rows(out)
+    assert {row["k"] for row in rows} == {"status", "snapshot", "mark"}
+    assert all(row["k"] not in {"delta", "trade", "oi", "liquidation"} for row in rows)
+    snapshots = [row for row in rows if row["k"] == "snapshot"]
+    assert snapshots[-1]["bids"] == [[100, 7]]
+    assert result.total_events == len(rows)
+
+
 # --------------------------------------------------------------------- meta
 
 

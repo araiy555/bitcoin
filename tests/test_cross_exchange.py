@@ -52,7 +52,9 @@ def warm(engine: CrossExchangeArb):
         update(engine, seconds, price)
 
 
-def basis_engine(*, allow_spot_short: bool = False) -> CrossExchangeArb:
+def basis_engine(
+    *, allow_spot_short: bool = False, require_funding: bool = False
+) -> CrossExchangeArb:
     return CrossExchangeArb(
         {"perp": INST, "spot": INST},
         CrossArbConfig(
@@ -67,6 +69,7 @@ def basis_engine(*, allow_spot_short: bool = False) -> CrossExchangeArb:
             depth=5,
             taker_bps={"spot": 0.0, "perp": 0.0},
             allowed_directions=None if allow_spot_short else (("spot", "perp"),),
+            require_funding_settlement=require_funding,
         ),
     )
 
@@ -209,6 +212,35 @@ def test_basis_expected_funding_receipt_improves_entry_net():
     assert strategy.position is not None
     # A positive funding rate is received by the short perpetual leg.
     assert strategy.position.expected_net_bps > 900.0
+    assert strategy.stats.funding_candidates == 1
+
+
+def test_required_funding_rejects_missing_settlement_and_cannot_exit_before_it():
+    missing = basis_engine(require_funding=True)
+    warm_basis(missing)
+    update_basis(missing, 10, 110.0)
+    assert missing.position is None
+    assert missing.stats.reject_codes["FUNDING_UNAVAILABLE"] == 1
+
+    strategy = basis_engine(require_funding=True)
+    warm_basis(strategy)
+    now = BASE_NS + int(9 * 1e9)
+    settle = BASE_NS + int(11 * 1e9)
+    strategy.apply("perp", MarkPrice(1000, 1000, 0.001, settle, now), now)
+    update_basis(strategy, 10, 110.0)
+    assert strategy.position is not None
+    # Mean reversion alone cannot close a trade sold as a funding trade.
+    update_basis(strategy, 10.5, 100.0)
+    assert strategy.position is not None
+
+    strategy.apply(
+        "perp",
+        MarkPrice(1000, 1000, 0.001, settle + int(8 * 3600 * 1e9), settle),
+        settle,
+    )
+    update_basis(strategy, 12, 100.0)
+    assert strategy.position is None
+    assert strategy.stats.funding_settlements == 1
 
 
 @pytest.mark.asyncio

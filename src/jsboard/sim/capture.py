@@ -30,7 +30,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..feed.base import Feed, FeedEvent, FeedStatus
+from ..core.market import MarketView
+from ..feed.base import DepthDelta, DepthSnapshot, Feed, FeedEvent, FeedStatus, MarkPrice
 from ..feed.replay import RX_KEY, SOURCE_KEY, _encode
 
 
@@ -78,6 +79,8 @@ class MultiCapture:
         *,
         on_event: Callable[[str, FeedEvent], None] | None = None,
         flush_every: int = 500,
+        basis_sample_ms: float | None = None,
+        basis_depth: int = 20,
     ) -> None:
         if not sources:
             raise ValueError("capture needs at least one source")
@@ -85,7 +88,60 @@ class MultiCapture:
         self.path = Path(path)
         self.on_event = on_event
         self.flush_every = flush_every
+        if basis_sample_ms is not None and basis_sample_ms <= 0:
+            raise ValueError("basis sample interval must be positive")
+        if basis_depth <= 0:
+            raise ValueError("basis depth must be positive")
+        self.basis_sample_ns = (
+            None if basis_sample_ms is None else int(basis_sample_ms * 1e6)
+        )
+        self.basis_depth = basis_depth
+        self._compact_views = {
+            name: MarketView(feed.instrument, depth=basis_depth)
+            for name, feed in sources.items()
+        }
+        self._compact_last_ns = {name: 0 for name in sources}
+        self._compact_update_id = {name: 0 for name in sources}
         self.stats: dict[str, SourceStats] = {name: SourceStats() for name in sources}
+
+    def _compact_basis_event(
+        self,
+        name: str,
+        event: FeedEvent,
+        monotonic_ns: int,
+    ) -> FeedEvent | None:
+        """Keep only sampled executable books and perpetual funding state.
+
+        A funding/basis hold lasts hours, so storing every 100ms delta and
+        every public trade is wasteful.  The complete live book is still
+        rebuilt here; once per interval it is emitted as a full depth
+        snapshot, which remains independently replayable.
+        """
+        if self.basis_sample_ns is None:
+            return event
+        if isinstance(event, (DepthSnapshot, DepthDelta)):
+            view = self._compact_views[name]
+            view.apply(event)
+            if isinstance(event, DepthSnapshot):
+                self._compact_update_id[name] = event.last_update_id
+            else:
+                self._compact_update_id[name] = event.final_id
+            last_ns = self._compact_last_ns[name]
+            if last_ns and monotonic_ns - last_ns < self.basis_sample_ns:
+                return None
+            snapshot = view.snapshot(self.basis_depth)
+            if not snapshot.bids or not snapshot.asks:
+                return None
+            self._compact_last_ns[name] = monotonic_ns
+            return DepthSnapshot(
+                bids=tuple((level.price, level.qty) for level in snapshot.bids),
+                asks=tuple((level.price, level.qty) for level in snapshot.asks),
+                last_update_id=self._compact_update_id[name],
+                ts_ns=getattr(event, "ts_ns", 0),
+            )
+        if isinstance(event, (MarkPrice, FeedStatus)):
+            return event
+        return None
 
     @staticmethod
     def _source_context(name: str, feed: Feed) -> dict[str, str]:
@@ -151,6 +207,9 @@ class MultiCapture:
                         continue
 
                     name, event, received_ns, monotonic_ns = item
+                    event = self._compact_basis_event(name, event, monotonic_ns)
+                    if event is None:
+                        continue
                     row = _encode(event)
                     row[SOURCE_KEY] = name
                     row[RX_KEY] = received_ns
@@ -216,12 +275,14 @@ class MultiCapture:
                     await aclose()
 
 
-def write_meta(path: Path, sources: dict[str, dict]) -> Path:
+def write_meta(path: Path, sources: dict[str, dict], **metadata) -> Path:
     """Store each source's instrument spec beside the capture.
 
     Without it a replay has to guess tick and lot sizes, and a wrong guess
     silently rescales every price in the file.
     """
     meta_path = path.with_suffix(path.suffix + ".meta.json")
-    meta_path.write_text(json.dumps({"sources": sources}, indent=2), encoding="utf-8")
+    meta_path.write_text(
+        json.dumps({"sources": sources, **metadata}, indent=2), encoding="utf-8"
+    )
     return meta_path

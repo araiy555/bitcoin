@@ -4,8 +4,8 @@
 経緯と実測結果は README にある。ここは「何がどう動くか」の一次資料。
 
 - 対象: Binance 現物 + Binance USDⓈ-M 無期限先物 + Bybit USDT無期限先物
-- 実装: Python 3.11+、22,696 行（src 13,549 / tests 7,828 / tools 1,319）
-- テスト: 636 件
+- 実装: Python 3.11+、22,887 行（src 13,680 / tests 7,888 / tools 1,319）
+- テスト: 638 件
 - **実発注の経路は存在しない。** API キーを受け取る箇所も、取引所へ注文を
   送る関数も無い。全コマンドは公開データの読み取りのみ。
 
@@ -28,6 +28,9 @@
   現物買い・先物売りを既定方向として、4脚の実板価格、全手数料、保有期限内の
   予想Funding、執行余白がすべて残る候補だけをペーパー建玉する。現物ショートは
   `--allow-spot-short` を明示しない限り `BORROW_UNAVAILABLE` で拒否する
+- `capture --basis-sample-ms 1000` は受信する全板差分から内部板を更新し続けながら、
+  1秒ごとのdepth 20 full snapshot、feed状態、Mark/Fundingだけを保存する。長時間の
+  Funding検証で不要な約定、OI、清算、個々の板差分を捨て、録画容量を抑える
 - `pair` / `dealer` / 即時hedgeも共通板歩きと品質・コスト判定を使用する
 
 `xarb` の追加オプション:
@@ -44,10 +47,18 @@ jsboard xarb capture.jsonl \
 
 ```bash
 jsboard basis capture.jsonl \
-  --lookback-minutes 30 --max-hold-hours 8 \
+  --lookback-minutes 30 --max-hold-hours 8 --require-funding \
   --spot-taker-bps 10 --perp-taker-bps 4 \
   --hedge-latency-buffer-bps 1 \
   --fill-model-buffer-bps 1 --safety-margin-bps 1
+```
+
+長時間Funding用の圧縮録画:
+
+```bash
+jsboard capture --symbol BTCUSDT --duration 32400 \
+  --basis-sample-ms 1000 --basis-depth 20 \
+  --out btc-basis-funding.jsonl
 ```
 
 この段階ではParquet変換、先行遅行、三角裁定、実注文はまだ実装していない。
