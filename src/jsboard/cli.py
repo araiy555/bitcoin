@@ -42,6 +42,7 @@ from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig
 from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
+from .mm.toxicity import ToxicityConfig, ToxicityGate
 from .net import describe_tls_error, make_session
 from .research import dynamic, triage
 from .research.archive import days_ending, fetch_day, load_seconds
@@ -237,6 +238,16 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
         quoter=quoter,
         fair_value=FairValueEstimator(FairValueConfig()),
         risk=risk,
+        toxicity=ToxicityGate(
+            ToxicityConfig(
+                threshold=args.toxicity_threshold,
+                pull_threshold=args.toxicity_pull_threshold,
+                depth_levels=args.toxicity_depth,
+                flow_weight=args.toxicity_flow_weight,
+                book_weight=args.toxicity_book_weight,
+                microprice_weight=args.toxicity_microprice_weight,
+            )
+        ),
         config=StrategyConfig(requote_interval_ms=args.requote_ms),
     )
 
@@ -389,6 +400,18 @@ def _reach_lines(mm: MarketMaker, s: dict) -> list[str]:
     ]
 
 
+def _toxicity_line(s: dict) -> str | None:
+    t = s.get("toxicity") or {}
+    if not t or t.get("threshold", 0.0) <= 0:
+        return None
+    return (
+        f"  毒性フィルター : threshold {t['threshold']:.2f}"
+        f"  片側化 {t['one_sided_share'] * 100:.1f}%"
+        f"  全取消 {t['pull_share'] * 100:.1f}%"
+        f"  最終score {t['last_score']:+.2f}"
+    )
+
+
 def _print_report(mm: MarketMaker, result) -> None:
     s = mm.summary()
     inst = mm.instrument
@@ -412,6 +435,7 @@ def _print_report(mm: MarketMaker, result) -> None:
         _capture_line(mm, s),
         *_attribution_lines(mm, s),
         _markout_line(s),
+        _toxicity_line(s),
         *_reach_lines(mm, s),
     ):
         if line:
@@ -639,7 +663,13 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
     # multiply into five quote-distance variants.
     distances = args.distances
     if distances is None and not any(
-        (args.sizes, getattr(args, "requotes", ""), getattr(args, "latencies", ""), args.axis)
+        (
+            args.sizes,
+            getattr(args, "requotes", ""),
+            getattr(args, "latencies", ""),
+            getattr(args, "toxicity_thresholds", ""),
+            args.axis,
+        )
     ):
         distances = "0,1,2,4,none"
     if distances:
@@ -650,6 +680,8 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
         axes["requote_ms"] = _grid(args.requotes, float)
     if getattr(args, "latencies", ""):
         axes["latency_ms"] = _grid(args.latencies, float)
+    if getattr(args, "toxicity_thresholds", ""):
+        axes["toxicity_threshold"] = _grid(args.toxicity_thresholds, float)
 
     for spec in args.axis or []:
         name, sep, values = spec.partition("=")
@@ -725,6 +757,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     markout = s.get("markout") or []
     bps = mm.attribution.per_round_trip_bps(matched)
     a = s.get("attribution") or {}
+    tox = s.get("toxicity") or {}
     return {
         "fills": int(s["fills"]),
         "capture_bps": capture,
@@ -742,6 +775,8 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "markout_10s": _markout_at(markout, 10.0),
         "exposed_share": a.get("exposed_share", math.nan) * 100.0,
         "max_maker_bps": mm.attribution.max_maker_bps(matched),
+        "tox_one_sided_pct": tox.get("one_sided_share", 0.0) * 100.0,
+        "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
         **{
             f"age_{i}": value
             for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
@@ -833,6 +868,8 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("1-10s", "age_2", "{:+.2f}"),
         ("10s+", "age_3", "{:+.2f}"),
         ("許容料率", "max_maker_bps", "{:+.2f}"),
+        ("毒性片側%", "tox_one_sided_pct", "{:.0f}"),
+        ("毒性全取消%", "tox_pull_pct", "{:.0f}"),
     ]
 
     def cell(row: dict, key: str, fmt: str) -> str:
@@ -2284,6 +2321,24 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
     mm.add_argument("--requote-ms", type=float, default=250.0)
 
+    toxicity = p.add_argument_group("selective MM toxicity gate")
+    toxicity.add_argument(
+        "--toxicity-threshold",
+        type=float,
+        default=0.0,
+        help="片側を止める圧力score。0で無効、研究開始値は0.4",
+    )
+    toxicity.add_argument(
+        "--toxicity-pull-threshold",
+        type=float,
+        default=0.90,
+        help="両側を全取消する絶対score",
+    )
+    toxicity.add_argument("--toxicity-depth", type=int, default=5)
+    toxicity.add_argument("--toxicity-flow-weight", type=float, default=0.50)
+    toxicity.add_argument("--toxicity-book-weight", type=float, default=0.30)
+    toxicity.add_argument("--toxicity-microprice-weight", type=float, default=0.20)
+
     risk = p.add_argument_group("risk")
     risk.add_argument("--max-notional", type=float, default=250_000.0)
     risk.add_argument("--max-drawdown", type=float, default=2_000.0)
@@ -2388,6 +2443,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--latencies",
         default="",
         help="注文到着遅延msの一覧（例: 20,10,5,2）",
+    )
+    p_sw.add_argument(
+        "--toxicity-thresholds",
+        default="",
+        help="選択的MMの片側停止score一覧（例: 0,0.2,0.4,0.6,0.8）",
     )
     p_sw.add_argument(
         "--axis",
