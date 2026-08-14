@@ -729,6 +729,27 @@ def _prepare_sweep_defaults(
     return changed
 
 
+def _prepare_pair_defaults(
+    maker: Instrument, hedge: Instrument, args: argparse.Namespace
+) -> list[str]:
+    """Choose a size representable on both legs of a paired trade.
+
+    A quantity valid on the maker venue can still round to zero on the hedge
+    venue when their lot sizes differ.  Silently reporting zero opportunities
+    in that case is a configuration error disguised as a market result.
+    """
+    changed: list[str] = []
+    if maker.to_lots(args.size) <= 0 or hedge.to_lots(args.size) <= 0:
+        args.size = str(max(maker.lot_size, hedge.lot_size) * 100)
+        changed.append(f"size={args.size}")
+
+    size_lots = maker.to_lots(args.size)
+    if maker.to_lots(args.max_position) < size_lots:
+        args.max_position = str(Decimal(args.size) * 10)
+        changed.append(f"max_position={args.max_position}")
+    return changed
+
+
 def _label(name: str, value) -> str:
     if name == "max_distance":
         return "touch" if value == 0 else ("none" if value is None else str(value))
@@ -1285,6 +1306,17 @@ async def cmd_hedge(args: argparse.Namespace) -> int:
             )
     maker_inst = _instrument_from_spec(sources[args.maker_source])
     hedge_inst = _instrument_from_spec(sources[args.hedge_source])
+    for source, instrument in (
+        (args.maker_source, maker_inst),
+        (args.hedge_source, hedge_inst),
+    ):
+        if not instrument.base or not instrument.quote:
+            raise ConfigError(
+                f"{source} の銘柄情報が不完全です（base/quoteなし）。"
+                "exchangeInfo取得失敗時の代替値で録画された可能性があります。\n"
+                "  この録画では相対価値を判定できません。現物と先物の両方に上場する"
+                "銘柄で capture し直してください。"
+            )
 
     console.print(
         f"{path.name}\n"
@@ -1427,6 +1459,17 @@ async def cmd_pair(args: argparse.Namespace) -> int:
 
     maker_inst = _instrument_from_spec(sources[args.maker_source])
     hedge_inst = _instrument_from_spec(sources[args.hedge_source])
+    for source, instrument in (
+        (args.maker_source, maker_inst),
+        (args.hedge_source, hedge_inst),
+    ):
+        if not instrument.base or not instrument.quote:
+            raise ConfigError(
+                f"{source} の銘柄情報が不完全です（base/quoteなし）。"
+                "exchangeInfo取得失敗時の代替値で録画された可能性があります。\n"
+                "  この録画では相対価値を判定できません。現物と先物の両方に上場する"
+                "銘柄で capture し直してください。"
+            )
     if maker_inst.base and hedge_inst.base and maker_inst.base != hedge_inst.base:
         raise ConfigError(
             f"ベース資産が違います: {maker_inst.base} / {hedge_inst.base}。"
@@ -1438,7 +1481,7 @@ async def cmd_pair(args: argparse.Namespace) -> int:
             "為替換算なしでは比較できません。"
         )
 
-    adjusted = _prepare_sweep_defaults(maker_inst, args, {})
+    adjusted = _prepare_pair_defaults(maker_inst, hedge_inst, args)
     if adjusted:
         console.print(
             "[dim]録画銘柄のlotに合わせて未指定値を自動調整: "
@@ -1908,6 +1951,15 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         try:
             spot = await fetch_instrument(args.symbol)
         except Exception as exc:  # noqa: BLE001
+            if args.symbol.upper() not in KNOWN_INSTRUMENTS:
+                console.print(
+                    f"[red]spot exchangeInfo failed: {exc}[/red]\n"
+                    f"[yellow]{args.symbol.upper()} の正しい現物tick/lotを確認できないため、"
+                    "BTC用の代替値では録画しません。現物未上場の可能性もあります。\n"
+                    "  現物–先物pairを調べるなら両方に上場する銘柄を指定してください。"
+                    "先物だけなら --perp-only を使えます。[/yellow]"
+                )
+                return 1
             console.print(f"[yellow]spot exchangeInfo unavailable ({exc}); using built-in[/yellow]")
             spot = build_instrument(args.symbol, None, None)
         sources["spot"] = BinanceFeed(spot, depth_ms=args.spot_depth_ms)

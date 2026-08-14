@@ -612,6 +612,10 @@ jsboard sweep us.jsonl --source perp \
 - 見えている板で全数量をヘッジできない注文の拒否
 
 まず現物と先物を同じ時系列へ記録し、その録画で判定する。
+銘柄はBinanceの通常現物と無期限先物の**両方**に上場している必要がある。
+先物だけの銘柄を指定した場合、現物tick/lotをBTCの代替値で捏造せず `capture` を
+停止する。古い録画でメタデータの `base` / `quote` が欠けている場合も `pair` は
+市場結果を0件と表示せず、録画不正として停止する。
 
 ```bash
 .venv/bin/jsboard capture --symbol BTCUSDT --duration 3600 --out btc-pair.jsonl

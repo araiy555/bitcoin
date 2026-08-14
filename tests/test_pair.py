@@ -1,6 +1,7 @@
 """Cross-market fair value and the pre-trade executable-edge gate."""
 
 import json
+from argparse import Namespace
 from decimal import Decimal
 
 import pytest
@@ -97,6 +98,41 @@ def test_filter_keeps_only_the_side_above_the_net_threshold():
     assert g.stats.quotes_tested == 2
     assert g.stats.quotes_passed == 1
     assert g.stats.pass_share == pytest.approx(0.5)
+
+
+def test_pair_defaults_must_be_representable_on_the_hedge_leg():
+    from jsboard.cli import _prepare_pair_defaults
+
+    tiny = Instrument("PAIR", Decimal("0.01"), Decimal("0.00001"), "P", "U")
+    coarse = Instrument("PAIR", Decimal("0.000001"), Decimal("1"), "P", "U")
+    args = Namespace(size="0.01", max_position="0.10")
+    changed = _prepare_pair_defaults(tiny, coarse, args)
+    assert args.size == "100"
+    assert args.max_position == "1000"
+    assert changed == ["size=100", "max_position=1000"]
+
+
+@pytest.mark.asyncio
+async def test_pair_rejects_fallback_metadata_without_base_or_quote(tmp_path):
+    from jsboard.cli import ConfigError, build_parser
+
+    path = tmp_path / "bad.jsonl"
+    path.write_text("")
+    path.with_suffix(".jsonl.meta.json").write_text(json.dumps({
+        "sources": {
+            "spot": {
+                "symbol": "USUSDT", "tick_size": "0.01", "lot_size": "0.00001",
+                "base": "", "quote": "",
+            },
+            "perp": {
+                "symbol": "USUSDT", "tick_size": "0.000001", "lot_size": "1",
+                "base": "US", "quote": "USDT",
+            },
+        }
+    }))
+    args = build_parser().parse_args(["pair", str(path)])
+    with pytest.raises(ConfigError, match="銘柄情報が不完全"):
+        await args.func(args)
 
 
 @pytest.mark.asyncio

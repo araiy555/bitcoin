@@ -92,6 +92,21 @@ async def test_receive_time_is_stored_beside_exchange_time(tmp_path):
     assert row["rx_ns"] > 1_000_000_000_000_000  # a real wall-clock stamp
 
 
+@pytest.mark.asyncio
+async def test_unknown_spot_symbol_never_uses_btc_fallback_metadata(tmp_path, monkeypatch):
+    import jsboard.cli as cli
+
+    async def unavailable(_symbol):
+        raise RuntimeError("not listed")
+
+    monkeypatch.setattr(cli, "fetch_instrument", unavailable)
+    args = cli.build_parser().parse_args([
+        "capture", "--symbol", "UNKNOWNUSDT", "--out", str(tmp_path / "bad.jsonl")
+    ])
+    assert await args.func(args) == 1
+    assert not (tmp_path / "bad.jsonl").exists()
+
+
 def test_timed_reader_uses_receive_time_and_falls_back_for_old_rows(tmp_path):
     path = tmp_path / "timed.jsonl"
     rows = [
