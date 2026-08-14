@@ -598,6 +598,44 @@ jsboard sweep us.jsonl --source perp \
 時点で学習内なので、設定を固定して別時間の録画で再検証するまで採用しない。
 
 
+## Binance dealer — spot/perpの4経路を自動で選ぶ
+
+`pair` はメイク市場とヘッジ市場を手で指定して検証します。`dealer` は同じBinanceの
+spot/perp録画から、次の4経路を各時点で比較し、建玉時コスト後edgeが最大の経路だけを
+選びます。
+
+- spotで買い指値 → perpで売りヘッジ
+- spotで売り指値 → perpで買いヘッジ
+- perpで買い指値 → spotで売りヘッジ
+- perpで売り指値 → spotで買いヘッジ
+
+評価には、現在のmaker気配、hedge板の実際の板歩き、spot/perp別のmaker・taker手数料、
+板の鮮度、次回funding予測を含めます。
+
+```bash
+.venv/bin/jsboard capture \
+  --symbol BTCUSDT \
+  --duration 3600 \
+  --out btc-dealer.jsonl
+
+.venv/bin/jsboard dealer btc-dealer.jsonl \
+  --size-base 0.001 \
+  --spot-maker-bps 10 \
+  --spot-taker-bps 10 \
+  --perp-maker-bps 2 \
+  --perp-taker-bps 4 \
+  --dealer-edge-bps 1 \
+  --max-age-ms 250 \
+  --funding-horizon-h 8 \
+  --sample-ms 100 \
+  --plain
+```
+
+手数料は必ず自分のBinanceアカウントの実効料率へ合わせてください。fundingは次回決済を
+またぐ想定の予測値で、確定値ではありません。また、`dealer` の「候補」と「最良選択」は
+発注前の経路判定であり、約定数や利益ではありません。キュー待ち、未約定、約定後のbasis
+変化まで含む採否は、選ばれた方向を `pair` で再生して確認します。
+
 ## 相対価値MM — ヘッジできる価格から先に注文を作る
 
 `hedge` は単体市場で出した注文を約定後にヘッジする診断だった。`pair` は順序が
