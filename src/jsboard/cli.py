@@ -665,6 +665,33 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
     return axes
 
 
+def _prepare_sweep_defaults(
+    instrument: Instrument, args: argparse.Namespace, axes: dict[str, list]
+) -> list[str]:
+    """Make generic BTC defaults executable for the recorded instrument.
+
+    The common parser defaults to 0.01 units with a 0.10 position cap. That is
+    valid for BTC but rounds to zero on instruments such as USUSDT whose lot is
+    one whole token. A sweep should compare its requested axes, not skip every
+    row because an unrelated generic default cannot be represented.
+
+    Explicit size/max-position sweep axes remain untouched so invalid requested
+    combinations are still rejected visibly by _check_sizes.
+    """
+    changed: list[str] = []
+    if "size" not in axes and instrument.to_lots(args.size) <= 0:
+        args.size = str(instrument.lot_size * 100)
+        changed.append(f"size={args.size}")
+
+    if (
+        "max_position" not in axes
+        and instrument.to_lots(args.max_position) < instrument.to_lots(args.size)
+    ):
+        args.max_position = str(Decimal(args.size) * 10)
+        changed.append(f"max_position={args.max_position}")
+    return changed
+
+
 def _label(name: str, value) -> str:
     if name == "max_distance":
         return "touch" if value == 0 else ("none" if value is None else str(value))
@@ -742,6 +769,14 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         raise ConfigError(
             "掃引する軸がありません。--distances / --requotes / --latencies / --axis "
             "のいずれかを指定してください。"
+        )
+
+    adjusted = _prepare_sweep_defaults(instrument, args, axes)
+    if adjusted:
+        console.print(
+            "[dim]録画銘柄のlotに合わせて未指定値を自動調整: "
+            + "  ".join(adjusted)
+            + "[/dim]"
         )
 
     names = list(axes)
