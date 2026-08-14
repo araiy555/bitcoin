@@ -38,6 +38,7 @@ from .feed import multi
 from .feed.base import DepthDelta, DepthSnapshot, Feed, TradeTick
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
+from .feed.bybit import BybitFeed
 from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged, iter_tagged_timed
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
@@ -69,6 +70,7 @@ from .research.scan import (
     watch,
 )
 from .sim.capture import MultiCapture, write_meta
+from .sim.cross_exchange import CrossArbConfig, CrossExchangeArb
 from .sim.dealer import BinanceDealer
 from .sim.hedge import HedgeConfig, Hedger
 from .sim.pair import CrossMarketFairValue, PairQuoteGate
@@ -166,6 +168,36 @@ async def fetch_futures_instrument(symbol: str) -> Instrument:
             quote=info["quoteAsset"],
         )
     raise RuntimeError(f"{wanted} is not listed on USDⓈ-M futures")
+
+
+async def fetch_bybit_instrument(symbol: str, category: str = "linear") -> Instrument:
+    """Read tick and quantity steps from Bybit V5 instrument metadata."""
+    import aiohttp
+
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    params = {"category": category, "symbol": symbol.upper()}
+    async with make_session() as session, session.get(
+        url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+    ) as resp:
+        resp.raise_for_status()
+        payload = await resp.json()
+    if payload.get("retCode") != 0:
+        raise RuntimeError(payload.get("retMsg") or "Bybit instruments-info failed")
+    rows = (payload.get("result") or {}).get("list") or []
+    if not rows:
+        raise RuntimeError(f"{symbol.upper()} is not listed on Bybit {category}")
+    info = rows[0]
+    tick = (info.get("priceFilter") or {}).get("tickSize")
+    lot = (info.get("lotSizeFilter") or {}).get("qtyStep")
+    if not tick or not lot:
+        raise RuntimeError(f"Bybit instrument info for {symbol.upper()} had no tick/lot")
+    return Instrument(
+        symbol=info["symbol"],
+        tick_size=Decimal(tick).normalize(),
+        lot_size=Decimal(lot).normalize(),
+        base=info.get("baseCoin", ""),
+        quote=info.get("quoteCoin", ""),
+    )
 
 
 class ConfigError(Exception):
@@ -2070,6 +2102,208 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_xcapture(args: argparse.Namespace) -> int:
+    """Record Binance and Bybit perpetual books on one receive-time clock."""
+    try:
+        binance = await fetch_futures_instrument(args.symbol)
+        bybit = await fetch_bybit_instrument(args.symbol, "linear")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]取引所の銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+    if binance.base != bybit.base or binance.quote != bybit.quote:
+        raise ConfigError(
+            f"同じ契約ではありません: Binance {binance.base}/{binance.quote}, "
+            f"Bybit {bybit.base}/{bybit.quote}"
+        )
+
+    sources = {
+        "binance": BinanceFuturesFeed(
+            binance,
+            depth_ms=args.binance_depth_ms,
+            open_interest_interval=60.0,
+            rest_fallback="never",
+        ),
+        "bybit": BybitFeed(bybit, category="linear", depth=args.bybit_depth),
+    }
+    specs = {
+        "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+        "bybit": {**_spec_dict(bybit, "perp"), "venue": "bybit"},
+    }
+    out = Path(args.out)
+    capture = MultiCapture(sources, out)
+    console.rule(f"[bold cyan]{args.symbol.upper()} 取引所間録画")
+    console.print(
+        f"  Binance: tick={binance.tick_size} lot={binance.lot_size}\n"
+        f"  Bybit  : tick={bybit.tick_size} lot={bybit.lot_size}\n"
+        f"  出力   : {out}\n"
+        f"  停止   : {args.duration:,.0f}秒後\n"
+        "  [dim]二つのWebSocketを同時に受信し、ローカル受信時刻順で保存します。[/dim]"
+    )
+
+    last_report = [time.monotonic()]
+
+    def on_event(_name, _event) -> None:
+        now = time.monotonic()
+        if now - last_report[0] < 10.0:
+            return
+        last_report[0] = now
+        parts = [
+            f"{name}[{st.status}] {st.events:,}"
+            for name, st in capture.stats.items()
+        ]
+        console.print(f"  [dim]{' | '.join(parts)}[/dim]")
+
+    capture.on_event = on_event
+    result = await capture.run(duration_s=args.duration, max_events=args.max_events)
+    meta = write_meta(out, specs)
+    console.rule("[bold cyan]取引所間録画完了")
+    console.print(
+        f"  時間     : {result.duration_s:,.1f}秒\n"
+        f"  イベント : {result.total_events:,}件\n"
+        f"  出力     : {out} ({out.stat().st_size / 1e6:,.1f} MB)\n"
+        f"  メタ     : {meta.name}"
+    )
+    for name, st in result.stats.items():
+        console.print(f"  {name}: {st.events:,}件 / 切断 {st.errors}回")
+    console.rule()
+    return 0
+
+
+async def cmd_xarb(args: argparse.Namespace) -> int:
+    """Replay a causal Binance/Bybit spread strategy with four real crosses."""
+    path = Path(args.path)
+    if not path.exists():
+        raise ConfigError(f"{path} がありません。先に xcapture を実行してください。")
+    meta_path = path.with_suffix(path.suffix + ".meta.json")
+    if not meta_path.exists():
+        raise ConfigError(f"{meta_path.name} がありません。xcaptureの録画が必要です。")
+    sources = json.loads(meta_path.read_text()).get("sources") or {}
+    if not {"binance", "bybit"}.issubset(sources):
+        raise ConfigError("xarbにはbinanceとbybitを同時に含むxcapture録画が必要です。")
+    instruments = {
+        source: _instrument_from_spec(sources[source]) for source in ("binance", "bybit")
+    }
+    if any(value < 0 for value in (args.binance_taker_bps, args.bybit_taker_bps)):
+        raise ConfigError("taker手数料は0以上で指定してください。")
+    if args.sample_ms < 0:
+        raise ConfigError("--sample-msは0以上で指定してください。")
+    config = CrossArbConfig(
+        size_base=args.size_base,
+        lookback_s=args.lookback_minutes * 60.0,
+        min_samples=args.min_samples,
+        entry_z=args.entry_z,
+        exit_z=args.exit_z,
+        max_hold_s=args.max_hold_minutes * 60.0,
+        min_expected_net_bps=args.min_expected_net_bps,
+        max_age_ms=args.max_age_ms,
+        depth=args.depth,
+        taker_bps={"binance": args.binance_taker_bps, "bybit": args.bybit_taker_bps},
+    )
+    engine = CrossExchangeArb(instruments, config)
+    interval_ns = int(args.sample_ms * 1e6)
+    last_eval_ns = 0
+    for source, received_ns, event in iter_tagged_timed(path):
+        if source not in instruments:
+            continue
+        observable_ns = received_ns or getattr(event, "ts_ns", 0)
+        if received_ns:
+            event = replace(event, ts_ns=received_ns)
+        engine.apply(source, event, observable_ns)
+        if observable_ns and observable_ns - last_eval_ns < interval_ns:
+            continue
+        engine.evaluate()
+        last_eval_ns = observable_ns
+    engine.finalize()
+    summary = engine.summary()
+
+    console.rule("[bold cyan]取引所間Zスコア — 実板・往復全コスト replay")
+    console.print(
+        f"  データ : {path.name}\n"
+        f"  契約   : Binance/Bybit {instruments['binance'].symbol} perpetual\n"
+        f"  数量   : {args.size_base:g} {instruments['binance'].base}\n"
+        f"  信号   : 過去{args.lookback_minutes:g}分のlog価格差 / "
+        f"|z|≥{args.entry_z:g}で建て、|z|≤{args.exit_z:g}で閉じる\n"
+        f"  期限   : {args.max_hold_minutes:g}分\n"
+        f"  費用   : Binance {args.binance_taker_bps:g}bps + "
+        f"Bybit {args.bybit_taker_bps:g}bpsを建玉・手仕舞いの4脚すべてに計上\n"
+        f"  執行   : depth {args.depth}段の実板歩き / 両板age≤{args.max_age_ms:g}ms\n"
+        "  funding: 決済直前に観測できた予測率を、決済時刻通過時だけ計上"
+    )
+
+    stats = engine.stats
+    console.print(
+        f"\n  観測 {stats.observations:,} / 同時に新鮮 {stats.fresh:,} / "
+        f"学習窓完成 {stats.warm:,}\n"
+        f"  信号 {stats.signals:,} / コスト不足で拒否 {stats.rejected_cost:,} / "
+        f"板不足で拒否 {stats.rejected_depth:,} / 建玉 {stats.entries:,}"
+    )
+    if engine.trades:
+        rows = engine.trades[-20:]
+        if args.plain:
+            console.print("long\tshort\tentry_z\texit_z\thold_s\texpected\tnet_bps\treason")
+            for trade in rows:
+                console.print(
+                    f"{trade.long_source}\t{trade.short_source}\t{trade.entry_z:+.2f}\t"
+                    f"{trade.exit_z:+.2f}\t{trade.hold_s:.1f}\t"
+                    f"{trade.expected_net_bps:+.2f}\t{trade.net_bps:+.2f}\t{trade.exit_reason}",
+                    highlight=False,
+                )
+        else:
+            table = Table(title="直近20取引")
+            for label in ("long", "short", "entry z", "exit z", "秒", "予想bps", "実現bps", "理由"):
+                table.add_column(label, justify="right")
+            for trade in rows:
+                table.add_row(
+                    trade.long_source,
+                    trade.short_source,
+                    f"{trade.entry_z:+.2f}",
+                    f"{trade.exit_z:+.2f}",
+                    f"{trade.hold_s:.1f}",
+                    f"{trade.expected_net_bps:+.2f}",
+                    f"{trade.net_bps:+.2f}",
+                    trade.exit_reason,
+                )
+            console.print(table)
+
+    console.print(
+        f"\n  完了取引 : {int(summary['trades']):,}\n"
+        f"  Gross    : {summary['gross_quote']:+.4f} USDT\n"
+        f"  Funding  : {summary['funding_quote']:+.4f} USDT\n"
+        f"  手数料   : {summary['fees_quote']:.4f} USDT\n"
+        f"  Net      : {summary['net_quote']:+.4f} USDT / {summary['net_bps']:+.2f}bps\n"
+        f"  勝率     : {summary['win_rate'] * 100:.1f}%\n"
+        f"  最大DD   : {summary['max_drawdown_quote']:.4f} USDT"
+    )
+    trades = int(summary["trades"])
+    if stats.warm == 0:
+        console.print(
+            "\n[yellow][bold]判定: 学習窓が完成していません。[/bold][/yellow]\n"
+            f"[dim]{args.lookback_minutes:g}分より十分長い録画が必要です。[/dim]"
+        )
+    elif trades == 0:
+        console.print(
+            "\n[yellow][bold]判定: Zスコアの歪みは往復全コストを超えませんでした。[/bold][/yellow]\n"
+            "[dim]閾値を下げて約定を捏造せず、この期間は取引なしです。[/dim]"
+        )
+    elif trades < 30:
+        console.print(
+            "\n[yellow][bold]判定: サンプル不足です。[/bold][/yellow]\n"
+            "[dim]黒字でも採用せず、別時間を含む長時間録画で30取引以上を確認します。[/dim]"
+        )
+    elif summary["net_quote"] <= 0:
+        console.print("\n[red][bold]判定: 往復全コスト後で赤字のため不採用です。[/bold][/red]")
+    else:
+        console.print(
+            "\n[green][bold]判定: この録画では往復全コスト後プラスです。[/bold][/green]\n"
+            "[yellow]まだ同じ1録画の研究結果です。別期間で固定条件を再検証するまで実運用しません。[/yellow]"
+        )
+    console.rule()
+    return 0
+
+
 async def cmd_capture(args: argparse.Namespace) -> int:
     """Record spot and perp together, onto one timeline."""
     if args.spot_only and args.perp_only:
@@ -3439,6 +3673,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--slippage-ticks", type=float, default=1.0)
     p_ev.add_argument("--tick-size", default=None)
     p_ev.set_defaults(func=cmd_events)
+
+    p_xcap = sub.add_parser("xcapture", help="BinanceとBybitの先物板を同時に記録する")
+    p_xcap.add_argument("--symbol", default="BTCUSDT")
+    p_xcap.add_argument("--out", default="btc-xarb.jsonl")
+    p_xcap.add_argument("--duration", type=float, default=7200.0, help="録画秒数")
+    p_xcap.add_argument("--max-events", type=int, default=None)
+    p_xcap.add_argument("--binance-depth-ms", type=int, default=100, choices=(100, 250, 500))
+    p_xcap.add_argument("--bybit-depth", type=int, default=50, choices=(1, 50, 200, 1000))
+    p_xcap.set_defaults(func=cmd_xcapture)
+
+    p_xarb = sub.add_parser("xarb", help="Binance/Bybit価格差を実板・往復費用込みで再生する")
+    p_xarb.add_argument("path", help="xcaptureで作った.jsonl")
+    p_xarb.add_argument("--size-base", type=float, default=0.001)
+    p_xarb.add_argument("--lookback-minutes", type=float, default=30.0)
+    p_xarb.add_argument("--min-samples", type=int, default=300)
+    p_xarb.add_argument("--entry-z", type=float, default=2.5)
+    p_xarb.add_argument("--exit-z", type=float, default=0.25)
+    p_xarb.add_argument("--max-hold-minutes", type=float, default=15.0)
+    p_xarb.add_argument("--min-expected-net-bps", type=float, default=1.0)
+    p_xarb.add_argument("--binance-taker-bps", type=float, default=4.0)
+    p_xarb.add_argument("--bybit-taker-bps", type=float, default=5.5)
+    p_xarb.add_argument("--max-age-ms", type=float, default=250.0)
+    p_xarb.add_argument("--sample-ms", type=float, default=100.0)
+    p_xarb.add_argument("--depth", type=int, default=20)
+    p_xarb.add_argument("--plain", action="store_true")
+    p_xarb.set_defaults(func=cmd_xarb)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")

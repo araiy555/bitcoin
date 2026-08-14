@@ -598,6 +598,53 @@ jsboard sweep us.jsonl --source perp \
 時点で学習内なので、設定を固定して別時間の録画で再検証するまで採用しない。
 
 
+## 取引所間Zスコア — Binance/Bybitの同一先物を相対売買する
+
+単一市場の方向やスプレッドを予測せず、BinanceとBybitに上場する同一USDT無期限先物の
+対数価格差を取引します。価格差のZスコアが過去窓から外れたとき、高い取引所を売り、
+安い取引所を同数量買います。価格差が平均へ戻るか保有期限に達したら両脚を閉じます。
+
+重要なのは、Zスコア自体を利益と数えないことです。`xarb` は次をすべて因果的に処理します。
+
+- 二つのWebSocketを一つのローカル受信時計で記録
+- 未来を含まない過去窓だけで平均・標準偏差を計算
+- midではなく両取引所の見えている板を数量分歩く
+- 建玉2脚＋手仕舞い2脚のtaker手数料を計上
+- 保有中に通過した両取引所の、決済直前に観測できたfunding予測を計上
+- 片方の板が古い、または数量を吸収できない時点は拒否
+- 予想される平均回帰幅が往復費用を超えない信号は拒否
+
+まず2時間録画します。
+
+```bash
+.venv/bin/jsboard xcapture \
+  --symbol BTCUSDT \
+  --duration 7200 \
+  --out btc-xarb.jsonl
+```
+
+同じ録画を固定条件で再生します。
+
+```bash
+.venv/bin/jsboard xarb btc-xarb.jsonl \
+  --size-base 0.001 \
+  --lookback-minutes 30 \
+  --min-samples 300 \
+  --entry-z 2.5 \
+  --exit-z 0.25 \
+  --max-hold-minutes 15 \
+  --min-expected-net-bps 1 \
+  --binance-taker-bps 4 \
+  --bybit-taker-bps 5.5 \
+  --max-age-ms 250 \
+  --sample-ms 100 \
+  --plain
+```
+
+手数料は必ず実際のアカウント料率へ置き換えてください。短い録画の黒字は採用せず、最低
+30取引と、設定を変えない別期間の再検証が必要です。両取引所へ実際に注文する機能はまだ
+なく、公開市場データによるpaper replayです。
+
 ## Binance dealer — spot/perpの4経路を自動で選ぶ
 
 `pair` はメイク市場とヘッジ市場を手で指定して検証します。`dealer` は同じBinanceの
