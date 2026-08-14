@@ -23,7 +23,7 @@ import math
 import sys
 import time
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -45,7 +45,7 @@ from .mm.risk import RiskLimits, RiskManager
 from .mm.strategy import MarketMaker, StrategyConfig
 from .mm.toxicity import ToxicityConfig, ToxicityGate
 from .net import describe_tls_error, make_session
-from .research import dynamic, triage
+from .research import dynamic, statarb, triage
 from .research.archive import days_ending, fetch_day, load_seconds
 from .research.events import combine, score, simulate, threshold
 from .research.features import attach_open_interest, build, load_open_interest, to_minutes
@@ -2216,6 +2216,176 @@ async def cmd_horizon(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_statarb_download(args: argparse.Namespace) -> int:
+    """Download a compact, reproducible cross-sectional futures dataset."""
+    last = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=2)
+    symbols = [value.strip() for value in args.symbols.split(",") if value.strip()]
+    root = Path(args.data_dir)
+    console.rule("[bold cyan]中速・市場中立 statarb — データ取得")
+    console.print(
+        f"  期間 : {last - timedelta(days=args.days - 1)} 〜 {last} ({args.days}日)\n"
+        f"  対象 : {'指定銘柄' if symbols else f'USDⓈ-M 流動性上位 {args.top}銘柄'}\n"
+        f"  保存 : {root}\n"
+        "  [dim]5分足は月次アーカイブを優先し、実現fundingは公式APIから取得します。[/dim]\n"
+    )
+
+    def progress(symbol: str, done: int, total: int) -> None:
+        console.print(f"  [{done:>2}/{total}] {symbol}")
+
+    try:
+        manifest = await statarb.download_dataset(
+            days=args.days,
+            top=args.top,
+            end=last,
+            root=root,
+            interval=args.interval,
+            symbols=symbols or None,
+            progress=progress,
+        )
+    except Exception as exc:  # noqa: BLE001 - turn network/data failures into a usable message
+        tls = describe_tls_error(exc)
+        if tls:
+            raise ConfigError(tls) from exc
+        raise ConfigError(f"statarbデータ取得に失敗しました: {type(exc).__name__}: {exc}") from exc
+
+    available = sum(row["archives"] > 0 for row in manifest["files"])
+    console.print(
+        f"\n  [bold green]完了[/bold green]: {available}/{len(manifest['files'])}銘柄\n"
+        f"  次: [bold].venv/bin/jsboard statarb backtest --lookbacks 6h,12h,24h,72h "
+        "--holds 4h,8h,24h --fees 4 --funding --walk-forward[/bold]"
+    )
+    console.rule()
+    return 0
+
+
+def _parse_hour_list(value: str, option: str) -> list[int]:
+    try:
+        parsed = [statarb.parse_hours(item) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ConfigError(f"{option}: {exc}") from exc
+    if not parsed:
+        raise ConfigError(f"{option} に1つ以上指定してください")
+    return list(dict.fromkeys(parsed))
+
+
+async def cmd_statarb_backtest(args: argparse.Namespace) -> int:
+    """Run residual-reversion portfolios with costs and chronological selection."""
+    root = Path(args.data_dir)
+    lookbacks = _parse_hour_list(args.lookbacks, "--lookbacks")
+    holds = _parse_hour_list(args.holds, "--holds")
+    configs = [statarb.StrategyConfig(lb, hold) for lb in lookbacks for hold in holds]
+    if args.fees < 0 or args.slippage_bps < 0:
+        raise ConfigError("--fees と --slippage-bps は0以上で指定してください")
+
+    console.rule("[bold cyan]中速・市場中立 statarb — バックテスト")
+    try:
+        manifest, prices, funding = statarb.load_dataset(root)
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(str(exc)) from exc
+    if len(prices) < 5:
+        raise ConfigError(
+            f"価格を読めたのが{len(prices)}銘柄だけです。downloadの完了状況を確認してください"
+        )
+    if args.funding:
+        missing = sorted(set(prices) - set(funding))
+        if missing:
+            raise ConfigError(
+                "funding履歴が不足しています: " + ", ".join(missing[:8])
+                + (" …" if len(missing) > 8 else "")
+            )
+
+    console.print(
+        f"  データ : {manifest['start']} 〜 {manifest['end']} / {len(prices)}銘柄\n"
+        "  戦略   : BTC betaを除いた相対騰落率の下位20%買い・上位20%売り\n"
+        f"  コスト : 片道 fee {args.fees:g}bps + 滑り {args.slippage_bps:g}bps "
+        f"→ 往復 {2 * (args.fees + args.slippage_bps):g}bps\n"
+        f"  funding: {'実現履歴を計上' if args.funding else '計上しない'}\n"
+    )
+    results = statarb.run_backtests(
+        prices,
+        funding,
+        configs,
+        fee_bps=args.fees,
+        slippage_bps=args.slippage_bps,
+        include_funding=args.funding,
+    )
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    table.add_column("lookback", justify="right")
+    table.add_column("hold", justify="right")
+    table.add_column("取引", justify="right")
+    table.add_column("価格", justify="right")
+    table.add_column("funding", justify="right")
+    table.add_column("コスト", justify="right")
+    table.add_column("Net", justify="right")
+    table.add_column("年率換算", justify="right")
+    table.add_column("勝率", justify="right")
+    table.add_column("最大DD", justify="right")
+    for result in sorted(results, key=lambda row: row.total_bps, reverse=True):
+        colour = "green" if result.total_bps > 0 else "red"
+        table.add_row(
+            f"{result.config.lookback_h}h",
+            f"{result.config.hold_h}h",
+            f"{result.trades:,}",
+            f"{result.price_bps:+.1f}",
+            f"{result.funding_bps:+.1f}",
+            f"-{result.cost_bps:.1f}",
+            f"[{colour}]{result.total_bps:+.1f}[/{colour}]",
+            f"[{colour}]{result.annual_bps / 100:+.1f}%[/{colour}]",
+            f"{result.win_rate:.1%}",
+            f"-{result.max_drawdown_bps / 100:.1f}%",
+        )
+    console.print(table)
+    best = max(results, key=lambda row: row.total_bps)
+    console.print(
+        f"\n  全期間最良 {best.config.label}: long {best.long_price_bps:+.1f}bps / "
+        f"short {best.short_price_bps:+.1f}bps / funding {best.funding_bps:+.1f}bps"
+    )
+
+    if args.walk_forward:
+        try:
+            folds, out = statarb.walk_forward(results)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        console.print("\n  [bold]Walk-forward（過去だけで設定を選び、次期間で採点）[/bold]")
+        for index, fold in enumerate(folds, 1):
+            end = datetime.fromtimestamp(fold.test_end_hour * 3600, tz=UTC).date()
+            console.print(
+                f"    fold {index}: {fold.selected.label} / "
+                f"train {fold.train_bps:+.1f} → test {fold.test_bps:+.1f}bps "
+                f"({fold.test_trades}回, 〜{end})"
+            )
+        colour = "green" if out.total_bps > 0 else "red"
+        console.print(
+            f"  未使用期間合計: [{colour}][bold]{out.total_bps:+.1f}bps[/bold][/{colour}] "
+            f"/ 年率換算 {out.annual_bps / 100:+.1f}% / 最大DD "
+            f"-{out.max_drawdown_bps / 100:.1f}%"
+        )
+        if out.monthly_bps:
+            monthly = "  ".join(
+                f"{month} {value:+.1f}" for month, value in sorted(out.monthly_bps.items())
+            )
+            console.print(f"  未使用期間の月別Net(bps): {monthly}")
+        if out.total_bps > 0 and all(fold.test_bps > 0 for fold in folds):
+            console.print(
+                "\n  [green]全foldが全コスト後プラスです。[/green]\n"
+                "  [dim]まだ同じデータで候補を選んだ研究結果です。設定を固定して、\n"
+                "  期間を後ろへずらした再検証を通るまで実運用しません。[/dim]"
+            )
+        else:
+            console.print(
+                "\n  [red]未使用期間で安定したプラスを確認できません。[/red]\n"
+                "  [dim]この相対反転ルールは採用しません。手数料を消した表示へ\n"
+                "  変更して黒字に見せることもしません。[/dim]"
+            )
+    console.print(
+        "\n  [yellow]注意:[/yellow] 銘柄は取得時点の流動性で選ぶため、上場廃止銘柄を含まない"
+        "生存者バイアスがあります。結果は上限寄りに読んでください。"
+    )
+    console.rule()
+    return 0
+
+
 async def cmd_predict(args: argparse.Namespace) -> int:
     """Measure whether any signal reaches the accuracy the fee demands."""
     last = (
@@ -2795,6 +2965,36 @@ def build_parser() -> argparse.ArgumentParser:
         requote_ms=100.0,
         min_edge_bps=0.0,
     )
+
+    p_sa = sub.add_parser(
+        "statarb", help="先物の中速・市場中立スタットアーブを取得・検証する"
+    )
+    sa_sub = p_sa.add_subparsers(dest="statarb_command", required=True)
+
+    p_sa_dl = sa_sub.add_parser("download", help="上位銘柄の5分足とfunding履歴を保存する")
+    p_sa_dl.add_argument("--days", type=int, default=365)
+    p_sa_dl.add_argument("--top", type=int, default=30)
+    p_sa_dl.add_argument("--end", default=None, help="最終日 YYYY-MM-DD。既定は公開済み直近日")
+    p_sa_dl.add_argument("--interval", default="5m", choices=("1m", "5m", "15m"))
+    p_sa_dl.add_argument(
+        "--symbols", default="", help="テスト用の明示銘柄。例 BTCUSDT,ETHUSDT"
+    )
+    p_sa_dl.add_argument("--data-dir", default=str(statarb.DEFAULT_ROOT))
+    p_sa_dl.set_defaults(func=cmd_statarb_download)
+
+    p_sa_bt = sa_sub.add_parser("backtest", help="全コスト込みで相対反転を検証する")
+    p_sa_bt.add_argument("--lookbacks", default="6h,12h,24h,72h")
+    p_sa_bt.add_argument("--holds", default="4h,8h,24h")
+    p_sa_bt.add_argument("--fees", type=float, default=4.0, help="片道手数料 bps")
+    p_sa_bt.add_argument(
+        "--slippage-bps", type=float, default=1.0, help="片道の想定スリッページ bps"
+    )
+    p_sa_bt.add_argument("--funding", action="store_true", help="実現fundingを損益へ含める")
+    p_sa_bt.add_argument(
+        "--walk-forward", action="store_true", help="過去だけで設定を選び次期間で採点する"
+    )
+    p_sa_bt.add_argument("--data-dir", default=str(statarb.DEFAULT_ROOT))
+    p_sa_bt.set_defaults(func=cmd_statarb_backtest)
 
     p_tri = sub.add_parser("triage", help="手数料・tick・スプレッドだけで全銘柄を一次審査")
     p_tri.add_argument("--product", default="perp", choices=("spot", "perp"))
