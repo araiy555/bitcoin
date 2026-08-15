@@ -15,14 +15,12 @@ import sys
 import time
 from pathlib import Path
 
-# When this file is executed as ``python tools/xarb_diag.py`` Python puts the
-# tools/ directory, not the repository root, on sys.path.  Add the root so the
-# sibling launcher can be imported reliably.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from jsboard.research import xarb_scan as scan
+from tools.xarb_compat import binance_book_compatible
 from tools.xarb_scan import okx_books_normalised
 
 EXPECTED = {
@@ -38,8 +36,8 @@ EXPECTED = {
 async def run(duration_s: float, notional: float) -> int:
     q: asyncio.Queue[scan.Book] = asyncio.Queue(maxsize=100_000)
     tasks = [
-        asyncio.create_task(scan._binance_book("binance_spot", scan.BINANCE_SPOT_WS, q)),
-        asyncio.create_task(scan._binance_book("binance_perp", scan.BINANCE_PERP_WS, q)),
+        asyncio.create_task(binance_book_compatible("binance_spot", scan.BINANCE_SPOT_WS, q)),
+        asyncio.create_task(binance_book_compatible("binance_perp", scan.BINANCE_PERP_WS, q)),
         asyncio.create_task(scan._bybit_book("bybit_spot", q)),
         asyncio.create_task(scan._bybit_book("bybit_perp", q)),
         asyncio.create_task(okx_books_normalised(q)),
