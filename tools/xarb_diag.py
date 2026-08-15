@@ -11,7 +11,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import sys
 import time
+from pathlib import Path
+
+# When this file is executed as ``python tools/xarb_diag.py`` Python puts the
+# tools/ directory, not the repository root, on sys.path.  Add the root so the
+# sibling launcher can be imported reliably.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from jsboard.research import xarb_scan as scan
 from tools.xarb_scan import okx_books_normalised
