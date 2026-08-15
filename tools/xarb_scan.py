@@ -1,12 +1,119 @@
 #!/usr/bin/env python3
-"""Run the six-market executable cross-venue scanner without changing jsboard CLI."""
+"""Run the six-market executable BTC cross-venue scanner.
+
+Research-only: public market data, no authentication, no order entry.
+
+OKX perpetual book sizes are reported in contracts.  Before scanning, this
+launcher fetches BTC-USDT-SWAP instrument metadata and converts contract size
+to BTC using ctVal so all six books are comparable in base-asset quantity.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import time
 
-from jsboard.research.xarb_scan import DEFAULT_FEES_BPS, format_summary, run_live
+import aiohttp
+import websockets
+
+from jsboard.net import make_session, ssl_context
+from jsboard.research import xarb_scan as scan
+
+
+async def okx_contract_value_btc() -> float:
+    url = "https://www.okx.com/api/v5/public/instruments"
+    params = {"instType": "SWAP", "instId": "BTC-USDT-SWAP"}
+    async with make_session() as session, session.get(
+        url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+    ) as resp:
+        resp.raise_for_status()
+        payload = await resp.json()
+    rows = payload.get("data") or []
+    if not rows:
+        raise RuntimeError("OKX BTC-USDT-SWAP metadata is empty")
+    row = rows[0]
+    ct_val = float(row.get("ctVal") or 0)
+    ct_ccy = row.get("ctValCcy") or ""
+    if ct_val <= 0:
+        raise RuntimeError("OKX BTC-USDT-SWAP ctVal is missing")
+    if ct_ccy != "BTC":
+        raise RuntimeError(
+            f"OKX BTC-USDT-SWAP ctValCcy={ct_ccy!r}; expected 'BTC', refusing to guess"
+        )
+    return ct_val
+
+
+def okx_levels(rows, *, reverse: bool, qty_multiplier: float):
+    levels = []
+    for row in rows or ():
+        try:
+            price = float(row[0])
+            qty = float(row[1]) * qty_multiplier
+        except (TypeError, ValueError, IndexError):
+            continue
+        if price > 0 and qty > 0:
+            levels.append((price, qty))
+    levels.sort(key=lambda x: x[0], reverse=reverse)
+    return tuple(levels)
+
+
+async def okx_books_normalised(out: asyncio.Queue) -> None:
+    contract_btc = await okx_contract_value_btc()
+    print(f"[xarb-scan] OKX BTC-USDT-SWAP ctVal = {contract_btc:g} BTC/contract")
+
+    subscriptions = [
+        {"channel": "books5", "instId": "BTC-USDT"},
+        {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+    ]
+    source_for = {
+        "BTC-USDT": "okx_spot",
+        "BTC-USDT-SWAP": "okx_perp",
+    }
+
+    while True:
+        try:
+            async with websockets.connect(
+                scan.OKX_WS,
+                ping_interval=20,
+                ping_timeout=20,
+                max_queue=2**14,
+                ssl=ssl_context(),
+            ) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": subscriptions}))
+                async for raw in ws:
+                    recv = time.monotonic_ns()
+                    payload = json.loads(raw)
+                    if payload.get("event") == "error":
+                        raise RuntimeError(payload.get("msg") or "OKX subscribe failed")
+                    arg = payload.get("arg") or {}
+                    if arg.get("channel") != "books5":
+                        continue
+                    inst_id = arg.get("instId")
+                    source = source_for.get(inst_id)
+                    if source is None:
+                        continue
+                    multiplier = contract_btc if inst_id == "BTC-USDT-SWAP" else 1.0
+                    for row in payload.get("data") or ():
+                        book = scan.Book(
+                            source=source,
+                            bids=okx_levels(
+                                row.get("bids"), reverse=True, qty_multiplier=multiplier
+                            ),
+                            asks=okx_levels(
+                                row.get("asks"), reverse=False, qty_multiplier=multiplier
+                            ),
+                            exchange_ts_ns=int(row.get("ts") or 0) * 1_000_000,
+                            receive_ts_ns=recv,
+                        )
+                        if book.valid():
+                            await out.put(book)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[xarb-scan] OKX reconnect: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(1.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--safety-buffer-bps", type=float, default=1.0)
     p.add_argument("--out", default="xarb-scan.jsonl")
 
-    for source, default in DEFAULT_FEES_BPS.items():
+    # Research assumptions only. Override these with the user's actual fee tier.
+    for source, default in scan.DEFAULT_FEES_BPS.items():
         p.add_argument(
             f"--{source.replace('_', '-')}-fee-bps",
             type=float,
@@ -39,9 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def amain(args: argparse.Namespace) -> int:
+    scan._okx_books = okx_books_normalised
+
     fees = {
         source: getattr(args, f"{source}_fee_bps")
-        for source in DEFAULT_FEES_BPS
+        for source in scan.DEFAULT_FEES_BPS
     }
     print("BTC cross-venue scanner")
     print("  markets : Binance/Bybit/OKX x spot/perp")
@@ -49,9 +159,15 @@ async def amain(args: argparse.Namespace) -> int:
     print(f"  duration: {args.duration:g}s")
     print(f"  sizes   : {', '.join(f'${x:g}' for x in args.notional)}")
     print(f"  min Net : {args.min_net_bps:g} bps")
+    print("  fees    : " + ", ".join(f"{k}={v:g}" for k, v in fees.items()) + " bps")
+    print(
+        "  buffers : "
+        f"latency={args.latency_buffer_bps:g}, fill={args.fill_buffer_bps:g}, "
+        f"rebalance={args.rebalance_buffer_bps:g}, safety={args.safety_buffer_bps:g} bps"
+    )
     print(f"  output  : {args.out}\n")
 
-    result = await run_live(
+    result = await scan.run_live(
         duration_s=args.duration,
         notionals=tuple(args.notional),
         fees_bps=fees,
@@ -65,7 +181,7 @@ async def amain(args: argparse.Namespace) -> int:
         out_path=args.out,
     )
     print("\n=== xarb-scan summary ===")
-    print(format_summary(result))
+    print(scan.format_summary(result))
     return 0
 
 
