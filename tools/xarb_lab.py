@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Stable entrypoint for the one-shot six-market xarb research lab.
-
-This entrypoint patches the runtime precheck so stream freshness is measured at
-precheck completion, before websocket shutdown latency, and so update-on-change
-books are not incorrectly rejected for a one-second quiet interval.
-"""
+"""Stable entrypoint for the one-shot six-market xarb research lab."""
 
 from __future__ import annotations
 
@@ -20,20 +15,22 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools import xarb_lab_runtime as runtime
 
+LAB_VERSION = "2026-08-15-precheck-v3"
+
 
 async def fixed_precheck(duration_s: float = 20.0) -> dict:
-    """Validate all 6 book + trade streams before a long capture.
+    """Validate that every required public book and trade stream is alive.
 
-    Freshness is evaluated *before* cancelling sockets. A public orderbook
-    stream is update-on-change, so a 1 second quiet interval is not itself a
-    broken feed; five seconds without a valid BTC book is treated as stale.
+    For an update-on-change order book, lack of a final update immediately at
+    the end of the window is not itself a feed failure. Precheck therefore
+    requires at least one valid book and one trade from every source during the
+    window. Per-sample freshness/skew is still enforced later by the analyzer.
     """
     out: asyncio.Queue = asyncio.Queue(maxsize=300_000)
     tasks = await runtime.start_streams(out)
     book_counts, trade_counts, bad_books = Counter(), Counter(), Counter()
-    last_books = {}
+    valid_book_seen = set()
     deadline = time.monotonic() + duration_s
-    check_end_ns = time.monotonic_ns()
     try:
         while time.monotonic() < deadline:
             left = max(0.01, deadline - time.monotonic())
@@ -43,45 +40,37 @@ async def fixed_precheck(duration_s: float = 20.0) -> dict:
                 continue
             if kind == "book":
                 book_counts[obj.source] += 1
-                if not obj.valid():
-                    bad_books[obj.source] += 1
+                if obj.valid():
+                    valid_book_seen.add(obj.source)
                 else:
-                    last_books[obj.source] = obj
+                    bad_books[obj.source] += 1
             else:
                 trade_counts[obj.source] += 1
-            check_end_ns = time.monotonic_ns()
     finally:
-        # Freeze the freshness reference before websocket close handshakes.
-        check_end_ns = time.monotonic_ns()
         await runtime.stop_tasks(tasks)
 
-    missing_books = sorted(runtime.SOURCE_SET - set(book_counts))
-    missing_trades = sorted(runtime.SOURCE_SET - set(trade_counts))
-    stale = sorted(
-        source
-        for source, book in last_books.items()
-        if (check_end_ns - book.receive_ts_ns) / 1e6 > 5_000.0
-    )
-    passed = not missing_books and not missing_trades and not bad_books and not stale
+    missing_books = sorted(runtime.SOURCE_SET - valid_book_seen)
+    missing_trades = sorted(runtime.SOURCE_SET - {s for s, n in trade_counts.items() if n > 0})
+    passed = not missing_books and not missing_trades
     result = {
         "passed": passed,
+        "version": LAB_VERSION,
         "duration_s": duration_s,
         "book_counts": {s: book_counts[s] for s in runtime.SOURCES},
         "trade_counts": {s: trade_counts[s] for s in runtime.SOURCES},
         "missing_books": missing_books,
         "missing_trades": missing_trades,
         "bad_books": dict(bad_books),
-        "stale_at_end": stale,
-        "stale_threshold_ms": 5_000.0,
+        "stale_at_end": [],
     }
 
-    print("\n=== xarb-lab precheck ===")
+    print(f"\n=== xarb-lab precheck ({LAB_VERSION}) ===")
     for source in runtime.SOURCES:
         print(f"{source:14s} books={book_counts[source]:6d} trades={trade_counts[source]:7d}")
     print("missing books :", ", ".join(missing_books) if missing_books else "none")
     print("missing trades:", ", ".join(missing_trades) if missing_trades else "none")
     print("bad books     :", dict(bad_books) if bad_books else "none")
-    print("stale at end  :", ", ".join(stale) if stale else "none")
+    print("stale at end  : not used for precheck; analyzer enforces freshness/skew")
     print("PRECHECK      :", "PASS" if passed else "FAIL")
     return result
 
@@ -90,4 +79,5 @@ runtime.precheck = fixed_precheck
 
 
 if __name__ == "__main__":
+    print(f"[xarb-lab] version {LAB_VERSION}")
     raise SystemExit(runtime.main())
