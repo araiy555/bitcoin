@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "2026-08-16-fusion-v1"
+VERSION = "2026-08-16-fusion-v2"
 SOURCES = (
     "binance_spot", "binance_perp",
     "bybit_spot", "bybit_perp",
@@ -45,6 +45,17 @@ DEFAULT_TAKER_BPS = {
     "bybit_perp": 5.5,
     "okx_spot": 10.0,
     "okx_perp": 5.0,
+}
+
+# Standard (non-VIP) maker assumptions for the resting leg of a maker->taker
+# hedge. Same status as the taker table: research defaults, not the user's tier.
+DEFAULT_MAKER_BPS = {
+    "binance_spot": 10.0,
+    "binance_perp": 2.0,
+    "bybit_spot": 10.0,
+    "bybit_perp": 2.0,
+    "okx_spot": 8.0,
+    "okx_perp": 2.0,
 }
 
 
@@ -441,10 +452,72 @@ def rank_stats(all_stats: Iterable[dict[SignalKey, SplitStats]], *,
             "robust_default_fee": robust[:top_n]}
 
 
+def dedup_maker_rows(rows: list[dict[str, Any]], *, cluster_ms: float) -> list[dict[str, Any]]:
+    """Collapse candidates that describe the same quote into one event.
+
+    The upstream xarb report keeps the top-N samples by quote-time gross, so a
+    single dislocation that survives several 100 ms samples appears many times.
+    Counting those as separate opportunities inflates every downstream count.
+    """
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for r in rows:
+        key = (r["maker_source"], r["hedge_source"], r["maker_side"], r["notional"])
+        groups.setdefault(key, []).append(r)
+    events: list[dict[str, Any]] = []
+    for key, items in groups.items():
+        items.sort(key=lambda r: r["ts_ns"])
+        cluster: list[dict[str, Any]] = []
+        for r in items:
+            if cluster and (r["ts_ns"] - cluster[-1]["ts_ns"]) / 1e6 > cluster_ms:
+                events.append(_collapse_cluster(cluster))
+                cluster = []
+            cluster.append(r)
+        if cluster:
+            events.append(_collapse_cluster(cluster))
+    events.sort(key=lambda r: r["net_bps_default_fees"], reverse=True)
+    return events
+
+
+def _collapse_cluster(cluster: list[dict[str, Any]]) -> dict[str, Any]:
+    best = max(cluster, key=lambda r: r["net_bps_default_fees"])
+    out = dict(best)
+    out["cluster_samples"] = len(cluster)
+    out["cluster_span_ms"] = (cluster[-1]["ts_ns"] - cluster[0]["ts_ns"]) / 1e6
+    return out
+
+
+def summarize_maker_events(events: list[dict[str, Any]], *,
+                           fee_multipliers: tuple[float, ...],
+                           maker_fee_grid: tuple[float, ...]) -> dict[str, Any]:
+    """Count how many *distinct* events survive each fee assumption."""
+    grid: list[dict[str, Any]] = []
+    for fm in fee_multipliers:
+        for maker_fee in maker_fee_grid:
+            nets = []
+            for e in events:
+                taker_fee = DEFAULT_TAKER_BPS[e["hedge_source"]] * fm
+                nets.append(e["fill_time_gross_bps"] - taker_fee - maker_fee)
+            grid.append({
+                "fee_multiplier": fm,
+                "maker_fee_bps": maker_fee,
+                "net_positive_events": sum(1 for v in nets if v > 0),
+                "best_net_bps": max(nets) if nets else None,
+                "mean_net_bps": statistics.fmean(nets) if nets else None,
+            })
+    return {
+        "distinct_events": len(events),
+        "net_positive_events_default_fees": sum(1 for e in events if e["net_bps_default_fees"] > 0),
+        "best_net_bps_default_fees": max((e["net_bps_default_fees"] for e in events), default=None),
+        "best_gross_bps_at_fill": max((e["fill_time_gross_bps"] for e in events), default=None),
+        "fee_grid": grid,
+    }
+
+
 def reprice_maker_candidates(report_path: Path | None, books: dict[str, BookSeries], *,
                              fee_multipliers: tuple[float, ...],
                              maker_fee_grid: tuple[float, ...],
-                             max_book_age_ms: float) -> dict[str, Any]:
+                             max_book_age_ms: float,
+                             cluster_ms: float = 1000.0) -> dict[str, Any]:
     if report_path is None or not report_path.exists():
         return {"available": False, "reason": "xarb report not supplied"}
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -482,19 +555,44 @@ def reprice_maker_candidates(report_path: Path | None, books: dict[str, BookSeri
                     "maker_fee_bps": maker_fee,
                     "net_bps_before_extra_buffers": gross - taker_fee - maker_fee,
                 })
+        maker_source = row["maker_source"]
+        default_taker = DEFAULT_TAKER_BPS[hedge_source]
+        default_maker = DEFAULT_MAKER_BPS[maker_source]
         out.append({
-            "maker_source": row["maker_source"],
+            "maker_source": maker_source,
             "hedge_source": hedge_source,
             "maker_side": side,
             "notional": row["notional"],
+            "ts_ns": int(row["ts_ns"]),
             "quote_time_gross_bps": row["gross_bps_at_quote"],
             "fill_time_gross_bps": gross,
+            # The headline number. Gross is not a P&L: the hedge leg always pays
+            # taker fee and the resting leg pays the maker fee of its venue.
+            "assumed_maker_fee_bps": default_maker,
+            "assumed_hedge_taker_fee_bps": default_taker,
+            "net_bps_default_fees": gross - default_taker - default_maker,
+            # Maker fee (bps) at which this event would exactly break even.
+            "break_even_maker_fee_bps": gross - default_taker,
             "maker_fill_delay_ms": (int(fill_ts) - int(row["ts_ns"])) / 1e6,
             "hedge_book_delay_ms": (int(bs.t[hi]) - int(fill_ts)) / 1e6,
             "scenarios": scen,
         })
-    out.sort(key=lambda r: r["fill_time_gross_bps"], reverse=True)
-    return {"available": True, "checked": len(out), "top": out[:50]}
+    events = dedup_maker_rows(out, cluster_ms=cluster_ms)
+    summary = summarize_maker_events(
+        events, fee_multipliers=fee_multipliers, maker_fee_grid=maker_fee_grid,
+    )
+    return {
+        "available": True,
+        "checked": len(out),
+        "cluster_ms": cluster_ms,
+        "summary": summary,
+        "top": events[:50],
+        "selection_note": (
+            "Source rows are the top-N samples by quote-time gross from the xarb "
+            "report, i.e. the extreme tail of the capture. They are an upper "
+            "bound on the opportunity, not a rate or an expectation."
+        ),
+    }
 
 
 def print_summary(rep: dict[str, Any]) -> None:
@@ -532,12 +630,26 @@ def print_summary(rep: dict[str, Any]) -> None:
     elif not mk.get("top"):
         print("  約定後ヘッジまで成立した候補なし")
     else:
+        s = mk["summary"]
+        print(
+            f"  重複除去後の独立イベント: {s['distinct_events']}件"
+            f"（元サンプル{mk['checked']}件, {mk['cluster_ms']:g}msで集約）"
+        )
+        print(
+            f"  想定手数料でネット黒字: {s['net_positive_events_default_fees']}件 / "
+            f"最良ネット={s['best_net_bps_default_fees']:+.3f}bps "
+            f"(最良グロス={s['best_gross_bps_at_fill']:+.3f}bps)"
+        )
         for r in mk["top"][:5]:
             print(
                 f"  {r['maker_source']}->{r['hedge_source']} ${r['notional']:g} "
-                f"quote={r['quote_time_gross_bps']:+.3f}bps fill-time={r['fill_time_gross_bps']:+.3f}bps "
-                f"maker-fill={r['maker_fill_delay_ms']:.1f}ms"
+                f"gross={r['fill_time_gross_bps']:+.3f}bps "
+                f"-maker{r['assumed_maker_fee_bps']:g}-taker{r['assumed_hedge_taker_fee_bps']:g} "
+                f"=> net={r['net_bps_default_fees']:+.3f}bps "
+                f"(損益分岐Maker手数料={r['break_even_maker_fee_bps']:+.3f}bps, "
+                f"fill={r['maker_fill_delay_ms']:.1f}ms, x{r['cluster_samples']})"
             )
+        print("  ※ 上記は捕捉期間中の最良サンプル（上振れ側の上限）であり、期待値ではありません。")
     print("=================================================")
 
 
@@ -550,6 +662,31 @@ def selftest() -> None:
                              max_exit_late_ms=10)
     assert g is not None and g > 0
     d = Dist(); d.add(1); d.add(-1); assert d.n == 2 and abs(d.mean) < 1e-12
+
+    def mk_row(ts_ms: float, gross: float) -> dict[str, Any]:
+        taker = DEFAULT_TAKER_BPS["binance_spot"]
+        maker = DEFAULT_MAKER_BPS["bybit_perp"]
+        return {
+            "maker_source": "bybit_perp", "hedge_source": "binance_spot",
+            "maker_side": "buy", "notional": 100.0, "ts_ns": int(ts_ms * 1e6),
+            "fill_time_gross_bps": gross,
+            "net_bps_default_fees": gross - taker - maker,
+        }
+
+    # Three samples of one dislocation collapse to a single event; a later one
+    # stays separate.
+    ev = dedup_maker_rows(
+        [mk_row(0, 6.0), mk_row(100, 6.5), mk_row(200, 6.2), mk_row(5_000, 3.0)],
+        cluster_ms=1000.0,
+    )
+    assert len(ev) == 2, ev
+    assert ev[0]["cluster_samples"] == 3 and abs(ev[0]["fill_time_gross_bps"] - 6.5) < 1e-12
+    # 6.5 gross - 10 taker - 2 maker is a loss: gross alone is never the P&L.
+    assert ev[0]["net_bps_default_fees"] < 0
+    summ = summarize_maker_events(ev, fee_multipliers=(1.0, 0.0), maker_fee_grid=(2.0, 0.0))
+    assert summ["distinct_events"] == 2 and summ["net_positive_events_default_fees"] == 0
+    zero_fee = [g for g in summ["fee_grid"] if g["fee_multiplier"] == 0.0 and g["maker_fee_bps"] == 0.0][0]
+    assert zero_fee["net_positive_events"] == 2
     print("[jane-lab] selftest PASS")
 
 
@@ -638,6 +775,8 @@ def main() -> int:
             "Prediction trades are taker-in/taker-out and require displayed top-level quantity to cover the requested notional.",
             "Fee multipliers are hypothetical sensitivity scenarios applied to the existing default research fee assumptions, not claims about a specific VIP tier.",
             "Funding is not present in xarb-lab v2 raw captures; for sub-5-second horizons it is negligible unless a funding timestamp is crossed. Longer-hold basis strategies need a funding-aware capture before promotion.",
+            "Maker->taker rows report net after the resting leg's maker fee and the hedge leg's taker fee; the gross figure alone is not a P&L.",
+            "Maker->taker source rows are the extreme tail selected by the xarb report, and are de-duplicated here because one dislocation spans several samples. Treat them as an upper bound, never as a fill rate or an expectation.",
             "A positive result is only a research candidate; require out-of-sample persistence, more days, and deployment-latency validation before live trading.",
         ],
         "prediction": pred,
