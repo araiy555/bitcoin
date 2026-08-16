@@ -650,6 +650,7 @@ def print_summary(rep: dict[str, Any]) -> None:
                 f"fill={r['maker_fill_delay_ms']:.1f}ms, x{r['cluster_samples']})"
             )
         print("  ※ 上記は捕捉期間中の最良サンプル（上振れ側の上限）であり、期待値ではありません。")
+        print("  ※ ヘッジ先は記録された1会場のみ。全会場を実板で比較するには tools/jane_hedge.py。")
     print("=================================================")
 
 
