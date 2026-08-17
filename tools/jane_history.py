@@ -157,12 +157,13 @@ def fetch_day(product: str, dataset: str, symbol: str, day: date, *,
     return target
 
 
-def _bid_ask_columns(first_row: list[str]) -> tuple[int, int] | None:
+def _bid_ask_columns(first_row: list[str]) -> tuple[int, int, int] | None:
     """Locate bid/ask columns, tolerating the header that newer files carry.
 
-    Returns None when the row *is* the header, so the caller skips it.
-    Positional defaults match both products: update_id, bid, bid_qty, ask,
-    ask_qty, [transaction_time, event_time].
+    Returns (bid, ask, transaction_time) column indexes, or None when the row
+    is not a header, so the caller keeps the positional defaults and parses it
+    as data. Positional layout of both products: update_id, bid, bid_qty, ask,
+    ask_qty, transaction_time, [event_time].
     """
     lowered = [c.strip().lower() for c in first_row]
     if any(c.replace("_", "").startswith("bestbid") for c in lowered):
@@ -170,15 +171,38 @@ def _bid_ask_columns(first_row: list[str]) -> tuple[int, int] | None:
                    if c.replace("_", "").startswith("bestbidprice"))
         ask = next(i for i, c in enumerate(lowered)
                    if c.replace("_", "").startswith("bestaskprice"))
-        return bid, ask
+        ts = next((i for i, c in enumerate(lowered)
+                   if c.replace("_", "") == "transactiontime"), 5)
+        return bid, ask, ts
     return None
 
 
-def spread_day(path: Path, *, row_stride: int, maker_fee_bps: float) -> dict[str, Any]:
-    """Sampled top-of-book spread statistics for one archived day."""
+def to_ms(stamp: int) -> int:
+    """Archive stamps are milliseconds in older files and microseconds in newer
+    ones. Deciding by magnitude beats hard-coding a cutover date, the same way
+    jsboard.research.archive does it."""
+    return stamp // 1_000 if stamp > 1_000_000_000_000_000 else stamp
+
+
+def spread_day(path: Path, *, row_stride: int, maker_fee_bps: float,
+               max_gap_ms: float = 60_000.0) -> dict[str, Any]:
+    """Sampled top-of-book spread statistics for one archived day.
+
+    Counting samples answers "what share of book updates were wide", which is
+    not the question. Quoting happens against the clock, so each sample also
+    carries the time until the next one: that gives the share of the *day* the
+    spread was above the fee floor. Each interval is credited to the quote that
+    ends it, and with a stride that interval spans rows which were not parsed,
+    so one sampled spread stands in for all of them - unbiased in aggregate,
+    coarse per interval.
+    """
     acc = SpreadAcc()
-    bid_i, ask_i = 1, 3
+    bid_i, ask_i, ts_i = 1, 3, 5
     skipped = 0
+    prev_ms: int | None = None
+    ms_total = 0.0
+    ms_over = 0.0
+    floor = 2.0 * maker_fee_bps
     with zipfile.ZipFile(path) as zf:
         name = zf.namelist()[0]
         with zf.open(name) as raw:
@@ -187,7 +211,7 @@ def spread_day(path: Path, *, row_stride: int, maker_fee_bps: float) -> dict[str
                 if i == 0:
                     found = _bid_ask_columns(row)
                     if found is not None:
-                        bid_i, ask_i = found
+                        bid_i, ask_i, ts_i = found
                         continue
                 if i % row_stride:
                     continue
@@ -204,11 +228,31 @@ def spread_day(path: Path, *, row_stride: int, maker_fee_bps: float) -> dict[str
                     skipped += 1
                     continue
                 mid = (bid + ask) * 0.5
-                acc.add((ask - bid) / mid * 10_000.0,
-                        fee_floor_bps=2.0 * maker_fee_bps)
+                spread = (ask - bid) / mid * 10_000.0
+                acc.add(spread, fee_floor_bps=floor)
+
+                ms: int | None = None
+                if len(row) > ts_i:
+                    try:
+                        ms = to_ms(int(row[ts_i]))
+                    except ValueError:
+                        ms = None
+                if ms is not None:
+                    if prev_ms is not None:
+                        dt = ms - prev_ms
+                        # Gaps mean a feed outage or a file seam, not a quiet
+                        # market; attributing them to one spread would be a lie.
+                        if 0 <= dt <= max_gap_ms:
+                            ms_total += dt
+                            if spread > floor:
+                                ms_over += dt
+                    prev_ms = ms
     return {
         "sampled": acc.n,
         "skipped": skipped,
+        "seconds_measured": ms_total / 1000.0,
+        "seconds_over_fee_floor": ms_over / 1000.0,
+        "time_rate_over_fee_floor": (ms_over / ms_total) if ms_total > 0 else None,
         "mean_spread_bps": acc.total / acc.n if acc.n else None,
         "min_spread_bps": acc.min_v if acc.n else None,
         "max_spread_bps": acc.max_v if acc.n else None,
@@ -239,6 +283,8 @@ def run(product: str, symbol: str, days: list[date], *, cache: Path, row_stride:
     out: list[dict[str, Any]] = []
     missing: list[str] = []
     total = SpreadAcc()
+    secs_total = 0.0
+    secs_over = 0.0
     for d in days:
         path = fetch_day(product, "bookTicker", symbol, d, cache=cache, timeout=timeout)
         if path is None:
@@ -256,11 +302,16 @@ def run(product: str, symbol: str, days: list[date], *, cache: Path, row_stride:
             total.over_fee += stats["samples_over_fee_floor"]
             for i, c in enumerate(stats["bins"]["counts"]):
                 total.bins[i] += c
+            secs_total += stats["seconds_measured"]
+            secs_over += stats["seconds_over_fee_floor"]
+        tr = stats["time_rate_over_fee_floor"]
         print(
             f"[jane-history] {d}: n={stats['sampled']:,} "
             f"平均={stats['mean_spread_bps']:.4f}bps "
             f"最大={stats['max_spread_bps']:.4f}bps "
-            f"手数料超過={stats['rate_over_fee_floor']*100:.4f}%"
+            f"手数料超過={stats['rate_over_fee_floor']*100:.4f}% "
+            f"時間比={'n/a' if tr is None else f'{tr*100:.4f}%'} "
+            f"({stats['seconds_over_fee_floor']:.1f}秒/日)"
         )
     return {
         "version": VERSION,
@@ -274,6 +325,9 @@ def run(product: str, symbol: str, days: list[date], *, cache: Path, row_stride:
         "days_missing": missing,
         "aggregate": {
             "sampled": total.n,
+            "seconds_measured": secs_total,
+            "seconds_over_fee_floor": secs_over,
+            "time_rate_over_fee_floor": (secs_over / secs_total) if secs_total > 0 else None,
             "mean_spread_bps": total.total / total.n if total.n else None,
             "min_spread_bps": total.min_v if total.n else None,
             "max_spread_bps": total.max_v if total.n else None,
@@ -287,6 +341,8 @@ def run(product: str, symbol: str, days: list[date], *, cache: Path, row_stride:
             "Binance stopped publishing bookTicker in March 2024, so later days return 404. That is a fact about the archive, not a failure.",
             "Rows are sampled with row_stride; the spread distribution is unaffected in shape but exact counts are 1/stride of the true ones.",
             "A spread below twice the maker fee means no strategy that earns the spread on this symbol can pay for itself, whatever the signal.",
+            "time_rate_over_fee_floor is the share of the measured clock, not of book updates. It is the honest denominator for 'how long could a quote have been profitable'.",
+            "A wide spread is also when adverse selection is worst, so the wide tail is not free money waiting to be picked up.",
         ],
     }
 
@@ -306,6 +362,12 @@ def print_summary(rep: dict[str, Any]) -> None:
           f"最大={a['max_spread_bps']:.4f} bps")
     print(f"手数料下限を超えたサンプル: {a['samples_over_fee_floor']:,} "
           f"({a['rate_over_fee_floor']*100:.4f}%)")
+    if a.get("time_rate_over_fee_floor") is not None:
+        per_day = a["seconds_over_fee_floor"] / max(1, rep["days_loaded"])
+        print(f"手数料下限を超えた時間: {a['seconds_over_fee_floor']:,.1f}秒 / "
+              f"{a['seconds_measured']:,.0f}秒 "
+              f"({a['time_rate_over_fee_floor']*100:.4f}%, 1日あたり{per_day:.1f}秒)")
+    print(f"手数料÷平均スプレッド: {rep['round_trip_fee_floor_bps'] / a['mean_spread_bps']:.1f}倍")
     edges = a["bins"]["edges_bps"]
     labels = [f"<{e:g}" for e in edges] + [f">={edges[-1]:g}"]
     print("スプレッド分布:")
@@ -349,16 +411,21 @@ def selftest() -> None:
 
     header = ["update_id", "best_bid_price", "best_bid_qty", "best_ask_price",
               "best_ask_qty", "transaction_time", "event_time"]
-    assert _bid_ask_columns(header) == (1, 3)
+    assert _bid_ask_columns(header) == (1, 3, 5)
+    assert to_ms(1_700_000_000_000) == 1_700_000_000_000          # already ms
+    assert to_ms(1_700_000_000_000_000) == 1_700_000_000_000      # microseconds
     assert _bid_ask_columns(["1", "100.0", "1", "101.0", "1", "0", "0"]) is None
 
     import tempfile
     rows = [header]
     # 4 sampled rows at stride 1: spreads of 2, 2, 20 and 200 bps on ~100k.
-    for bid, ask in ((100_000.0, 100_020.0), (100_000.0, 100_020.0),
-                     (100_000.0, 100_200.0), (100_000.0, 102_000.0)):
-        rows.append(["1", f"{bid}", "1", f"{ask}", "1", "0", "0"])
-    rows.append(["1", "0", "1", "0", "1", "0", "0"])  # unusable, must be skipped
+    t0 = 1_700_000_000_000
+    # 1s at 2bps, 1s at 2bps, 1s at 20bps, then 198bps: only the wide ones sit
+    # above the 4bps floor, and each interval is exactly one second.
+    for k, (bid, ask) in enumerate(((100_000.0, 100_020.0), (100_000.0, 100_020.0),
+                                    (100_000.0, 100_200.0), (100_000.0, 102_000.0))):
+        rows.append(["1", f"{bid}", "1", f"{ask}", "1", f"{t0 + k * 1000}", "0"])
+    rows.append(["1", "0", "1", "0", "1", f"{t0 + 4000}", "0"])  # unusable, skipped
     with tempfile.TemporaryDirectory() as td:
         zp = Path(td) / "d.zip"
         buf = io.StringIO()
@@ -371,6 +438,11 @@ def selftest() -> None:
     assert abs(st["max_spread_bps"] - 198.02) < 0.05, st
     # fee floor is 4 bps: only the 20 and 200 bps rows clear it.
     assert st["samples_over_fee_floor"] == 2, st
+    # Three 1s intervals; each is credited to the quote that ends it, so the
+    # 20bps and 198bps rows contribute one second each.
+    assert abs(st["seconds_measured"] - 3.0) < 1e-9, st
+    assert abs(st["seconds_over_fee_floor"] - 2.0) < 1e-9, st
+    assert abs(st["time_rate_over_fee_floor"] - 2 / 3) < 1e-9, st
     print("[jane-history] selftest PASS")
 
 
