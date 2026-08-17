@@ -32,6 +32,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+if sys.version_info < (3, 11):
+    # Importing jane_lab under the macOS system python (3.9) fails with an
+    # opaque "dataclass() got an unexpected keyword argument 'slots'". Say what
+    # is actually wrong and which interpreter to use instead.
+    raise SystemExit(
+        f"jane_hedge needs Python 3.11+ (pyproject requires-python), got "
+        f"{sys.version.split()[0]} at {sys.executable}.\n"
+        f"Run it with the project venv, e.g. .venv/bin/python3 tools/jane_hedge.py ..."
+    )
+
 try:  # package import, and the direct-script path via tools/tools.py
     from tools import jane_lab as base
 except ImportError:  # pragma: no cover - exercised only outside the repo root
