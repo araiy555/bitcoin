@@ -27,6 +27,7 @@ import argparse
 import csv
 import io
 import json
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -62,6 +63,36 @@ MAKER_BPS = {"spot": DEFAULT_MAKER_BPS["binance_spot"],
              "perp": DEFAULT_MAKER_BPS["binance_perp"]}
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """Verify against the bundled roots, exactly as jsboard.net does.
+
+    A Homebrew Python on macOS points OpenSSL at a CA store that is usually
+    empty, so every chain fails verification while curl succeeds. certifi ships
+    Mozilla's roots with the package and behaves the same on every machine.
+    Verification is never disabled: a certificate error means the far end could
+    not be identified, and silencing the check does not fix that.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+SSL_CONTEXT = _ssl_context()
+
+
+def tls_hint(exc: BaseException) -> str | None:
+    text = f"{type(exc).__name__}: {exc}"
+    if "CERTIFICATE_VERIFY_FAILED" not in text and "SSLCertVerification" not in text:
+        return None
+    return (
+        "TLS証明書の検証に失敗しました。Pythonが空のCAストアを見ています。\n"
+        "  .venv/bin/pip install certifi   で解決します"
+        "（このリポジトリの依存に含まれているので、通常は -e インストールで入ります）。"
+    )
+
+
 def archive_url(product: str, dataset: str, symbol: str, day: date) -> str:
     """Identical to jsboard.research.archive.archive_url; selftest asserts it."""
     name = f"{symbol.upper()}-{dataset}-{day:%Y-%m-%d}.zip"
@@ -86,15 +117,16 @@ def sample_days(start: date, end: date, every_n: int) -> list[date]:
     return out
 
 
-def head_ok(url: str, *, timeout: float) -> int:
+def head_ok(url: str, *, timeout: float) -> tuple[int, str | None]:
+    """(status, error). Status 0 means the request never reached the server."""
     req = urllib.request.Request(url, method="HEAD")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return int(resp.status)
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
+            return int(resp.status), None
     except urllib.error.HTTPError as exc:
-        return int(exc.code)
-    except OSError:
-        return 0
+        return int(exc.code), None
+    except OSError as exc:
+        return 0, tls_hint(exc) or f"{type(exc).__name__}: {exc}"
 
 
 def fetch_day(product: str, dataset: str, symbol: str, day: date, *,
@@ -105,11 +137,16 @@ def fetch_day(product: str, dataset: str, symbol: str, day: date, *,
         return target
     url = archive_url(product, dataset, symbol, day)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(url, timeout=timeout, context=SSL_CONTEXT) as resp:
             blob = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
+        raise
+    except OSError as exc:
+        hint = tls_hint(exc)
+        if hint:
+            raise SystemExit(f"[jane-history] {hint}") from exc
         raise
     target.parent.mkdir(parents=True, exist_ok=True)
     # Write beside the target and rename, so an interrupted download cannot
@@ -184,12 +221,17 @@ def spread_day(path: Path, *, row_stride: int, maker_fee_bps: float) -> dict[str
 def probe(product: str, symbol: str, days: list[date], *, timeout: float) -> dict[str, Any]:
     datasets = ("bookTicker", "aggTrades", "bookDepth")
     rows = []
+    errors: list[str] = []
     for d in days:
         row: dict[str, Any] = {"day": d.isoformat()}
         for ds in datasets:
-            row[ds] = head_ok(archive_url(product, ds, symbol, d), timeout=timeout)
+            status, err = head_ok(archive_url(product, ds, symbol, d), timeout=timeout)
+            row[ds] = status
+            if err and err not in errors:
+                errors.append(err)
         rows.append(row)
-    return {"product": product, "symbol": symbol, "datasets": list(datasets), "rows": rows}
+    return {"product": product, "symbol": symbol, "datasets": list(datasets),
+            "rows": rows, "errors": errors}
 
 
 def run(product: str, symbol: str, days: list[date], *, cache: Path, row_stride: int,
@@ -289,6 +331,19 @@ def selftest() -> None:
     except ImportError:
         pass
 
+    # The context must carry roots; an empty store is what broke this on macOS.
+    assert SSL_CONTEXT.verify_mode == ssl.CERT_REQUIRED
+    assert SSL_CONTEXT.cert_store_stats()["x509_ca"] > 0, "CA store is empty"
+    try:  # same roots the rest of the repo uses
+        from jsboard.net import ssl_context as jsb_ctx
+        assert jsb_ctx().cert_store_stats()["x509_ca"] == \
+            SSL_CONTEXT.cert_store_stats()["x509_ca"]
+    except ImportError:
+        pass
+    err = ssl.SSLCertVerificationError("certificate verify failed")
+    assert tls_hint(err) is not None
+    assert tls_hint(OSError("connection refused")) is None
+
     assert sample_days(date(2024, 1, 1), date(2024, 1, 10), 4) == [
         date(2024, 1, 1), date(2024, 1, 5), date(2024, 1, 9)]
 
@@ -354,10 +409,12 @@ def main() -> int:
         for row in rep["rows"]:
             print(f"{row['day']:12s} " +
                   " ".join(f"{row[d]:>10d}" for d in rep["datasets"]))
-        print("\n200=あり 404=なし 0=接続失敗")
+        print("\n200=あり 404=なし 0=サーバに到達できず（下のエラーを参照）")
+        for err in rep["errors"]:
+            print(f"\n[jane-history] {err}")
         Path(args.report).write_text(json.dumps(rep, indent=2), encoding="utf-8")
         print(f"\nreport: {args.report}")
-        return 0
+        return 1 if rep["errors"] else 0
 
     rep = run(args.product, args.symbol, days, cache=Path(args.cache),
               row_stride=args.row_stride, timeout=args.timeout,
