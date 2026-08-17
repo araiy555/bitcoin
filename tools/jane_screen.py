@@ -57,6 +57,11 @@ DEFAULT_TAKER_BPS = base.DEFAULT_TAKER_BPS
 DEFAULT_MAKER_BPS = base.DEFAULT_MAKER_BPS
 
 
+# Edge sizes to count occurrences of, before any fee is charged. This is the
+# question a fee tier cannot change: how big does the dislocation ever get?
+EDGE_THRESHOLDS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+
+
 @dataclass(slots=True)
 class Acc:
     """Population stats for one (maker, hedge, side, notional) family."""
@@ -67,17 +72,25 @@ class Acc:
     pos_raw: int = 0
     sum_raw: float = 0.0
     max_raw: float = -math.inf
+    sum_res: float = 0.0
+    max_res: float = -math.inf
+    res_over: list[int] = field(default_factory=lambda: [0] * len(EDGE_THRESHOLDS))
     episodes: int = 0
     last_pos_ts: int | None = None
     top: list[tuple[float, int, dict[str, Any]]] = field(default_factory=list)
 
-    def add(self, ts: int, *, net_adj: float, net_raw: float, row: dict[str, Any],
-            episode_gap_ms: float, keep_top: int) -> None:
+    def add(self, ts: int, *, net_adj: float, net_raw: float, residual: float,
+            row: dict[str, Any], episode_gap_ms: float, keep_top: int) -> None:
         self.n += 1
         self.sum_adj += net_adj
         self.sum_raw += net_raw
         self.max_adj = max(self.max_adj, net_adj)
         self.max_raw = max(self.max_raw, net_raw)
+        self.sum_res += residual
+        self.max_res = max(self.max_res, residual)
+        for i, thr in enumerate(EDGE_THRESHOLDS):
+            if residual > thr:
+                self.res_over[i] += 1
         if net_raw > 0:
             self.pos_raw += 1
         if net_adj > 0:
@@ -236,7 +249,7 @@ def screen(capture: Path, *, notionals: tuple[float, ...], sample_ms: float,
                         continue
                     acc.setdefault((m, h, side, notional), Acc()).add(
                         ts, net_adj=row["net_residual_bps"], net_raw=row["net_raw_bps"],
-                        row=row,
+                        residual=row["residual_bps"], row=row,
                         episode_gap_ms=episode_gap_ms, keep_top=keep_top,
                     )
 
@@ -321,6 +334,13 @@ def summarize(acc: dict[tuple[str, str, str, float], Acc]) -> list[dict[str, Any
             "net_residual_positive": a.pos_adj,
             "net_residual_positive_rate": a.pos_adj / a.n,
             "positive_episodes": a.episodes,
+            # Pre-fee edge. A fee tier can move the bar down to zero but cannot
+            # make the dislocation itself any bigger, so these are the numbers
+            # that decide whether any tier could ever work.
+            "residual_mean_bps": a.sum_res / a.n,
+            "residual_best_bps": a.max_res,
+            "fee_budget_needed_bps": a.max_res,
+            "edge_counts": {f">{t:g}bps": c for t, c in zip(EDGE_THRESHOLDS, a.res_over)},
             "net_raw_mean_bps": a.sum_raw / a.n,
             "net_raw_best_bps": a.max_raw,
             "net_raw_positive": a.pos_raw,
@@ -354,6 +374,20 @@ def print_summary(rep: dict[str, Any], *, top_n: int) -> None:
         print("  成立したファミリーなし（板不足/鮮度切れ）")
         print("=======================================================")
         return
+
+    edged = sorted(fams, key=lambda r: r["residual_best_bps"], reverse=True)
+    print("\n優位性ランキング（手数料控除前の残差＝歪みの大きさそのもの）:")
+    print(f"  {'maker':13s}->{'hedge':13s} {'side':4s} {'残差平均':>8s} {'残差最良':>8s} "
+          f"{'>1bps':>6s} {'>2bps':>6s} {'>4bps':>6s} {'>8bps':>6s} {'必要手数料':>9s} {'現手数料':>7s}")
+    for f in edged[:top_n]:
+        c = f["edge_counts"]
+        print(
+            f"  {f['maker_source']:13s}->{f['hedge_source']:13s} {f['side']:4s} "
+            f"{f['residual_mean_bps']:+8.3f} {f['residual_best_bps']:+8.3f} "
+            f"{c['>1bps']:6d} {c['>2bps']:6d} {c['>4bps']:6d} {c['>8bps']:6d} "
+            f"{f['fee_budget_needed_bps']:9.3f} {f['fees_bps']:7.1f}"
+        )
+    print("  ※ 必要手数料 = Maker+Taker合計がこの値未満でなければ、最良の一瞬すら黒字になりません。")
 
     live = [f for f in fams if f["positive_episodes"] > 0]
     print(f"\n手数料を超えた（残差ベース）ファミリー: {len(live)} / {len(fams)}")
@@ -416,12 +450,17 @@ def selftest() -> None:
     a = Acc()
     det = {"x": 1}
     for ms in (0, 100, 200, 5_000):
-        a.add(int(ms * 1e6), net_adj=1.0, net_raw=1.0, row=det,
+        a.add(int(ms * 1e6), net_adj=1.0, net_raw=1.0, residual=3.0, row=det,
               episode_gap_ms=1000.0, keep_top=5)
     assert a.n == 4 and a.pos_adj == 4 and a.episodes == 2, a
+    # residual 3.0 clears the 0.5/1/2 bps thresholds but not 4/8/16.
+    assert a.res_over == [4, 4, 4, 0, 0, 0], a.res_over
+    assert a.max_res == 3.0
     a2 = Acc()
-    a2.add(0, net_adj=-1.0, net_raw=1.0, row=det, episode_gap_ms=1000.0, keep_top=5)
+    a2.add(0, net_adj=-1.0, net_raw=1.0, residual=0.2, row=det,
+           episode_gap_ms=1000.0, keep_top=5)
     assert a2.pos_adj == 0 and a2.pos_raw == 1 and a2.episodes == 0
+    assert a2.res_over == [0] * len(EDGE_THRESHOLDS)
     print("[jane-screen] selftest PASS")
 
 
