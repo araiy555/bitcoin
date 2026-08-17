@@ -153,11 +153,32 @@ def window_stats(times: list[int], rates: list[float], *, hold_days: float,
         starts.append(t)
     if not nets:
         return {"hold_days": hold_days, "windows": 0}
+
+    # Overlapping windows share almost all of their prints, so a rate computed
+    # over them counts one regime hundreds of times. Walking forward a whole
+    # holding period at a time gives the independent observations, which for a
+    # long hold over a few years is a single-digit number - and that is the
+    # honest sample size for any claim about how often this works.
+    indep: list[float] = []
+    cursor_t = starts[0]
+    k = 0
+    while k < len(starts):
+        if starts[k] < cursor_t:
+            k += 1
+            continue
+        indep.append(nets[k])
+        cursor_t = starts[k] + span
+        k += 1
+
     worst_i = min(range(len(nets)), key=lambda k: nets[k])
     best_i = max(range(len(nets)), key=lambda k: nets[k])
     return {
         "hold_days": hold_days,
         "windows": len(nets),
+        "independent_windows": len(indep),
+        "independent_positive_rate": sum(1 for v in indep if v > 0) / len(indep),
+        "independent_mean_net_bps": statistics.fmean(indep),
+        "independent_median_net_bps": statistics.median(indep),
         "round_trip_fee_bps": round_trip_fee_bps,
         "mean_net_bps": statistics.fmean(nets),
         "median_net_bps": statistics.median(nets),
@@ -192,7 +213,8 @@ def yearly(times: list[int], rates: list[float]) -> list[dict[str, Any]]:
 
 
 def analyze(rows: list[dict[str, Any]], *, hold_days: tuple[float, ...],
-            spot_taker_bps: float, perp_taker_bps: float) -> dict[str, Any]:
+            spot_taker_bps: float, perp_taker_bps: float,
+            recent_days: float | None = None) -> dict[str, Any]:
     times, rates = to_series(rows)
     if len(times) < 2:
         return {"version": VERSION, "available": False, "reason": "funding prints not found"}
@@ -223,6 +245,12 @@ def analyze(rows: list[dict[str, Any]], *, hold_days: tuple[float, ...],
         "days_to_repay_fees": (round_trip / mean_bps * interval_h / 24.0)
                               if mean_bps > 0 else None,
         "by_year": yearly(times, rates),
+        # The full-sample average is carried by 2021. What the strategy is
+        # worth now needs the tail of the data on its own.
+        "recent": recent_slice(rows, times, hold_days=hold_days,
+                               spot_taker_bps=spot_taker_bps,
+                               perp_taker_bps=perp_taker_bps,
+                               recent_days=recent_days),
         "windows": [window_stats(times, rates, hold_days=d, round_trip_fee_bps=round_trip)
                     for d in hold_days],
         "notes": [
@@ -233,6 +261,21 @@ def analyze(rows: list[dict[str, Any]], *, hold_days: tuple[float, ...],
             "Funding is not an arbitrage. It is payment for taking the other side of crowded leverage, and it turns negative exactly when that crowd flips.",
         ],
     }
+
+
+def recent_slice(rows: list[dict[str, Any]], times: list[int], *,
+                 hold_days: tuple[float, ...], spot_taker_bps: float,
+                 perp_taker_bps: float, recent_days: float | None) -> dict[str, Any] | None:
+    if not recent_days or not times:
+        return None
+    cut = times[-1] - int(recent_days * DAY_MS)
+    kept = [r for r in rows if int(r["fundingTime"]) >= cut]
+    if len(kept) < 2:
+        return None
+    sub = analyze(kept, hold_days=hold_days, spot_taker_bps=spot_taker_bps,
+                  perp_taker_bps=perp_taker_bps, recent_days=None)
+    sub["recent_days"] = recent_days
+    return sub
 
 
 def print_summary(rep: dict[str, Any]) -> None:
@@ -276,6 +319,31 @@ def print_summary(rep: dict[str, Any]) -> None:
             f"{w['worst_net_bps']:+9.2f} {w['worst_start']:>12s} "
             f"{w['annualised_pct_if_repeated']:+8.2f}%"
         )
+
+    print("\n重複を除いた独立窓のみ（これが本当の標本数）:")
+    print(f"  {'保有':>6s} {'独立数':>7s} {'net平均':>9s} {'net中央':>9s} {'黒字率':>8s}")
+    for w in rep["windows"]:
+        if not w["windows"]:
+            continue
+        print(
+            f"  {w['hold_days']:5g}日 {w['independent_windows']:7d} "
+            f"{w['independent_mean_net_bps']:+9.2f} "
+            f"{w['independent_median_net_bps']:+9.2f} "
+            f"{w['independent_positive_rate']*100:7.2f}%"
+        )
+
+    rec = rep.get("recent")
+    if rec:
+        print(f"\n直近{rec['recent_days']:g}日のみ（{rec['first']} 〜 {rec['last']}）:")
+        print(f"  1回あたり平均={rec['mean_bps_per_print']:+.4f}bps "
+              f"プラス率={rec['positive_rate']*100:.2f}% "
+              f"手数料控除前年率={rec['gross_annualised_pct']:+.2f}%")
+        for w in rec["windows"]:
+            if not w["windows"]:
+                continue
+            print(f"  {w['hold_days']:5g}日: net中央={w['median_net_bps']:+8.2f}bps "
+                  f"黒字率={w['positive_rate']*100:6.2f}% "
+                  f"(独立{w['independent_windows']}窓で{w['independent_positive_rate']*100:.0f}%)")
     print("\n※ ファンディングは裁定ではなく、偏ったレバレッジの反対側を引き受ける対価です。")
     print("※ ベーシス損益・証拠金・清算リスクは未モデル化。")
     print("=" * 56)
@@ -298,6 +366,20 @@ def selftest() -> None:
     assert abs(rep["round_trip_fee_bps"] - 28.0) < 1e-12
     # 1 bps three times a day repays 28 bps of fees in 28/3 days.
     assert abs(rep["days_to_repay_fees"] - 28.0 / 3.0) < 1e-9, rep["days_to_repay_fees"]
+    # 270 prints spans 89.7 days, so 30-day holds starting at day 0 and day 30
+    # both fit; one starting at day 60 would run past the last print.
+    w30 = rep["windows"][0]
+    assert w30["independent_windows"] == 2, w30["independent_windows"]
+    assert w30["independent_positive_rate"] == 1.0
+    assert abs(w30["independent_mean_net_bps"] - 62.0) < 1e-9
+
+    # The recent slice must see only the tail, and must not recurse.
+    r = analyze(rows, hold_days=(30.0,), spot_taker_bps=10.0, perp_taker_bps=4.0,
+                recent_days=30.0)
+    assert r["recent"] is not None and r["recent"]["recent"] is None
+    assert r["recent"]["prints"] < r["prints"], (r["recent"]["prints"], r["prints"])
+    assert r["recent"]["recent_days"] == 30.0
+
     w = rep["windows"][0]
     # 30 days x 3 prints x 1 bps = 90 bps gross, minus 28 bps of fees.
     assert abs(w["mean_net_bps"] - 62.0) < 1e-9, w
@@ -324,6 +406,8 @@ def main() -> int:
     p.add_argument("--cache", default=str(DEFAULT_CACHE))
     p.add_argument("--refresh", action="store_true", help="ignore the cached download")
     p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--recent-days", type=float, default=365.0,
+                   help="直近この日数だけの再計算も出す。0で無効")
     p.add_argument("--report", default="jane-carry-report.json")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
@@ -340,7 +424,8 @@ def main() -> int:
                          timeout=args.timeout, refresh=args.refresh)
     print(f"[jane-carry] ファンディング {len(rows):,} 件")
     rep = analyze(rows, hold_days=tuple(sorted(set(args.hold_days))),
-                  spot_taker_bps=args.spot_taker_bps, perp_taker_bps=args.perp_taker_bps)
+                  spot_taker_bps=args.spot_taker_bps, perp_taker_bps=args.perp_taker_bps,
+                  recent_days=args.recent_days or None)
     rep["config"] = vars(args)
     Path(args.report).write_text(json.dumps(rep, indent=2, allow_nan=False), encoding="utf-8")
     print_summary(rep)
