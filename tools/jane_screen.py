@@ -91,6 +91,38 @@ class Acc:
                 heapq.heappop(self.top)
 
 
+SPREAD_BINS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+@dataclass(slots=True)
+class SpreadAcc:
+    """Top-of-book spread of one venue, in bps, against its own fee floor.
+
+    A round trip that rests on both sides of one venue earns the spread once
+    and pays the maker fee twice, so ``spread > 2 * maker fee`` is the floor any
+    single-venue quoting strategy has to clear before anything else matters.
+    """
+    n: int = 0
+    total: float = 0.0
+    min_v: float = math.inf
+    max_v: float = -math.inf
+    over_fee: int = 0
+    bins: list[int] = field(default_factory=lambda: [0] * (len(SPREAD_BINS) + 1))
+
+    def add(self, spread_bps: float, *, fee_floor_bps: float) -> None:
+        self.n += 1
+        self.total += spread_bps
+        self.min_v = min(self.min_v, spread_bps)
+        self.max_v = max(self.max_v, spread_bps)
+        if spread_bps > fee_floor_bps:
+            self.over_fee += 1
+        for i, edge in enumerate(SPREAD_BINS):
+            if spread_bps < edge:
+                self.bins[i] += 1
+                return
+        self.bins[-1] += 1
+
+
 def ewma_alpha(dt_ms: float, halflife_ms: float) -> float:
     if halflife_ms <= 0:
         return 1.0
@@ -161,6 +193,7 @@ def screen(capture: Path, *, notionals: tuple[float, ...], sample_ms: float,
     basis: dict[tuple[str, str], float] = {}
     basis_ts: dict[tuple[str, str], int] = {}
     acc: dict[tuple[str, str, str, float], Acc] = {}
+    spreads: dict[str, SpreadAcc] = {}
     first_ts = 0
     samples = 0
     step = int(sample_ms * 1e6)
@@ -171,6 +204,11 @@ def screen(capture: Path, *, notionals: tuple[float, ...], sample_ms: float,
         samples += 1
         fresh = {s: b for s, b in latest.items()
                  if (ts - b["ts_ns"]) / 1e6 <= max_age_ms}
+        for s, b in fresh.items():
+            spreads.setdefault(s, SpreadAcc()).add(
+                (b["asks"][0][0] - b["bids"][0][0]) / b["mid"] * 10_000.0,
+                fee_floor_bps=2.0 * DEFAULT_MAKER_BPS[s],
+            )
         for m, h in pairs:
             bm, bh = fresh.get(m), fresh.get(h)
             if bm is None or bh is None:
@@ -230,6 +268,7 @@ def screen(capture: Path, *, notionals: tuple[float, ...], sample_ms: float,
         "version": VERSION,
         "capture": str(capture),
         "samples": samples,
+        "spreads": summarize_spreads(spreads),
         "families": summarize(acc),
         "notes": [
             "Residual = raw gross - EWMA basis between the two venues; only deviation from the recent normal relationship is counted as edge.",
@@ -237,8 +276,31 @@ def screen(capture: Path, *, notionals: tuple[float, ...], sample_ms: float,
             "The hedge price is walked over real depth, so size-driven slippage is included. Maker fills are NOT modelled: every sample assumes the resting order would have been filled at the touch, which is optimistic.",
             "positive_episodes merges consecutive positive samples so one dislocation counts once.",
             "raw_* columns are the unadjusted view the old ranking used, kept only to show how much of it was basis.",
+            "The spread table is the structural floor: a venue whose top-of-book spread is below twice its maker fee cannot support any strategy that earns the spread, regardless of signal quality.",
         ],
     }
+
+
+def summarize_spreads(spreads: dict[str, SpreadAcc]) -> list[dict[str, Any]]:
+    out = []
+    for s, a in spreads.items():
+        if not a.n:
+            continue
+        fee_floor = 2.0 * DEFAULT_MAKER_BPS[s]
+        out.append({
+            "source": s,
+            "samples": a.n,
+            "mean_spread_bps": a.total / a.n,
+            "min_spread_bps": a.min_v,
+            "max_spread_bps": a.max_v,
+            "maker_fee_bps": DEFAULT_MAKER_BPS[s],
+            "round_trip_fee_floor_bps": fee_floor,
+            "samples_over_fee_floor": a.over_fee,
+            "rate_over_fee_floor": a.over_fee / a.n,
+            "bins": {"edges_bps": list(SPREAD_BINS), "counts": list(a.bins)},
+        })
+    out.sort(key=lambda r: r["mean_spread_bps"])
+    return out
 
 
 def summarize(acc: dict[tuple[str, str, str, float], Acc]) -> list[dict[str, Any]]:
@@ -273,6 +335,20 @@ def print_summary(rep: dict[str, Any], *, top_n: int) -> None:
     print("\n======== ①b ベーシス調整後の候補スクリーニング ========")
     print(f"capture: {rep['capture']}")
     print(f"サンプル数: {rep['samples']:,}")
+    sp = rep.get("spreads") or []
+    if sp:
+        print("\n会場別スプレッド vs 往復Maker手数料（単一会場で板を張る場合の下限）:")
+        print(f"  {'venue':14s} {'平均spread':>10s} {'最小':>7s} {'最大':>8s} "
+              f"{'手数料下限':>10s} {'超過率':>8s}")
+        for r in sp:
+            print(
+                f"  {r['source']:14s} {r['mean_spread_bps']:10.3f} "
+                f"{r['min_spread_bps']:7.3f} {r['max_spread_bps']:8.3f} "
+                f"{r['round_trip_fee_floor_bps']:10.1f} "
+                f"{r['rate_over_fee_floor']*100:7.3f}%"
+            )
+        print("  ※ 超過率 = スプレッドが往復Maker手数料(2×)を上回ったサンプルの割合。")
+
     fams = rep["families"]
     if not fams:
         print("  成立したファミリーなし（板不足/鮮度切れ）")
@@ -328,6 +404,14 @@ def selftest() -> None:
     assert evaluate_sample(maker, book(100_050.0, qty=1e-9), side="buy",
                            notional=1000.0, basis_bps=b, maker_fee_bps=2.0,
                            taker_fee_bps=4.0) is None
+
+    sa = SpreadAcc()
+    for v in (0.1, 0.3, 5.0):
+        sa.add(v, fee_floor_bps=4.0)
+    assert sa.n == 3 and sa.over_fee == 1 and sum(sa.bins) == 3
+    # 0.1 -> [0,0.25), 0.3 -> [0.25,0.5), 5.0 -> [4,8)
+    assert sa.bins == [1, 1, 0, 0, 0, 1, 0], sa.bins
+    assert abs(sa.min_v - 0.1) < 1e-12 and abs(sa.max_v - 5.0) < 1e-12
 
     a = Acc()
     det = {"x": 1}
