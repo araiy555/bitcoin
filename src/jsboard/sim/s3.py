@@ -80,7 +80,16 @@ def default_client():
         raise RuntimeError(
             "S3 への保存には boto3 が必要です: pip install -e '.[s3]'"
         ) from exc
-    return boto3.client("s3")
+    try:
+        return boto3.client("s3")
+    except Exception as exc:  # noqa: BLE001 - the credential chain has its own types
+        # Credential problems surface here, before a single line is recorded.
+        # Letting them out raw buries a one-line remedy under a traceback, and
+        # the remedy is the only part worth reading.
+        raise RuntimeError(
+            f"S3クライアントを作れませんでした: {exc}\n"
+            "  aws configure か aws login で認証を設定してください。"
+        ) from exc
 
 
 @dataclass(slots=True)

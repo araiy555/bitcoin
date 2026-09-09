@@ -166,6 +166,25 @@ class TestCredentials:
         params = set(inspect.signature(RotatingJsonlSink).parameters)
         assert not (params & {"aws_access_key_id", "aws_secret_access_key", "token"})
 
+    def test_an_unusable_credential_chain_becomes_one_readable_line(self, monkeypatch):
+        # boto3 raises its own exception types here, and the CLI only knows how
+        # to print a RuntimeError. Without the translation the user gets a
+        # 30-line traceback whose one useful line is "run aws configure".
+        import sys
+        import types
+
+        from jsboard.sim import s3
+
+        class Boom(Exception):
+            pass
+
+        fake = types.ModuleType("boto3")
+        fake.client = lambda *a, **kw: (_ for _ in ()).throw(Boom("no credentials"))
+        monkeypatch.setitem(sys.modules, "boto3", fake)
+
+        with pytest.raises(RuntimeError, match="aws configure"):
+            s3.default_client()
+
 
 class TestFileLikeContract:
     """MultiCapture writes to this as if it were an open file."""
