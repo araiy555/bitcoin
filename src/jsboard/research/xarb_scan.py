@@ -24,7 +24,6 @@ import websockets
 
 from ..net import ssl_context
 
-
 BINANCE_SPOT_WS = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
 BINANCE_PERP_WS = "wss://fstream.binance.com/ws/btcusdt@depth20@100ms"
 BYBIT_WS = {

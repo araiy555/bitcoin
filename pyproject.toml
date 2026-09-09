@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+s3 = [
+    # Only needed for `capture --s3-bucket`. Credentials come from boto3's own
+    # chain (environment, shared config, instance role); the project never
+    # takes a key as an argument.
+    "boto3>=1.34",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

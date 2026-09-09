@@ -76,6 +76,7 @@ from .sim.hedge import HedgeConfig, Hedger
 from .sim.pair import CrossMarketFairValue, PairQuoteGate
 from .sim.paper import PAPER_OWNER, PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
+from .sim.s3 import RotatingJsonlSink, S3Target
 from .ui.board import Board
 
 console = Console()
@@ -2507,9 +2508,23 @@ async def cmd_capture(args: argparse.Namespace) -> int:
 
     out = Path(args.out)
     basis_sample_ms = args.basis_sample_ms if args.basis_sample_ms > 0 else None
+    sink = None
+    if args.s3_bucket:
+        try:
+            sink = RotatingJsonlSink(
+                path=out,
+                target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
+                symbol=args.symbol.upper(),
+                rotate_seconds=args.rotate_minutes * 60.0,
+                keep_local=args.keep_local,
+            )
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
     capture = MultiCapture(
         sources,
         out,
+        sink=sink,
         basis_sample_ms=basis_sample_ms,
         basis_depth=args.basis_depth,
     )
@@ -2517,7 +2532,16 @@ async def cmd_capture(args: argparse.Namespace) -> int:
     console.rule(f"[bold cyan]{args.symbol.upper()} を記録")
     console.print(
         f"  出力   : {out}\n"
-        f"  対象   : {', '.join(sources)}\n"
+        + (
+            f"  S3     : s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/"
+            f"symbol={args.symbol.upper()}/...  "
+            f"({args.rotate_minutes:g}分ごとに gzip 転送"
+            + ("・ローカルも保持" if args.keep_local else "・転送後ローカル削除")
+            + ")\n"
+            if sink is not None
+            else ""
+        )
+        + f"  対象   : {', '.join(sources)}\n"
         f"  停止   : "
         + (f"{args.duration:.0f}秒後" if args.duration else "Ctrl-C まで")
         + (
@@ -2564,9 +2588,24 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         f"  停止理由 : {result.stopped_because}\n"
         f"  時間     : {result.duration_s:,.1f}秒\n"
         f"  イベント : {result.total_events:,} 件\n"
-        f"  出力     : {out}  ({out.stat().st_size / 1e6:,.1f} MB)\n"
-        f"  メタ     : {meta.name}"
+        + (
+            f"  出力     : {out}  ({out.stat().st_size / 1e6:,.1f} MB)\n"
+            if sink is None and out.exists()
+            else ""
+        )
+        + f"  メタ     : {meta.name}"
     )
+    if sink is not None:
+        s3 = sink.summary()
+        console.print(
+            f"  S3       : {len(s3['uploaded']):,} 個を s3://{s3['bucket']} へ転送"
+        )
+        for key in s3["uploaded"][-3:]:
+            console.print(f"    [dim]{key}[/dim]")
+        for failure in s3["failed"]:
+            # A failed part keeps its local copy; say so rather than leaving
+            # the impression the hour is safely in the bucket.
+            console.print(f"    [red]転送失敗（ローカルに残置）: {failure}[/red]")
     for name, st in result.stats.items():
         kinds = ", ".join(f"{k} {v:,}" for k, v in sorted(st.by_kind.items()))
         console.print(f"  [bold]{name}[/bold]: {st.events:,} 件  [dim]{kinds}[/dim]")
@@ -3932,6 +3971,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--fallback-after", type=float, default=10.0, help="auto の待ち時間（秒）")
     p_cap.add_argument("--trade-poll", type=float, default=1.0, help="REST約定の取得間隔（秒）")
     p_cap.add_argument("--mark-poll", type=float, default=1.0, help="RESTマークの取得間隔（秒）")
+    s3 = p_cap.add_argument_group("S3")
+    s3.add_argument("--s3-bucket", default=None, help="指定すると分割して gzip 転送する")
+    s3.add_argument("--s3-prefix", default="raw", help="バケット内の接頭辞")
+    s3.add_argument("--rotate-minutes", type=float, default=15.0, help="何分ごとに転送するか")
+    s3.add_argument(
+        "--keep-local", action="store_true",
+        help="転送後もローカルの分割ファイルを消さない",
+    )
     p_cap.set_defaults(func=cmd_capture)
 
     return parser

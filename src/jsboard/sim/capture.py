@@ -79,6 +79,7 @@ class MultiCapture:
         *,
         on_event: Callable[[str, FeedEvent], None] | None = None,
         flush_every: int = 500,
+        sink: object | None = None,
         basis_sample_ms: float | None = None,
         basis_depth: int = 20,
     ) -> None:
@@ -88,6 +89,10 @@ class MultiCapture:
         self.path = Path(path)
         self.on_event = on_event
         self.flush_every = flush_every
+        self.sink = sink
+        """Where the lines go. A plain append-mode file when absent; anything
+        with write/flush/close otherwise, which is how the S3 uploader slots in
+        without the recorder knowing about buckets or rotation."""
         if basis_sample_ms is not None and basis_sample_ms <= 0:
             raise ValueError("basis sample interval must be positive")
         if basis_depth <= 0:
@@ -189,7 +194,7 @@ class MultiCapture:
 
         written = 0
         try:
-            with self.path.open("a", encoding="utf-8") as fh:
+            with self._open_sink() as fh:
                 while True:
                     if duration_s is not None and (time.time_ns() - started) / 1e9 >= duration_s:
                         reason = "duration reached"
@@ -256,6 +261,9 @@ class MultiCapture:
             stats=self.stats,
             stopped_because=reason,
         )
+
+    def _open_sink(self):
+        return self.sink if self.sink is not None else self.path.open("a", encoding="utf-8")
 
     async def _pump(self, name: str, feed: Feed, queue: asyncio.Queue) -> None:
         """Drain one feed into the shared queue, tagging the arrival time."""
