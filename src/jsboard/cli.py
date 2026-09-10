@@ -3623,7 +3623,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep = sub.add_parser("replay", help="replay a capture")
     add_common(p_rep)
     p_rep.add_argument("path")
-    p_rep.add_argument("--speed", type=float, default=1.0, help="0 = as fast as possible")
+    # A backtest wants the answer, not the wait: a one-hour recording replayed
+    # at 1.0 takes an hour to say what it can say in seconds. Real time is the
+    # exception here (watching the board move), so it is the flag, not the
+    # default.
+    p_rep.add_argument(
+        "--speed", type=float, default=0.0,
+        help="再生速度。既定の0は最速、1.0は実時間と同じ速さ",
+    )
     p_rep.add_argument(
         "--source", default=None,
         help="capture 録画のどちらを再生するか (spot / perp)",

@@ -162,3 +162,13 @@ def test_a_size_the_user_typed_is_still_refused() -> None:
     assert _adapt_generic_defaults(instrument, args) == []
     with pytest.raises(ConfigError, match="最小単位"):
         _check_sizes(instrument, args)
+
+
+def test_a_backtest_runs_at_full_speed_unless_asked_otherwise() -> None:
+    """An hour of data should not cost an hour to evaluate.
+
+    Real-time playback is for watching the board move, which is a deliberate
+    choice rather than the thing you get by not making one.
+    """
+    assert build_parser().parse_args(["replay", "us.jsonl"]).speed == 0.0
+    assert build_parser().parse_args(["replay", "us.jsonl", "--speed", "1"]).speed == 1.0
