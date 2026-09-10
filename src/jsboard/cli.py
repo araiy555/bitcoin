@@ -205,6 +205,49 @@ class ConfigError(Exception):
     """A setting that would make the session do nothing, caught at startup."""
 
 
+DEFAULT_SIZE = "0.01"
+DEFAULT_MAX_POSITION = "0.10"
+
+
+def _adapt_generic_defaults(
+    instrument: Instrument,
+    args: argparse.Namespace,
+    *,
+    skip_report: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Rescale the untouched BTC-shaped defaults to the instrument at hand.
+
+    `sweep` and `hedge` already did this; every other command left the user to
+    discover the lot size by hitting two refusals in a row. Nobody asked for
+    0.01 units — it is what the parser fills in when nothing is said — so
+    adapting it is honouring the request rather than overriding it.
+
+    A value the user typed is left alone, including a wrong one: _check_sizes
+    still refuses it, because silently trading a size nobody asked for is worse
+    than stopping. That distinction is why the parser default is None rather
+    than "0.01" — an explicit `--size 0.01` on a whole-token instrument must
+    still fail, and a string default cannot tell the two apart.
+    """
+    changed: list[str] = []
+    if args.size is None:
+        if instrument.to_lots(DEFAULT_SIZE) > 0:
+            args.size = DEFAULT_SIZE
+        else:
+            text = f"{instrument.lot_size * 100:f}"
+            # Strip only a fractional tail: "100" must not become "1".
+            args.size = text.rstrip("0").rstrip(".") if "." in text else text
+            if "size" not in skip_report:
+                changed.append(f"--size {args.size}")
+    if args.max_position is None:
+        if instrument.to_lots(DEFAULT_MAX_POSITION) >= instrument.to_lots(args.size):
+            args.max_position = DEFAULT_MAX_POSITION
+        else:
+            args.max_position = str(Decimal(args.size) * 10)
+            if "max_position" not in skip_report:
+                changed.append(f"--max-position {args.max_position}")
+    return changed
+
+
 def _check_sizes(instrument: Instrument, args: argparse.Namespace) -> None:
     """Refuse sizes that round away to nothing.
 
@@ -234,6 +277,11 @@ def _check_sizes(instrument: Instrument, args: argparse.Namespace) -> None:
 
 
 def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker:
+    adapted = _adapt_generic_defaults(instrument, args)
+    if adapted:
+        console.print(
+            f"[dim]{instrument.symbol} の最小単位に合わせました: {' '.join(adapted)}[/dim]"
+        )
     _check_sizes(instrument, args)
     market = MarketView(instrument=instrument, depth=args.depth)
 
@@ -750,7 +798,9 @@ def _prepare_sweep_defaults(
     Explicit size/max-position sweep axes remain untouched so invalid requested
     combinations are still rejected visibly by _check_sizes.
     """
-    changed: list[str] = []
+    # A swept axis replaces the value on every run, so adapting the base is
+    # invisible and reporting it would be noise.
+    changed = _adapt_generic_defaults(instrument, args, skip_report=frozenset(axes))
     if "size" not in axes and instrument.to_lots(args.size) <= 0:
         args.size = str(instrument.lot_size * 100)
         changed.append(f"size={args.size}")
@@ -773,7 +823,7 @@ def _prepare_pair_defaults(
     venue when their lot sizes differ.  Silently reporting zero opportunities
     in that case is a configuration error disguised as a market result.
     """
-    changed: list[str] = []
+    changed = _adapt_generic_defaults(maker, args)
     if maker.to_lots(args.size) <= 0 or hedge.to_lots(args.size) <= 0:
         args.size = str(max(maker.lot_size, hedge.lot_size) * 100)
         changed.append(f"size={args.size}")
@@ -3463,8 +3513,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
     mm.add_argument("--kappa", type=float, default=1.4, help="order arrival intensity")
     mm.add_argument("--levels", type=int, default=3, help="ladder depth per side")
     mm.add_argument("--level-step", type=int, default=2, help="ticks between levels")
-    mm.add_argument("--size", default="0.01", help="base quote size per level")
-    mm.add_argument("--max-position", default="0.10", help="inventory limit")
+    mm.add_argument("--size", default=None, help=f"base quote size per level (既定 {DEFAULT_SIZE}、最小単位に満たなければ自動調整)")
+    mm.add_argument("--max-position", default=None, help=f"inventory limit (既定 {DEFAULT_MAX_POSITION}、同上)")
     mm.add_argument("--min-half-spread", type=int, default=1, help="ticks")
     mm.add_argument(
         "--max-distance",
