@@ -2656,6 +2656,15 @@ async def cmd_capture(args: argparse.Namespace) -> int:
             # A failed part keeps its local copy; say so rather than leaving
             # the impression the hour is safely in the bucket.
             console.print(f"    [red]転送失敗（ローカルに残置）: {failure}[/red]")
+        if s3["failed"]:
+            # The parts are on disk but the file the user was told to analyse
+            # never existed: with a sink the lines went to the parts instead.
+            # Without this line the hour looks lost when it is intact.
+            console.print(
+                f"  [yellow]分割ファイルは手元にあります。"
+                f"1本にまとめれば解析できます:[/yellow]\n"
+                f"    [dim]cat {out.stem}-*{out.suffix} > {out.name}[/dim]"
+            )
     for name, st in result.stats.items():
         kinds = ", ".join(f"{k} {v:,}" for k, v in sorted(st.by_kind.items()))
         console.print(f"  [bold]{name}[/bold]: {st.events:,} 件  [dim]{kinds}[/dim]")
