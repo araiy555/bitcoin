@@ -2392,6 +2392,82 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_carry(args: argparse.Namespace) -> int:
+    """Funding history turned into the worst case of holding the carry."""
+    from .research.carry import CarryStudy, fetch_funding, parse_funding
+
+    if args.entry_cost_bps < 0:
+        raise ConfigError("--entry-cost-bps は0以上で指定してください。")
+    if args.from_file:
+        source = Path(args.from_file)
+        if not source.exists():
+            raise ConfigError(f"{source} がありません。")
+        points = parse_funding(json.loads(source.read_text()))
+        origin = source.name
+    else:
+        console.print(f"[dim]{args.symbol.upper()} のFunding履歴を取得中…[/dim]")
+        points = await fetch_funding(args.symbol, days=args.days)
+        origin = f"Binance /fapi/v1/fundingRate（直近{args.days:g}日）"
+        if args.save:
+            Path(args.save).write_text(
+                json.dumps(
+                    [{"fundingTime": p.ts_ms, "fundingRate": p.rate} for p in points],
+                    indent=2,
+                )
+            )
+    if not points:
+        raise ConfigError("Funding履歴が空です。銘柄名と期間を確認してください。")
+
+    study = CarryStudy(
+        points,
+        entry_cost_bps=args.entry_cost_bps,
+        drawdown_window_days=args.window_days,
+    )
+    payback = study.payback_summary(max_hold_days=args.max_hold_days)
+    first, last = study.points[0].when, study.points[-1].when
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} Fundingキャリー — 現物買い・先物売りを持ち切る")
+    console.print(
+        f"  出典   : {origin}\n"
+        f"  期間   : {first:%Y-%m-%d} 〜 {last:%Y-%m-%d}  "
+        f"({study.span_days:,.0f}日 / {len(study):,}回 / {study.interval_hours:g}時間ごと)\n"
+        f"  入場費 : {args.entry_cost_bps:g}bps（4脚の往復手数料）"
+    )
+    console.print(
+        f"\n  平均   : {study.mean_bps:+.4f} bps/回  中央値 {study.median_bps:+.4f}\n"
+        f"  年率   : {study.annual_pct:+.2f}%（単利・手数料前）\n"
+        f"  マイナス回: {study.negative_share * 100:.1f}%  最悪の1回 {study.worst_settlement_bps:+.2f} bps"
+    )
+    console.print(
+        f"\n  最大DD : {study.max_drawdown_bps:.2f} bps（累積曲線の高値からの落ち込み）\n"
+        f"  水面下 : 最長 {study.longest_underwater_days:,.1f}日\n"
+        f"  最悪{args.window_days}日: {study.worst_window_bps():+.2f} bps"
+    )
+    if payback["median_days"] is None:
+        console.print(
+            f"\n  [red]回収 : {args.max_hold_days:g}日以内に入場費を回収できた入場はありません[/red]"
+        )
+    else:
+        console.print(
+            f"\n  回収   : 中央値 {payback['median_days']:.1f}日 / "
+            f"9割が {payback['p90_days']:.1f}日以内\n"
+            f"  未回収 : {payback['never']:,} / {payback['judged']:,} 回 "
+            f"({payback['never_share'] * 100:.1f}%、{args.max_hold_days:g}日で打ち切り)"
+        )
+
+    net_annual = study.annual_pct
+    verdict = (
+        "判定: Fundingは入場費を回収し、平均では正。拘束される証拠金と清算リスクに見合うかは別問題です。"
+        if payback["never_share"] < 0.1 and net_annual > 0
+        else "判定: この期間のFundingでは、入場費を安定して回収できていません。"
+    )
+    console.print(f"\n{verdict}")
+    console.print(
+        "[dim]  清算リスクと取引所リスクは含みません。Fundingの系列には現れないためです。[/dim]"
+    )
+    return 0
+
+
 async def cmd_basis(args: argparse.Namespace) -> int:
     """Replay Binance spot/perpetual basis with executable four-leg prices."""
     path = Path(args.path)
@@ -4028,6 +4104,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_basis.add_argument("--plain", action="store_true")
     p_basis.set_defaults(func=cmd_basis)
+
+    p_carry = sub.add_parser(
+        "carry", help="現物買い・無期限先物売りを持ち続けたときのFunding収支を調べる"
+    )
+    p_carry.add_argument("--symbol", default="BTCUSDT")
+    p_carry.add_argument("--days", type=float, default=730.0, help="遡る日数")
+    p_carry.add_argument(
+        "--entry-cost-bps", type=float, default=28.0,
+        help="建てて閉じるまでの往復手数料。既定は現物10bps+先物4bpsの4脚",
+    )
+    p_carry.add_argument(
+        "--max-hold-days", type=float, default=180.0, help="回収を待つ上限日数",
+    )
+    p_carry.add_argument(
+        "--window-days", type=int, default=30, help="最悪期間を測る窓の長さ",
+    )
+    p_carry.add_argument("--save", default=None, help="取得した履歴をJSONで保存する")
+    p_carry.add_argument("--from-file", default=None, help="保存済みJSONを読む（取得しない）")
+    p_carry.add_argument("--plain", action="store_true")
+    p_carry.set_defaults(func=cmd_carry)
 
     p_cap = sub.add_parser("capture", help="現物と先物を同時に記録する")
     p_cap.add_argument("--symbol", default="BTCUSDT")
