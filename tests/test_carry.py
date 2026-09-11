@@ -183,3 +183,90 @@ class TestCommand:
         )
         with pytest.raises(ConfigError, match="nope.json"):
             asyncio.run(cmd_carry(args))
+
+
+class TestTiming:
+    def test_the_signal_cannot_see_the_settlement_it_is_positioned_for(self):
+        """A rule that reads its own payment turns any series into a winner."""
+        from jsboard.research.carry import run_timed
+
+        # Flat, then one huge settlement. A lookahead rule would be in for it.
+        points = series([0.0] * 5 + [1000.0] + [0.0] * 5)
+        result = run_timed(points, lookback=2, enter_bps=1.0, exit_bps=0.5,
+                           entry_cost_bps=0.0)
+        assert result.net_bps <= 0.0
+
+    def test_it_enters_after_the_signal_and_collects_what_follows(self):
+        from jsboard.research.carry import run_timed
+
+        points = series([5.0] * 10)
+        result = run_timed(points, lookback=2, enter_bps=1.0, exit_bps=0.5,
+                           entry_cost_bps=0.0)
+        assert result.trips == 1
+        assert result.net_bps == pytest.approx(5.0 * 8)  # the 8 after the window
+
+    def test_a_series_that_never_qualifies_never_pays_the_entry(self):
+        from jsboard.research.carry import run_timed
+
+        result = run_timed(series([0.1] * 50), lookback=3, enter_bps=5.0,
+                           exit_bps=1.0, entry_cost_bps=28.0)
+        assert result.trips == 0
+        assert result.net_bps == 0.0
+        assert result.time_in_market == 0.0
+
+    def test_each_re_entry_pays_the_cost_again(self):
+        from jsboard.research.carry import run_timed
+
+        # Rich, thin, rich again: two entries, two costs.
+        points = series([5.0] * 6 + [0.0] * 6 + [5.0] * 6)
+        result = run_timed(points, lookback=2, enter_bps=2.0, exit_bps=1.0,
+                           entry_cost_bps=10.0)
+        assert result.trips == 2
+        assert result.net_bps < run_timed(
+            points, lookback=2, enter_bps=2.0, exit_bps=1.0, entry_cost_bps=0.0
+        ).net_bps
+
+    def test_deployed_return_exceeds_the_full_period_one_when_it_sits_out(self):
+        from jsboard.research.carry import run_timed
+
+        points = series([5.0] * 10 + [0.0] * 30)
+        result = run_timed(points, lookback=2, enter_bps=2.0, exit_bps=1.0,
+                           entry_cost_bps=0.0)
+        assert 0 < result.time_in_market < 1
+        assert result.annual_pct_deployed > result.annual_pct_full
+
+    def test_an_exit_above_the_entry_is_refused(self):
+        from jsboard.research.carry import run_timed
+
+        with pytest.raises(ValueError):
+            run_timed(series([1.0] * 10), lookback=2, enter_bps=1.0, exit_bps=2.0)
+
+    def test_a_history_shorter_than_the_lookback_reports_nothing(self):
+        from jsboard.research.carry import run_timed
+
+        result = run_timed(series([1.0] * 3), lookback=10, enter_bps=0.0, exit_bps=0.0)
+        assert result.trips == 0
+        assert result.equity_bps == []
+
+
+def test_the_timing_grid_runs_and_names_the_baseline(tmp_path, capsys):
+    import asyncio
+    import json
+
+    from jsboard.cli import build_parser, cmd_carry
+
+    path = tmp_path / "funding.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"fundingTime": START + i * 8 * HOUR_MS, "fundingRate": 0.00005}
+                for i in range(400)
+            ]
+        )
+    )
+    args = build_parser().parse_args(
+        ["carry", "--from-file", str(path), "--timing", "--plain"]
+    )
+    assert asyncio.run(cmd_carry(args)) == 0
+    out = capsys.readouterr().out
+    assert "常時保有" in out

@@ -244,6 +244,113 @@ class CarryStudy:
         }
 
 
+# ---------------------------------------------------------------------- timed
+
+
+@dataclass(frozen=True, slots=True)
+class TimedResult:
+    """Holding the carry only while funding is rich enough to be worth it."""
+
+    trips: int
+    net_bps: float
+    days_held: float
+    span_days: float
+    max_drawdown_bps: float
+    equity_bps: list[float]
+
+    @property
+    def time_in_market(self) -> float:
+        return self.days_held / self.span_days if self.span_days else 0.0
+
+    @property
+    def annual_pct_full(self) -> float:
+        """Return on capital that sat ready the whole period, idle or not.
+
+        This is what the strategy earns if it is the only use of the money.
+        """
+        if self.span_days <= 0:
+            return 0.0
+        return self.net_bps / self.span_days * 365.0 / 100.0
+
+    @property
+    def annual_pct_deployed(self) -> float:
+        """Return per day actually in the position.
+
+        Higher than the full-period figure whenever the rule sits out, and it
+        says whether the position is good rather than whether the schedule is.
+        """
+        if self.days_held <= 0:
+            return 0.0
+        return self.net_bps / self.days_held * 365.0 / 100.0
+
+
+def run_timed(
+    points: list[FundingPoint],
+    *,
+    lookback: int,
+    enter_bps: float,
+    exit_bps: float,
+    entry_cost_bps: float = 28.0,
+) -> TimedResult:
+    """Enter when trailing funding is rich, leave when it thins out.
+
+    The signal is the mean of the `lookback` settlements **strictly before**
+    the one being positioned for. Including the current settlement would let
+    the rule see the payment it is deciding to collect, which turns any series
+    into a winner and means nothing.
+
+    The whole round-trip cost is charged at entry rather than split across the
+    two ends. It is the same money either way, and charging it up front keeps
+    a position that is closed by the end of the data from looking free.
+    """
+    if lookback < 1:
+        raise ValueError("the lookback needs at least one settlement")
+    if exit_bps > enter_bps:
+        raise ValueError("the exit threshold cannot be above the entry threshold")
+    if len(points) <= lookback:
+        return TimedResult(0, 0.0, 0.0, 0.0, 0.0, [])
+
+    rates = [p.bps for p in points]
+    equity = 0.0
+    curve: list[float] = []
+    held = False
+    trips = 0
+    settlements_held = 0
+    for i in range(lookback, len(points)):
+        window = rates[i - lookback : i]
+        signal = statistics.fmean(window)
+        if not held and signal >= enter_bps:
+            held = True
+            trips += 1
+            equity -= entry_cost_bps
+        elif held and signal < exit_bps:
+            held = False
+        if held:
+            equity += rates[i]
+            settlements_held += 1
+        curve.append(equity)
+
+    peak = 0.0
+    worst = 0.0
+    for value in curve:
+        peak = max(peak, value)
+        worst = max(worst, peak - value)
+
+    interval_days = (
+        (points[-1].ts_ms - points[0].ts_ms) / MS_PER_DAY / (len(points) - 1)
+        if len(points) > 1
+        else 0.0
+    )
+    return TimedResult(
+        trips=trips,
+        net_bps=equity,
+        days_held=settlements_held * interval_days,
+        span_days=(points[-1].ts_ms - points[lookback].ts_ms) / MS_PER_DAY,
+        max_drawdown_bps=worst,
+        equity_bps=curve,
+    )
+
+
 # --------------------------------------------------------------------- source
 
 

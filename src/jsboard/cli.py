@@ -2392,6 +2392,48 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
     return 0
 
 
+def _carry_timing_grid(study, args: argparse.Namespace) -> None:
+    """Every combination tried, not the best one found.
+
+    A single reported winner from a grid searched on the same two years is a
+    number about this data, not about the trade. Printing the whole surface
+    makes the difference visible: a broad band of similar results is worth
+    something, one bright cell surrounded by losses is not.
+    """
+    from .research.carry import run_timed
+
+    lookbacks = [int(v) for v in args.lookbacks.split(",") if v.strip()]
+    enters = [float(v) for v in args.enters.split(",") if v.strip()]
+    baseline = study.annual_pct - args.entry_cost_bps / study.span_days * 365 / 100.0
+
+    table = Table(title="入場条件つき（同じ2年で探索した値なので、過学習として読むこと）")
+    table.add_column("窓")
+    for enter in enters:
+        table.add_column(f"≥{enter:g}bps", justify="right")
+    for lookback in lookbacks:
+        row = [f"{lookback * study.interval_hours / 24:g}日"]
+        for enter in enters:
+            result = run_timed(
+                study.points,
+                lookback=lookback,
+                enter_bps=enter,
+                exit_bps=enter / 2.0,
+                entry_cost_bps=args.entry_cost_bps,
+            )
+            row.append(
+                f"{result.annual_pct_full:+.1f}% / {result.time_in_market * 100:.0f}%在"
+                if result.trips
+                else "—"
+            )
+        table.add_row(*row)
+    console.print()
+    console.print(table)
+    console.print(
+        f"  [dim]各セルは「常時保有に対する代替案の年率 / 建玉していた時間の割合」。"
+        f"常時保有は {baseline:+.1f}%。[/dim]"
+    )
+
+
 async def cmd_carry(args: argparse.Namespace) -> int:
     """Funding history turned into the worst case of holding the carry."""
     from .research.carry import CarryStudy, fetch_funding, parse_funding
@@ -2454,6 +2496,9 @@ async def cmd_carry(args: argparse.Namespace) -> int:
             f"  未回収 : {payback['never']:,} / {payback['judged']:,} 回 "
             f"({payback['never_share'] * 100:.1f}%、{args.max_hold_days:g}日で打ち切り)"
         )
+
+    if args.timing:
+        _carry_timing_grid(study, args)
 
     net_annual = study.annual_pct
     verdict = (
@@ -4122,6 +4167,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_carry.add_argument("--save", default=None, help="取得した履歴をJSONで保存する")
     p_carry.add_argument("--from-file", default=None, help="保存済みJSONを読む（取得しない）")
+    p_carry.add_argument(
+        "--timing", action="store_true",
+        help="Fundingが厚い時期だけ建てる案を、常時保有と並べて出す",
+    )
+    p_carry.add_argument(
+        "--lookbacks", default="3,9,21,63",
+        help="--timing の判断に使う直近の決済回数（カンマ区切り）",
+    )
+    p_carry.add_argument(
+        "--enters", default="0.3,0.5,0.7,1.0",
+        help="--timing の建玉しきい値 bps/回（カンマ区切り）。手仕舞いはその半値",
+    )
     p_carry.add_argument("--plain", action="store_true")
     p_carry.set_defaults(func=cmd_carry)
 
