@@ -365,3 +365,33 @@ async def test_basis_cli_replays_spot_perp_capture(tmp_path, capsys):
     assert "現物–先物ベーシス" in output
     assert "完了取引 : 1" in output
     assert "Funding" in output
+
+
+class TestNearMiss:
+    """Zero trades is an answer; how close it came is the useful part."""
+
+    def test_a_run_that_never_trades_still_says_how_far_short_it_fell(self):
+        eng = engine(fees=50.0)  # far above anything this spread can pay
+        warm(eng)
+        update(eng, 10, 101.0)
+
+        assert eng.stats.entries == 0
+        assert eng.stats.best_net_bps is not None
+        assert eng.stats.best_net_bps < 0
+        # Gross minus net is what the round trip cost, and it must be the fees.
+        assert eng.stats.best_gross_bps - eng.stats.best_net_bps > 100.0
+
+    def test_the_best_moment_is_kept_not_the_last_one(self):
+        eng = engine(fees=50.0)
+        warm(eng)
+        update(eng, 10, 101.0)
+        best = eng.stats.best_net_bps
+        update(eng, 12, 100.05)  # a much smaller divergence afterwards
+
+        assert eng.stats.best_net_bps == best
+
+    def test_nothing_is_claimed_before_any_signal(self):
+        eng = engine(fees=50.0)
+        warm(eng)
+
+        assert eng.stats.best_net_bps is None

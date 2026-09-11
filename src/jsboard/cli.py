@@ -2319,6 +2319,15 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
             "  拒否理由: "
             + " / ".join(f"{code}={count:,}" for code, count in sorted(stats.reject_codes.items()))
         )
+    if stats.best_net_bps is not None:
+        # Zero trades is an answer, but not the same answer every time. Say how
+        # far the best moment fell short, so a dead idea is distinguishable
+        # from one that only needs cheaper fills.
+        cost_bps = stats.best_gross_bps - stats.best_net_bps
+        console.print(
+            f"  最良の機会: 収束 {stats.best_gross_bps:.2f}bps / "
+            f"全コスト {cost_bps:.2f}bps / 差 {stats.best_net_bps:+.2f}bps"
+        )
     if engine.trades:
         rows = engine.trades[-20:]
         if args.plain:
@@ -2458,6 +2467,15 @@ async def cmd_basis(args: argparse.Namespace) -> int:
         console.print(
             "  拒否理由: "
             + " / ".join(f"{code}={count:,}" for code, count in sorted(stats.reject_codes.items()))
+        )
+    if stats.best_net_bps is not None:
+        # Zero trades is an answer, but not the same answer every time. Say how
+        # far the best moment fell short, so a dead idea is distinguishable
+        # from one that only needs cheaper fills.
+        cost_bps = stats.best_gross_bps - stats.best_net_bps
+        console.print(
+            f"  最良の機会: 収束 {stats.best_gross_bps:.2f}bps / "
+            f"全コスト {cost_bps:.2f}bps / 差 {stats.best_net_bps:+.2f}bps"
         )
     if engine.trades:
         console.print("long\tshort\tentry_z\texit_z\thold_s\texpected\tnet_bps\treason")

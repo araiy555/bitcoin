@@ -101,6 +101,15 @@ class CrossArbStats:
     funding_candidates: int = 0
     funding_settlements: int = 0
     reject_codes: dict[str, int] = field(default_factory=dict)
+    best_gross_bps: float = 0.0
+    best_net_bps: float | None = None
+    """The closest the market came to paying for a round trip.
+
+    A run with zero trades says only "no", and "no" has two very different
+    causes: the edge was 2bps against a 30bps cost, or it was 29. The first is
+    a dead strategy, the second is a fee tier. Without this the two look
+    identical in the output.
+    """
 
 
 class CrossExchangeArb:
@@ -225,6 +234,11 @@ class CrossExchangeArb:
     def _record_rejects(self, codes: tuple[RejectCode, ...]) -> None:
         for code in codes:
             self.stats.reject_codes[code.value] = self.stats.reject_codes.get(code.value, 0) + 1
+
+    def _record_best(self, decision) -> None:
+        if self.stats.best_net_bps is None or decision.expected_net_bps > self.stats.best_net_bps:
+            self.stats.best_net_bps = decision.expected_net_bps
+            self.stats.best_gross_bps = decision.gross_edge_bps
 
     def _common_qty(self) -> float:
         quantities = [
@@ -361,6 +375,7 @@ class CrossExchangeArb:
             costs,
             min_expected_net_bps=self.config.min_expected_net_bps,
         )
+        self._record_best(decision)
         if not decision.accepted:
             self.stats.rejected_cost += 1
             self._record_rejects(decision.reject_codes)
