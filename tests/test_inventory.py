@@ -173,3 +173,29 @@ class TestDrawdown:
             t.update(equity)
 
         assert t.drawdown == 0.0
+
+
+class TestRebates:
+    """A venue paying its market makers to quote is the condition that
+    separates their economics from a retail account's, so the tools have to be
+    able to express it. Refusing the sign meant the comparison could not be
+    run at all."""
+
+    def test_a_negative_maker_fee_is_a_credit_not_a_charge(self):
+        from jsboard.mm.inventory import FeeSchedule
+
+        assert FeeSchedule(maker_bps=-1.0).cost(10_000.0, is_maker=True) == -1.0
+
+    def test_the_taker_side_is_untouched_by_a_maker_rebate(self):
+        from jsboard.mm.inventory import FeeSchedule
+
+        fees = FeeSchedule(maker_bps=-1.0, taker_bps=4.0)
+        assert fees.cost(10_000.0, is_maker=False) == 4.0
+
+    def test_the_replay_parser_accepts_a_rebate(self):
+        from jsboard.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["replay", "us.jsonl", "--maker-bps", "-1"]
+        )
+        assert args.maker_bps == -1.0

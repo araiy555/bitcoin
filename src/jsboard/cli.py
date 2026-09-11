@@ -1684,8 +1684,12 @@ async def cmd_dealer(args: argparse.Namespace) -> int:
         args.perp_maker_bps,
         args.perp_taker_bps,
     )
-    if any(value < 0 for value in fees):
-        raise ConfigError("maker/taker手数料は0以上で指定してください。")
+    # A negative fee is a rebate, and rebates are real: a venue pays its
+    # designated market makers to quote. Refusing the sign made the tool unable
+    # to model the one condition that separates a market maker's economics from
+    # a retail account's, which is exactly the comparison worth running.
+    if any(value < -10.0 for value in fees):
+        raise ConfigError("手数料は-10bps以上で指定してください（マイナスはリベート）。")
     if args.size_base <= 0 or args.sample_ms < 0 or args.depth <= 0:
         raise ConfigError(
             "--size-baseと--depthは0より大きく、--sample-msは0以上にしてください。"
@@ -2264,8 +2268,12 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
     instruments = {
         source: _instrument_from_spec(sources[source]) for source in ("binance", "bybit")
     }
-    if any(value < 0 for value in (args.binance_taker_bps, args.bybit_taker_bps)):
-        raise ConfigError("taker手数料は0以上で指定してください。")
+    # A negative fee is a rebate, and rebates are real: a venue pays its
+    # designated market makers to quote. Refusing the sign made the tool unable
+    # to model the one condition that separates a market maker's economics from
+    # a retail account's, which is exactly the comparison worth running.
+    if any(value < -10.0 for value in (args.binance_taker_bps, args.bybit_taker_bps)):
+        raise ConfigError("手数料は-10bps以上で指定してください（マイナスはリベート）。")
     if args.sample_ms < 0:
         raise ConfigError("--sample-msは0以上で指定してください。")
     config = CrossArbConfig(
@@ -2528,8 +2536,12 @@ async def cmd_basis(args: argparse.Namespace) -> int:
     instruments = {
         source: _instrument_from_spec(sources[source]) for source in ("perp", "spot")
     }
-    if any(value < 0 for value in (args.spot_taker_bps, args.perp_taker_bps)):
-        raise ConfigError("taker手数料は0以上で指定してください。")
+    # A negative fee is a rebate, and rebates are real: a venue pays its
+    # designated market makers to quote. Refusing the sign made the tool unable
+    # to model the one condition that separates a market maker's economics from
+    # a retail account's, which is exactly the comparison worth running.
+    if any(value < -10.0 for value in (args.spot_taker_bps, args.perp_taker_bps)):
+        raise ConfigError("手数料は-10bps以上で指定してください（マイナスはリベート）。")
     if args.sample_ms < 0:
         raise ConfigError("--sample-msは0以上で指定してください。")
     allowed_directions = None if args.allow_spot_short else (("spot", "perp"),)
