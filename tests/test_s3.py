@@ -221,3 +221,109 @@ class TestFileLikeContract:
         assert client.calls == 1
         body = next(iter(client.objects.values()))
         assert b'"k": "trade"' in gzip.decompress(body)
+
+
+class TestRecordingsInTheBucket:
+    """A bucket you can only write to does not save the disk it was for.
+
+    The whole reason for having somewhere else to put a day of data is that
+    the laptop cannot hold it. A downloader that writes locally and then
+    uploads still needs the local disk for the entire file — so a recording
+    has to be readable straight out of the bucket, not merely archivable to
+    it.
+    """
+
+    def test_a_uri_splits_into_bucket_and_key(self):
+        from jsboard.sim.s3 import split_uri
+
+        assert split_uri("s3://jsboard-capture/history/x.jsonl.gz") == (
+            "jsboard-capture",
+            "history/x.jsonl.gz",
+        )
+
+    def test_a_uri_without_a_key_is_refused(self):
+        import pytest
+
+        from jsboard.sim.s3 import split_uri
+
+        with pytest.raises(ValueError):
+            split_uri("s3://jsboard-capture")
+
+    def test_a_local_path_is_not_mistaken_for_a_uri(self):
+        from jsboard.sim.s3 import is_s3_uri
+
+        assert not is_s3_uri("x.jsonl.gz")
+        assert not is_s3_uri("/tmp/s3/x.jsonl")
+        assert is_s3_uri("s3://b/k")
+
+    def test_the_meta_file_sits_beside_the_object_either_way(self):
+        from pathlib import Path
+
+        from jsboard.sim.s3 import meta_uri
+
+        assert meta_uri("s3://b/h/x.jsonl.gz") == "s3://b/h/x.jsonl.gz.meta.json"
+        assert meta_uri(Path("x.jsonl.gz")) == "x.jsonl.gz.meta.json"
+
+    def test_a_local_gzip_recording_still_reads(self, tmp_path):
+        import gzip
+
+        from jsboard.sim.s3 import open_text
+
+        path = tmp_path / "r.jsonl.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write('{"a":1}\n')
+        with open_text(path) as fh:
+            assert fh.read() == '{"a":1}\n'
+
+    def test_a_gzipped_object_is_streamed_and_decompressed(self, monkeypatch):
+        import gzip
+        import io
+
+        import jsboard.sim.s3 as s3
+
+        body = gzip.compress(b'{"a":1}\n')
+
+        class FakeClient:
+            def get_object(self, Bucket, Key):  # noqa: N803 - boto3's spelling
+                assert (Bucket, Key) == ("b", "h/x.jsonl.gz")
+                return {"Body": io.BytesIO(body)}
+
+        monkeypatch.setattr(s3, "default_client", FakeClient)
+        with s3.open_text("s3://b/h/x.jsonl.gz") as fh:
+            assert fh.read() == '{"a":1}\n'
+
+    def test_an_uncompressed_object_is_read_as_text(self, monkeypatch):
+        import io
+
+        import jsboard.sim.s3 as s3
+
+        class FakeClient:
+            def get_object(self, Bucket, Key):  # noqa: N803
+                return {"Body": io.BytesIO(b'{"a":1}\n')}
+
+        monkeypatch.setattr(s3, "default_client", FakeClient)
+        with s3.open_text("s3://b/h/x.jsonl") as fh:
+            assert fh.read() == '{"a":1}\n'
+
+    def test_a_replay_reads_a_recording_out_of_the_bucket(self, tmp_path, monkeypatch):
+        """The reader the whole study goes through, pointed at an object."""
+        import gzip
+        import io
+
+        import jsboard.sim.s3 as s3
+        from jsboard.feed.replay import iter_tagged
+
+        local = tmp_path / "r.jsonl.gz"
+        with gzip.open(local, "wt", encoding="utf-8") as fh:
+            fh.write(
+                '{"k":"status","state":"live","detail":"archive","ts_ns":1,'
+                '"src":"binance","rx_ns":1}\n'
+            )
+        blob = local.read_bytes()
+
+        class FakeClient:
+            def get_object(self, Bucket, Key):  # noqa: N803
+                return {"Body": io.BytesIO(blob)}
+
+        monkeypatch.setattr(s3, "default_client", FakeClient)
+        assert [src for src, _ in iter_tagged("s3://b/h/r.jsonl.gz")] == ["binance"]

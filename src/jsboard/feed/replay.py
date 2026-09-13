@@ -233,7 +233,7 @@ def iter_tagged(path: str | Path):
     book builds a book that never existed. Cross-venue work needs the
     opposite: both streams, still interleaved, each routed to its own book.
     """
-    with _open_text(Path(path)) as fh:
+    with _open_text(path) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -252,7 +252,7 @@ def iter_tagged_timed(path: str | Path):
     not compare exchange clocks from two different products.  Old recordings
     without ``rx_ns`` remain usable by falling back to the event timestamp.
     """
-    with _open_text(Path(path)) as fh:
+    with _open_text(path) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -300,18 +300,18 @@ the longer names are the canonical CMR-001 schema.
 """
 
 
-def _open_text(path: Path):
-    """A recording, compressed or not.
+def _open_text(path: str | Path):
+    """A recording, compressed or not, local or in a bucket.
 
     A day of BTC futures is 4.8GB as plain JSONL and under 400MB gzipped, on a
     laptop with 7.9GB free. Choosing by suffix keeps every existing recording
-    readable without a flag.
+    readable without a flag, and accepting an `s3://` URI means the laptop
+    never has to hold the file at all — which is the whole point of having
+    somewhere else to put it.
     """
-    if path.suffix == ".gz":
-        import gzip
+    from ..sim.s3 import open_text
 
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open(encoding="utf-8")
+    return open_text(path)
 
 
 class ReplayFeed(Feed):

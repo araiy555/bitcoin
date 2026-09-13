@@ -92,6 +92,77 @@ def default_client():
         ) from exc
 
 
+S3_SCHEME = "s3://"
+
+
+def is_s3_uri(uri: str | Path) -> bool:
+    return str(uri).startswith(S3_SCHEME)
+
+
+def split_uri(uri: str | Path) -> tuple[str, str]:
+    """`s3://bucket/a/b.jsonl.gz` → `("bucket", "a/b.jsonl.gz")`."""
+    rest = str(uri)[len(S3_SCHEME) :]
+    bucket, _, key = rest.partition("/")
+    if not bucket or not key:
+        raise ValueError(f"s3://バケット/キー の形で指定してください: {uri}")
+    return bucket, key
+
+
+def open_text(uri: str | Path):
+    """A recording as text, wherever it lives and however it is compressed.
+
+    The point of having a bucket is that the laptop does not have to hold the
+    data. A downloader that writes locally and then uploads still needs the
+    local disk for the whole file, which is the constraint the bucket was
+    supposed to remove — so a recording has to be *readable* from the bucket,
+    not merely archivable to it.
+
+    The object is streamed rather than downloaded: a day of two venues is
+    several hundred megabytes and a replay reads it once, front to back.
+    """
+    text = str(uri)
+    if not is_s3_uri(text):
+        path = Path(text)
+        if path.suffix == ".gz":
+            return gzip.open(path, "rt", encoding="utf-8")
+        return path.open(encoding="utf-8")
+
+    import io
+
+    bucket, key = split_uri(text)
+    body = default_client().get_object(Bucket=bucket, Key=key)["Body"]
+    if key.endswith(".gz"):
+        return io.TextIOWrapper(gzip.GzipFile(fileobj=body), encoding="utf-8")
+    return io.TextIOWrapper(body, encoding="utf-8")
+
+
+def read_bytes(uri: str | Path) -> bytes:
+    if not is_s3_uri(uri):
+        return Path(uri).read_bytes()
+    bucket, key = split_uri(uri)
+    return default_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def exists(uri: str | Path) -> bool:
+    if not is_s3_uri(uri):
+        return Path(uri).exists()
+    bucket, key = split_uri(uri)
+    try:
+        default_client().head_object(Bucket=bucket, Key=key)
+    except Exception:  # noqa: BLE001 - botocore's 404 has its own type
+        return False
+    return True
+
+
+def meta_uri(uri: str | Path) -> str:
+    """Where a recording's spec file sits, on either kind of location."""
+    text = str(uri)
+    if is_s3_uri(text):
+        return text + ".meta.json"
+    path = Path(text)
+    return str(path.with_suffix(path.suffix + ".meta.json"))
+
+
 @dataclass(slots=True)
 class RotatingJsonlSink:
     """A file-like sink that rotates, compresses and uploads as it goes.

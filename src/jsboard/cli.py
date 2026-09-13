@@ -2386,18 +2386,20 @@ def _replay_two_market_capture(
     engine.finalize()
 
 
-def _xarb_instruments(path: Path) -> dict[str, Instrument]:
+def _xarb_instruments(path: str | Path) -> dict[str, Instrument]:
     """Both venues' specs from the recording's own metadata.
 
     Guessing tick and lot here would rescale one venue's prices against the
     other's, which is indistinguishable from a spread.
     """
-    meta_path = path.with_suffix(path.suffix + ".meta.json")
-    if not meta_path.exists():
+    from .sim.s3 import exists, meta_uri, read_bytes
+
+    meta_path = meta_uri(path)
+    if not exists(meta_path):
         raise ConfigError(
-            f"{meta_path.name} がありません。xcapture か xvision の出力が必要です。"
+            f"{meta_path} がありません。xcapture か xvision の出力が必要です。"
         )
-    sources = json.loads(meta_path.read_text()).get("sources") or {}
+    sources = json.loads(read_bytes(meta_path)).get("sources") or {}
     if not {"binance", "bybit"}.issubset(sources):
         raise ConfigError(
             "xarbにはbinanceとbybitを同時に含む録画が必要です"
@@ -2437,8 +2439,13 @@ def _xarb_config(args: argparse.Namespace) -> CrossArbConfig:
 
 async def cmd_xarb(args: argparse.Namespace) -> int:
     """Replay a causal Binance/Bybit spread strategy with four real crosses."""
-    path = Path(args.path)
-    if not path.exists():
+    from .sim.s3 import exists as location_exists
+    from .sim.s3 import is_s3_uri
+
+    # Kept as text rather than a Path: `Path("s3://b/k")` silently collapses
+    # the double slash and the URI stops resolving.
+    path = args.path if is_s3_uri(args.path) else Path(args.path)
+    if not location_exists(path):
         raise ConfigError(
             f"{path} がありません。先に xvision（過去データ）か xcapture（ライブ）を実行してください。"
         )
@@ -2450,7 +2457,7 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
 
     console.rule("[bold cyan]取引所間Zスコア — 実板・往復全コスト replay")
     console.print(
-        f"  データ : {path.name}\n"
+        f"  データ : {Path(str(path)).name}\n"
         f"  契約   : Binance/Bybit {instruments['binance'].symbol} perpetual\n"
         f"  数量   : {args.size_base:g} {instruments['binance'].base}\n"
         f"  信号   : 過去{args.lookback_minutes:g}分のlog価格差 / "
@@ -3022,17 +3029,31 @@ async def cmd_xvision(args: argparse.Namespace) -> int:
         raise ConfigError(
             "片方の取引所のイベントが0件です。価格差は測れません。"
         )
+    target = str(out)
     if args.s3_bucket:
         from .sim.s3 import default_client
 
         key = f"{args.s3_prefix.strip('/')}/{binance.symbol}-x/{out.name}"
+        meta = out.with_suffix(out.suffix + ".meta.json")
         try:
-            default_client().upload_file(str(out), args.s3_bucket, key)
+            client = default_client()
+            client.upload_file(str(out), args.s3_bucket, key)
+            client.upload_file(str(meta), args.s3_bucket, key + ".meta.json")
         except Exception as exc:  # noqa: BLE001 - the local file is still there
-            console.print(f"  [red]S3 転送失敗: {exc}[/red]")
+            console.print(f"  [red]S3 転送失敗: {exc}[/red]（ローカルは残しました）")
         else:
-            console.print(f"  S3     : s3://{args.s3_bucket}/{key}")
-    console.print(f"\n[dim]  次: jsboard xarb {out} --plain[/dim]")
+            target = f"s3://{args.s3_bucket}/{key}"
+            console.print(f"  S3     : {target}")
+            if not args.keep:
+                # Uploading and then keeping the file is the worst of both:
+                # the bucket bill and the full local disk. The bucket exists so
+                # the laptop does not have to hold the data, and `xarb` reads
+                # the object directly, so the local copy has no reader left.
+                freed = out.stat().st_size
+                out.unlink(missing_ok=True)
+                meta.unlink(missing_ok=True)
+                console.print(f"  ローカル: 削除（{freed / 1e6:,.1f} MB 解放）")
+    console.print(f"\n[dim]  次: jsboard xarb {target} --plain[/dim]")
     return 0
 
 
@@ -5003,6 +5024,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_xvision.add_argument("--lot-size", default=None)
     p_xvision.add_argument("--s3-bucket", default=None, help="保存先バケット")
     p_xvision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
+    p_xvision.add_argument(
+        "--keep",
+        action="store_true",
+        help="S3へ送ったあともローカルを残す（既定は削除。xarbはs3://を直接読む）",
+    )
     p_xvision.set_defaults(func=cmd_xvision)
 
     p_walk = sub.add_parser(
