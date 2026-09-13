@@ -317,6 +317,10 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             max_position_lots=instrument.to_lots(args.max_position),
             max_notional=args.max_notional,
             max_drawdown=args.max_drawdown,
+            # A book rebuilt from the tape has one level a side, which is the
+            # truth about the archive rather than a thin market. Refusing to
+            # quote on it would make every archived day report a flat zero.
+            min_book_levels=getattr(args, "min_book_levels", 2),
         )
     )
     venue = PaperVenue(
@@ -3804,6 +3808,12 @@ def add_common(p: argparse.ArgumentParser) -> None:
     mm.add_argument("--size", default=None, help=f"base quote size per level (既定 {DEFAULT_SIZE}、最小単位に満たなければ自動調整)")
     mm.add_argument("--max-position", default=None, help=f"inventory limit (既定 {DEFAULT_MAX_POSITION}、同上)")
     mm.add_argument("--min-half-spread", type=int, default=1, help="ticks")
+    mm.add_argument(
+        "--min-book-levels",
+        type=int,
+        default=2,
+        help="建値を出すのに要る板の段数。約定から再現した板は1段しかない",
+    )
     mm.add_argument(
         "--vol-multiplier",
         type=float,

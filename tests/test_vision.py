@@ -422,3 +422,29 @@ class TestFeedStatus:
 
         lines = [json.loads(x) for x in out.read_text().splitlines()]
         assert lines[0]["ts_ns"] == lines[1]["ts_ns"]
+
+
+class TestThinBook:
+    """One level a side is what the archive has, not a thin market."""
+
+    def test_the_level_requirement_can_be_lowered(self):
+        from decimal import Decimal
+
+        from jsboard.cli import build_maker, build_parser
+        from jsboard.core.types import Instrument
+
+        args = build_parser().parse_args(
+            ["replay", "us.jsonl", "--min-book-levels", "1"]
+        )
+        inst = Instrument("USUSDT", Decimal("0.000001"), Decimal("1"))
+        assert build_maker(inst, args).risk.limits.min_book_levels == 1
+
+    def test_the_live_default_is_untouched(self):
+        from decimal import Decimal
+
+        from jsboard.cli import build_maker, build_parser
+        from jsboard.core.types import Instrument
+
+        args = build_parser().parse_args(["replay", "us.jsonl"])
+        inst = Instrument("USUSDT", Decimal("0.000001"), Decimal("1"))
+        assert build_maker(inst, args).risk.limits.min_book_levels == 2
