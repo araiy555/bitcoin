@@ -657,6 +657,19 @@ async def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_write(path: Path):
+    """Write gzipped when the name asks for it.
+
+    The archives expand about fifteen fold into JSONL, and the machine doing
+    the replay has less free disk than two days of BTC would take.
+    """
+    if path.suffix == ".gz":
+        import gzip
+
+        return gzip.open(path, "wt", encoding="utf-8")
+    return path.open("w", encoding="utf-8")
+
+
 def _parse_when(text: str | None) -> int | None:
     """An ISO time on the recording's own clock, in UTC.
 
@@ -2523,7 +2536,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
     inferred = 0
     missing: list[str] = []
 
-    with out.open("w", encoding="utf-8") as fh:
+    with _open_write(out) as fh:
         for day in days:
             book_url = daily_url("bookTicker", args.symbol, day)
             tape_url = daily_url("aggTrades", args.symbol, day)
@@ -2574,6 +2587,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
             console.print(f"  {day}: {day_count:,} 件")
 
     write_meta(out, {"perp": _spec_dict(instrument, "perp")}, source="data.binance.vision")
+
     console.rule("[bold cyan]過去データの取り込み完了")
     console.print(
         f"  銘柄   : {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
@@ -2595,6 +2609,26 @@ async def cmd_vision(args: argparse.Namespace) -> int:
         raise ConfigError(
             "1件も取り込めませんでした。銘柄名と日付を確認してください。"
         )
+    if args.s3_bucket:
+        # The laptop has less free disk than two days of BTC. Shipping the day
+        # off and deleting it locally is what makes a month of history usable
+        # at all, so the upload happening is worth its own line.
+        from .sim.s3 import default_client
+
+        # Named for the file rather than the clock: these are whole published
+        # days, and the name already carries which ones.
+        key = f"{args.s3_prefix.strip('/')}/{instrument.symbol}/{out.name}"
+        try:
+            default_client().upload_file(str(out), args.s3_bucket, key)
+        except Exception as exc:  # noqa: BLE001 - the local file is still there
+            console.print(f"  [red]S3 転送失敗: {exc}[/red]")
+        else:
+            console.print(f"  S3     : s3://{args.s3_bucket}/{key}")
+            meta = out.with_suffix(out.suffix + ".meta.json")
+            if meta.exists():
+                default_client().upload_file(
+                    str(meta), args.s3_bucket, f"{key}.meta.json"
+                )
     console.print(
         f"\n[dim]  次: jsboard replay {out} --source perp --headless[/dim]"
     )
@@ -4344,6 +4378,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_vision.add_argument("--out", default="history.jsonl")
     p_vision.add_argument("--tick-size", default=None)
     p_vision.add_argument("--lot-size", default=None)
+    p_vision.add_argument("--s3-bucket", default=None, help="保存先バケット")
+    p_vision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
     p_vision.set_defaults(func=cmd_vision)
 
     p_carry = sub.add_parser(

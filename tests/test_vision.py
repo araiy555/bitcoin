@@ -556,3 +556,67 @@ class TestWindowKeepsState:
             return live
 
         assert asyncio.run(run())
+
+
+class TestCompression:
+    """A day of BTC is 4.8GB plain and under 400MB gzipped."""
+
+    def written(self, tmp_path, monkeypatch, name):
+        import asyncio
+
+        from jsboard.cli import build_parser, cmd_vision
+        from jsboard.research import vision
+
+        tape = archive(
+            [
+                f"1,0.0298,10,1,1,{MS},true",
+                f"2,0.0299,10,2,2,{MS + 1},false",
+                f"3,0.0298,10,3,3,{MS + 2},true",
+            ]
+        )
+
+        async def fake_fetch(url):
+            return None if "bookTicker" in url else tape
+
+        monkeypatch.setattr(vision, "fetch", fake_fetch)
+        out = tmp_path / name
+        args = build_parser().parse_args(
+            [
+                "vision", "--symbol", "USUSDT", "--start", "2026-09-01",
+                "--out", str(out), "--tick-size", "0.000001", "--lot-size", "1",
+            ]
+        )
+        assert asyncio.run(cmd_vision(args)) == 0
+        return out
+
+    def test_a_gz_name_writes_a_gzip_file(self, tmp_path, monkeypatch):
+        import gzip
+
+        out = self.written(tmp_path, monkeypatch, "hist.jsonl.gz")
+        with gzip.open(out, "rt") as fh:
+            assert fh.readline().startswith("{")
+
+    def test_a_gzipped_recording_replays(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from jsboard.feed.replay import ReplayFeed
+
+        out = self.written(tmp_path, monkeypatch, "hist.jsonl.gz")
+
+        async def drain():
+            return [
+                e
+                async for e in ReplayFeed(INST, out, speed=0, source="perp").stream()
+                if isinstance(e, (DepthSnapshot, TradeTick))
+            ]
+
+        assert asyncio.run(drain())
+
+    def test_a_plain_name_still_writes_plain_text(self, tmp_path, monkeypatch):
+        out = self.written(tmp_path, monkeypatch, "hist.jsonl")
+        assert out.read_text().startswith("{")
+
+    def test_compression_actually_shrinks_it(self, tmp_path, monkeypatch):
+        plain = self.written(tmp_path, monkeypatch, "a.jsonl").stat().st_size
+        packed = self.written(tmp_path, monkeypatch, "b.jsonl.gz").stat().st_size
+        assert packed < plain

@@ -300,6 +300,20 @@ the longer names are the canonical CMR-001 schema.
 """
 
 
+def _open_text(path: Path):
+    """A recording, compressed or not.
+
+    A day of BTC futures is 4.8GB as plain JSONL and under 400MB gzipped, on a
+    laptop with 7.9GB free. Choosing by suffix keeps every existing recording
+    readable without a flag.
+    """
+    if path.suffix == ".gz":
+        import gzip
+
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open(encoding="utf-8")
+
+
 class ReplayFeed(Feed):
     """Replay a JSONL recording, optionally in original wall-clock time."""
 
@@ -331,7 +345,7 @@ class ReplayFeed(Feed):
     async def stream(self) -> AsyncIterator[FeedEvent]:
         yield FeedStatus("connecting", str(self.path))
         prev_ts: int | None = None
-        with self.path.open(encoding="utf-8") as fh:
+        with _open_text(self.path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
