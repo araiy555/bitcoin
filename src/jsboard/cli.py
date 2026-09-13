@@ -2446,6 +2446,88 @@ def _carry_timing_grid(study, args: argparse.Namespace) -> None:
     )
 
 
+async def cmd_vision(args: argparse.Namespace) -> int:
+    """Turn Binance's published daily archives into a replayable recording."""
+    from datetime import date as _date
+
+    from .research.vision import (
+        AGG_TRADE_COLUMNS,
+        BOOK_TICKER_COLUMNS,
+        book_events,
+        daily_url,
+        days_between,
+        fetch,
+        merge,
+        read_zip_csv,
+        trade_events,
+    )
+
+    try:
+        start = _date.fromisoformat(args.start)
+        end = _date.fromisoformat(args.end) if args.end else start
+    except ValueError as exc:
+        raise ConfigError(f"日付は YYYY-MM-DD で指定してください: {exc}") from exc
+    days = days_between(start, end)
+
+    if args.tick_size and args.lot_size:
+        instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
+    else:
+        # The archive carries prices as text; without the venue's own tick and
+        # lot they would be rounded to whatever a guess suggested, rescaling
+        # every price in the file by the ratio of two guesses.
+        instrument = await fetch_futures_instrument(args.symbol)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    missing: list[str] = []
+
+    with out.open("w", encoding="utf-8") as fh:
+        for day in days:
+            book_url = daily_url("bookTicker", args.symbol, day)
+            tape_url = daily_url("aggTrades", args.symbol, day)
+            console.print(f"[dim]{day}[/dim] 取得中…")
+            book_blob = await fetch(book_url)
+            tape_blob = await fetch(tape_url)
+            if book_blob is None or tape_blob is None:
+                missing.append(f"{day}")
+                continue
+            streams = [
+                book_events(read_zip_csv(book_blob, BOOK_TICKER_COLUMNS), instrument),
+                trade_events(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), instrument),
+            ]
+            day_count = 0
+            for stamped in merge(*streams):
+                row = _encode(stamped.event)
+                row[SOURCE_KEY] = "perp"
+                row[RX_KEY] = stamped.ts_ns
+                fh.write(json.dumps(row) + "\n")
+                day_count += 1
+            written += day_count
+            console.print(f"  {day}: {day_count:,} 件")
+
+    write_meta(out, {"perp": _spec_dict(instrument, "perp")}, source="data.binance.vision")
+    console.rule("[bold cyan]過去データの取り込み完了")
+    console.print(
+        f"  銘柄   : {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
+        f"  期間   : {days[0]} 〜 {days[-1]}（{len(days)}日）\n"
+        f"  出力   : {out}  ({out.stat().st_size / 1e6:,.1f} MB)\n"
+        f"  イベント: {written:,} 件"
+    )
+    if missing:
+        # A listing that starts mid-range, or today's file before it is
+        # published. Saying which days are absent beats a total that silently
+        # covers less than it claims.
+        console.print(f"  [yellow]未公開の日: {', '.join(missing)}[/yellow]")
+    if written == 0:
+        raise ConfigError(
+            "1件も取り込めませんでした。銘柄名と日付を確認してください。"
+        )
+    console.print(
+        f"\n[dim]  次: jsboard replay {out} --source perp --headless[/dim]"
+    )
+    return 0
+
+
 async def cmd_carry(args: argparse.Namespace) -> int:
     """Funding history turned into the worst case of holding the carry."""
     from .research.carry import CarryStudy, fetch_funding, parse_funding
@@ -4171,6 +4253,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_basis.add_argument("--plain", action="store_true")
     p_basis.set_defaults(func=cmd_basis)
+
+    p_vision = sub.add_parser(
+        "vision", help="Binance公開の日次アーカイブを落としてリプレイ用に変換する"
+    )
+    p_vision.add_argument("--symbol", default="BTCUSDT")
+    p_vision.add_argument("--start", required=True, help="開始日 YYYY-MM-DD")
+    p_vision.add_argument("--end", default=None, help="終了日。省略で開始日のみ")
+    p_vision.add_argument("--out", default="history.jsonl")
+    p_vision.add_argument("--tick-size", default=None)
+    p_vision.add_argument("--lot-size", default=None)
+    p_vision.set_defaults(func=cmd_vision)
 
     p_carry = sub.add_parser(
         "carry", help="現物買い・無期限先物売りを持ち続けたときのFunding収支を調べる"
