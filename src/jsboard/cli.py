@@ -2386,20 +2386,29 @@ def _replay_two_market_capture(
     engine.finalize()
 
 
-async def cmd_xarb(args: argparse.Namespace) -> int:
-    """Replay a causal Binance/Bybit spread strategy with four real crosses."""
-    path = Path(args.path)
-    if not path.exists():
-        raise ConfigError(f"{path} がありません。先に xcapture を実行してください。")
+def _xarb_instruments(path: Path) -> dict[str, Instrument]:
+    """Both venues' specs from the recording's own metadata.
+
+    Guessing tick and lot here would rescale one venue's prices against the
+    other's, which is indistinguishable from a spread.
+    """
     meta_path = path.with_suffix(path.suffix + ".meta.json")
     if not meta_path.exists():
-        raise ConfigError(f"{meta_path.name} がありません。xcaptureの録画が必要です。")
+        raise ConfigError(
+            f"{meta_path.name} がありません。xcapture か xvision の出力が必要です。"
+        )
     sources = json.loads(meta_path.read_text()).get("sources") or {}
     if not {"binance", "bybit"}.issubset(sources):
-        raise ConfigError("xarbにはbinanceとbybitを同時に含むxcapture録画が必要です。")
-    instruments = {
+        raise ConfigError(
+            "xarbにはbinanceとbybitを同時に含む録画が必要です"
+            "（xcapture のライブ録画、または xvision の過去データ）。"
+        )
+    return {
         source: _instrument_from_spec(sources[source]) for source in ("binance", "bybit")
     }
+
+
+def _xarb_config(args: argparse.Namespace) -> CrossArbConfig:
     # A negative fee is a rebate, and rebates are real: a venue pays its
     # designated market makers to quote. Refusing the sign made the tool unable
     # to model the one condition that separates a market maker's economics from
@@ -2408,7 +2417,7 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         raise ConfigError("手数料は-10bps以上で指定してください（マイナスはリベート）。")
     if args.sample_ms < 0:
         raise ConfigError("--sample-msは0以上で指定してください。")
-    config = CrossArbConfig(
+    return CrossArbConfig(
         size_base=args.size_base,
         lookback_s=args.lookback_minutes * 60.0,
         min_samples=args.min_samples,
@@ -2424,6 +2433,17 @@ async def cmd_xarb(args: argparse.Namespace) -> int:
         safety_margin_bps=args.safety_margin_bps,
         taker_bps={"binance": args.binance_taker_bps, "bybit": args.bybit_taker_bps},
     )
+
+
+async def cmd_xarb(args: argparse.Namespace) -> int:
+    """Replay a causal Binance/Bybit spread strategy with four real crosses."""
+    path = Path(args.path)
+    if not path.exists():
+        raise ConfigError(
+            f"{path} がありません。先に xvision（過去データ）か xcapture（ライブ）を実行してください。"
+        )
+    instruments = _xarb_instruments(path)
+    config = _xarb_config(args)
     engine = CrossExchangeArb(instruments, config)
     _replay_two_market_capture(path, engine, instruments, args.sample_ms)
     summary = engine.summary()
