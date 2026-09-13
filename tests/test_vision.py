@@ -303,3 +303,75 @@ class TestCommandPath:
         events = asyncio.run(drain())
         assert any(isinstance(e, DepthSnapshot) for e in events)
         assert any(isinstance(e, TradeTick) for e in events)
+
+
+class TestFeedStatus:
+    """A day of archive that never says it connected quotes nothing.
+
+    The risk gate holds every order until the feed reports connected. A live
+    recording carries that line; an archive has no such concept. Without it
+    a full day replays as a flat zero, which is indistinguishable in the
+    report from a strategy that simply found no opportunity.
+    """
+
+    def test_the_written_day_announces_a_connected_feed(self, tmp_path, monkeypatch):
+        import asyncio
+        import json
+
+        from jsboard.cli import build_parser, cmd_vision
+        from jsboard.research import vision
+
+        tape = archive(
+            [
+                f"1,0.0298,10,1,1,{MS},true",
+                f"2,0.0299,10,2,2,{MS + 1},false",
+            ]
+        )
+
+        async def fake_fetch(url):
+            return None if "bookTicker" in url else tape
+
+        monkeypatch.setattr(vision, "fetch", fake_fetch)
+        out = tmp_path / "hist.jsonl"
+        args = build_parser().parse_args(
+            [
+                "vision", "--symbol", "USUSDT", "--start", "2026-09-01",
+                "--out", str(out), "--tick-size", "0.000001", "--lot-size", "1",
+            ]
+        )
+        assert asyncio.run(cmd_vision(args)) == 0
+
+        first = json.loads(out.read_text().splitlines()[0])
+        assert first["k"] == "status"
+        assert first["state"] == "connected"
+
+    def test_the_status_carries_the_first_events_time(self, tmp_path, monkeypatch):
+        """Stamped with now, it would read as a day-old feed and be pulled."""
+        import asyncio
+        import json
+
+        from jsboard.cli import build_parser, cmd_vision
+        from jsboard.research import vision
+
+        tape = archive(
+            [
+                f"1,0.0298,10,1,1,{MS},true",
+                f"2,0.0299,10,2,2,{MS + 1},false",
+            ]
+        )
+
+        async def fake_fetch(url):
+            return None if "bookTicker" in url else tape
+
+        monkeypatch.setattr(vision, "fetch", fake_fetch)
+        out = tmp_path / "hist.jsonl"
+        args = build_parser().parse_args(
+            [
+                "vision", "--symbol", "USUSDT", "--start", "2026-09-01",
+                "--out", str(out), "--tick-size", "0.000001", "--lot-size", "1",
+            ]
+        )
+        asyncio.run(cmd_vision(args))
+
+        lines = [json.loads(x) for x in out.read_text().splitlines()]
+        assert lines[0]["ts_ns"] == lines[1]["ts_ns"]

@@ -35,7 +35,7 @@ from rich.table import Table
 from .core.market import MarketView
 from .core.types import Instrument, Side
 from .feed import multi
-from .feed.base import DepthDelta, DepthSnapshot, Feed, TradeTick
+from .feed.base import DepthDelta, DepthSnapshot, Feed, FeedStatus, TradeTick
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
 from .feed.bybit import BybitFeed
@@ -2521,6 +2521,19 @@ async def cmd_vision(args: argparse.Namespace) -> int:
                 ]
             day_count = 0
             for stamped in merge(*streams):
+                if day_count == 0:
+                    # The risk gate refuses to quote until the feed says it is
+                    # connected, and a live recording carries that line while an
+                    # archive does not. Without it the whole day replays with
+                    # every quote pulled and reports a flat zero, which reads
+                    # exactly like a strategy that found nothing.
+                    hello = _encode(
+                        FeedStatus(state="connected", detail="archive", ts_ns=stamped.ts_ns)
+                    )
+                    hello[SOURCE_KEY] = "perp"
+                    hello[RX_KEY] = stamped.ts_ns
+                    fh.write(json.dumps(hello) + "\n")
+                    written += 1
                 row = _encode(stamped.event)
                 row[SOURCE_KEY] = "perp"
                 row[RX_KEY] = stamped.ts_ns
