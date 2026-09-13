@@ -23,7 +23,7 @@ import math
 import statistics
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -961,6 +961,13 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "markout_10s": _markout_at(markout, 10.0),
         "exposed_share": a.get("exposed_share", math.nan) * 100.0,
         "max_maker_bps": mm.attribution.max_maker_bps(matched),
+        # Share of filled size the tape cannot explain. A row where this is
+        # most of the volume is a row about how coarse the recording is, not
+        # about the market — and it belongs next to the P&L it produced,
+        # rather than in a footnote nobody reads while choosing a setting.
+        "gap_share": (
+            s.get("gap_filled", 0.0) / s["filled"] * 100.0 if s.get("filled") else math.nan
+        ),
         "tox_one_sided_pct": tox.get("one_sided_share", 0.0) * 100.0,
         "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
         **{
@@ -968,6 +975,46 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
             for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
         },
     }
+
+
+async def _run_combos(
+    instrument: Instrument,
+    args: argparse.Namespace,
+    names: list[str],
+    combos: list[tuple],
+    path: Path,
+    *,
+    quiet: bool = False,
+) -> list[dict]:
+    """Replay one recording once per setting, returning a row each.
+
+    A combination whose sizes the instrument cannot represent is skipped
+    aloud rather than dropped: a grid that quietly ran fewer rows than it
+    printed would read as a result about the market.
+    """
+    rows = []
+    for combo in combos:
+        settings = dict(zip(names, combo, strict=True))
+        run_args = argparse.Namespace(**vars(args))
+        for name, value in settings.items():
+            setattr(run_args, name, value)
+        shown = "  ".join(f"{n}={_label(n, v)}" for n, v in settings.items())
+        try:
+            _check_sizes(instrument, run_args)
+        except ConfigError as exc:
+            console.print(f"[yellow]skip {shown}: {exc}[/yellow]")
+            continue
+
+        mm = build_maker(instrument, run_args)
+        attach_virtual_clock(mm)
+        feed = ReplayFeed(instrument, path, speed=0.0, source=args.source)
+        await run(feed, mm, duration_s=None, max_events=args.max_events)
+        row = _sweep_row(mm, mm.summary())
+        row["settings"] = settings
+        rows.append(row)
+        if not quiet:
+            console.print(f"  {shown}  fills={row['fills']:,}")
+    return rows
 
 
 async def cmd_sweep(args: argparse.Namespace) -> int:
@@ -1010,27 +1057,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         f"軸: {', '.join(f'{n}={len(axes[n])}' for n in names)}"
     )
 
-    rows = []
-    for combo in combos:
-        settings = dict(zip(names, combo, strict=True))
-        run_args = argparse.Namespace(**vars(args))
-        for name, value in settings.items():
-            setattr(run_args, name, value)
-        shown = "  ".join(f"{n}={_label(n, v)}" for n, v in settings.items())
-        try:
-            _check_sizes(instrument, run_args)
-        except ConfigError as exc:
-            console.print(f"[yellow]skip {shown}: {exc}[/yellow]")
-            continue
-
-        mm = build_maker(instrument, run_args)
-        attach_virtual_clock(mm)
-        feed = ReplayFeed(instrument, path, speed=0.0, source=args.source)
-        await run(feed, mm, duration_s=None, max_events=args.max_events)
-        row = _sweep_row(mm, mm.summary())
-        row["settings"] = settings
-        rows.append(row)
-        console.print(f"  {shown}  fills={row['fills']:,}")
+    rows = await _run_combos(instrument, args, names, combos, path)
 
     if not rows:
         console.print("[red]走れた組み合わせがありません。[/red]")
@@ -1054,6 +1081,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("1-10s", "age_2", "{:+.2f}"),
         ("10s+", "age_3", "{:+.2f}"),
         ("許容料率", "max_maker_bps", "{:+.2f}"),
+        ("飛越%", "gap_share", "{:.0f}"),
         ("毒性片側%", "tox_one_sided_pct", "{:.0f}"),
         ("毒性全取消%", "tox_pull_pct", "{:.0f}"),
     ]
@@ -1066,11 +1094,11 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         # A rich table of this width wraps in most terminals, which makes the
         # numbers unreadable and unpasteable. Tab-separated survives both.
         head = [*names, *(c[0] for c in columns)]
-        console.print("\t".join(head), highlight=False)
+        console.print("\t".join(head), highlight=False, soft_wrap=True)
         for r in rows:
             cells = [_label(n, r["settings"][n]) for n in names]
             cells += [cell(r, key, fmt) for _, key, fmt in columns]
-            console.print("\t".join(cells), highlight=False)
+            console.print("\t".join(cells), highlight=False, soft_wrap=True)
         return 0
 
     table = Table(title=f"{instrument.symbol} — sweep ({path.name})", padding=(0, 1))
@@ -1517,9 +1545,9 @@ async def cmd_hedge(args: argparse.Namespace) -> int:
         return "—" if isinstance(value, float) and math.isnan(value) else fmt.format(value)
 
     if args.plain:
-        console.print("\t".join(c[0] for c in columns), highlight=False)
+        console.print("\t".join(c[0] for c in columns), highlight=False, soft_wrap=True)
         for r in rows:
-            console.print("\t".join(cell(r, k, f) for _, k, f in columns), highlight=False)
+            console.print("\t".join(cell(r, k, f) for _, k, f in columns), highlight=False, soft_wrap=True)
     else:
         table = Table(title=f"{maker_inst.symbol} — メイク＋即時ヘッジ", padding=(0, 1))
         for header, _, _ in columns:
@@ -1689,9 +1717,9 @@ async def cmd_pair(args: argparse.Namespace) -> int:
         return "—" if not math.isfinite(value) else fmt.format(value)
 
     if args.plain:
-        console.print("\t".join(c[0] for c in columns), highlight=False)
+        console.print("\t".join(c[0] for c in columns), highlight=False, soft_wrap=True)
         for row in rows:
-            console.print("\t".join(cell(row, key, fmt) for _, key, fmt in columns), highlight=False)
+            console.print("\t".join(cell(row, key, fmt) for _, key, fmt in columns), highlight=False, soft_wrap=True)
     else:
         table = Table(title=f"{maker_inst.symbol} — 相対価値MM＋即時ヘッジ", padding=(0, 1))
         for header, _, _ in columns:
@@ -1836,9 +1864,9 @@ async def cmd_dealer(args: argparse.Namespace) -> int:
             )
         )
     if args.plain:
-        console.print("\t".join(header for header, _ in columns), highlight=False)
+        console.print("\t".join(header for header, _ in columns), highlight=False, soft_wrap=True)
         for row in rows:
-            console.print("\t".join(row), highlight=False)
+            console.print("\t".join(row), highlight=False, soft_wrap=True)
     else:
         table = Table(title=f"{spot.symbol} — 自動経路選択", padding=(0, 1))
         for header, _ in columns:
@@ -2517,54 +2545,52 @@ def _carry_timing_grid(study, args: argparse.Namespace) -> None:
     )
 
 
-async def cmd_vision(args: argparse.Namespace) -> int:
-    """Turn Binance's published daily archives into a replayable recording."""
-    from datetime import date as _date
+@dataclass(slots=True)
+class ArchiveHaul:
+    """What one download of published days actually contained."""
 
+    written: int = 0
+    inferred: int = 0
+    missing: list[str] = field(default_factory=list)
+
+
+async def download_archive_days(
+    instrument: Instrument, symbol: str, days: list, out: Path, *, quiet: bool = False
+) -> ArchiveHaul:
+    """Write the published archives for `days` into one replayable file.
+
+    Split out of `vision` so a study can hold one day at a time: a month of
+    BTC is far larger than the disk it has to land on, and the only way to
+    cover a month is to fetch a day, measure it, and delete it before
+    fetching the next.
+    """
     from .research.vision import (
         AGG_TRADE_COLUMNS,
         BOOK_TICKER_COLUMNS,
         book_events,
         book_from_tape,
         daily_url,
-        days_between,
         fetch,
         merge,
         read_zip_csv,
         trade_events,
     )
 
-    try:
-        start = _date.fromisoformat(args.start)
-        end = _date.fromisoformat(args.end) if args.end else start
-    except ValueError as exc:
-        raise ConfigError(f"日付は YYYY-MM-DD で指定してください: {exc}") from exc
-    days = days_between(start, end)
-
-    if args.tick_size and args.lot_size:
-        instrument = build_instrument(args.symbol, args.tick_size, args.lot_size)
-    else:
-        # The archive carries prices as text; without the venue's own tick and
-        # lot they would be rounded to whatever a guess suggested, rescaling
-        # every price in the file by the ratio of two guesses.
-        instrument = await fetch_futures_instrument(args.symbol)
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    inferred = 0
-    missing: list[str] = []
+    haul = ArchiveHaul()
 
     with _open_write(out) as fh:
         for day in days:
-            book_url = daily_url("bookTicker", args.symbol, day)
-            tape_url = daily_url("aggTrades", args.symbol, day)
-            console.print(f"[dim]{day}[/dim] 取得中…")
+            book_url = daily_url("bookTicker", symbol, day)
+            tape_url = daily_url("aggTrades", symbol, day)
+            if not quiet:
+                console.print(f"[dim]{day}[/dim] 取得中…")
             book_blob = await fetch(book_url)
             tape_blob = await fetch(tape_url)
             if tape_blob is None:
                 # Name the URL: a missing day and a wrong path look identical
                 # from the totals, and only one of them is worth retrying.
-                missing.append(f"{day} ({tape_url})")
+                haul.missing.append(f"{day} ({tape_url})")
                 continue
             if book_blob is None:
                 # Binance publishes the prints for every day and the quote
@@ -2572,7 +2598,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
                 # touch from the side that crossed on each print — coarser,
                 # but it carries the one thing being measured here, which is
                 # whether the tape reached a price.
-                inferred += 1
+                haul.inferred += 1
                 streams = [
                     book_from_tape(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), instrument)
                 ]
@@ -2595,16 +2621,50 @@ async def cmd_vision(args: argparse.Namespace) -> int:
                     hello[SOURCE_KEY] = "perp"
                     hello[RX_KEY] = stamped.ts_ns
                     fh.write(json.dumps(hello) + "\n")
-                    written += 1
+                    haul.written += 1
                 row = _encode(stamped.event)
                 row[SOURCE_KEY] = "perp"
                 row[RX_KEY] = stamped.ts_ns
                 fh.write(json.dumps(row) + "\n")
                 day_count += 1
-            written += day_count
-            console.print(f"  {day}: {day_count:,} 件")
+            haul.written += day_count
+            if not quiet:
+                console.print(f"  {day}: {day_count:,} 件")
 
     write_meta(out, {"perp": _spec_dict(instrument, "perp")}, source="data.binance.vision")
+    return haul
+
+
+async def _archive_instrument(args: argparse.Namespace) -> Instrument:
+    if args.tick_size and args.lot_size:
+        return build_instrument(args.symbol, args.tick_size, args.lot_size)
+    # The archive carries prices as text; without the venue's own tick and
+    # lot they would be rounded to whatever a guess suggested, rescaling
+    # every price in the file by the ratio of two guesses.
+    return await fetch_futures_instrument(args.symbol)
+
+
+def _archive_days(args: argparse.Namespace) -> list:
+    from datetime import date as _date
+
+    from .research.vision import days_between
+
+    try:
+        start = _date.fromisoformat(args.start)
+        end = _date.fromisoformat(args.end) if args.end else start
+    except ValueError as exc:
+        raise ConfigError(f"日付は YYYY-MM-DD で指定してください: {exc}") from exc
+    return days_between(start, end)
+
+
+async def cmd_vision(args: argparse.Namespace) -> int:
+    """Turn Binance's published daily archives into a replayable recording."""
+    days = _archive_days(args)
+    instrument = await _archive_instrument(args)
+    out = Path(args.out)
+
+    haul = await download_archive_days(instrument, args.symbol, days, out)
+    written, inferred, missing = haul.written, haul.inferred, haul.missing
 
     console.rule("[bold cyan]過去データの取り込み完了")
     console.print(
@@ -2651,6 +2711,304 @@ async def cmd_vision(args: argparse.Namespace) -> int:
         f"\n[dim]  次: jsboard replay {out} --source perp --headless[/dim]"
     )
     return 0
+
+
+def _walk_key(settings: dict) -> tuple:
+    return tuple(sorted(settings.items(), key=lambda kv: kv[0]))
+
+
+def _walk_label(key: tuple) -> str:
+    return "  ".join(f"{n}={_label(n, v)}" for n, v in key) or "（既定のまま）"
+
+
+def _walk_aggregate(rows: list[dict]) -> dict:
+    """One setting's behaviour across days.
+
+    The mean is reported two ways because they answer different questions.
+    Weighted by fills is what the account would have earned; the plain mean
+    over days is whether it earned it *every* day or won one day and gave it
+    back. A strategy that only survives as a total is a directional bet.
+    """
+    fills = sum(r["fills"] for r in rows)
+    scored = [r for r in rows if r["fills"] > 0 and not math.isnan(r["pre_fee_bps"])]
+    pre = [r["pre_fee_bps"] for r in scored]
+    weighted = (
+        sum(r["pre_fee_bps"] * r["fills"] for r in scored) / sum(r["fills"] for r in scored)
+        if scored
+        else math.nan
+    )
+    gaps = [r["gap_share"] for r in rows if not math.isnan(r.get("gap_share", math.nan))]
+    return {
+        "days": len(rows),
+        "traded_days": len(scored),
+        "fills": fills,
+        "pre_fee_weighted": weighted,
+        "pre_fee_mean": statistics.fmean(pre) if pre else math.nan,
+        "pre_fee_worst": min(pre) if pre else math.nan,
+        "negative_days": sum(1 for v in pre if v < 0),
+        "gap_share": statistics.fmean(gaps) if gaps else math.nan,
+        "max_maker_bps": (
+            statistics.fmean(
+                [r["max_maker_bps"] for r in scored if not math.isnan(r["max_maker_bps"])]
+            )
+            if scored
+            else math.nan
+        ),
+    }
+
+
+# Headers stay short on purpose. The full names wrap a rich table at any
+# realistic terminal width, and a wrapped header turns nine numbers into a
+# column of ellipses — which is how a table gets read wrong rather than read.
+WALK_COLUMNS = [
+    ("日数", "days", "{:,.0f}"),
+    ("約定日", "traded_days", "{:,.0f}"),
+    ("約定", "fills", "{:,.0f}"),
+    ("前加重", "pre_fee_weighted", "{:+.2f}"),
+    ("前平均", "pre_fee_mean", "{:+.2f}"),
+    ("最悪日", "pre_fee_worst", "{:+.2f}"),
+    ("負日", "negative_days", "{:,.0f}"),
+    ("許容料率", "max_maker_bps", "{:+.2f}"),
+    ("飛越%", "gap_share", "{:.0f}"),
+]
+
+WALK_LEGEND = (
+    "[dim]前加重=手数料前bps(約定数で加重)  前平均=日ごとの単純平均  "
+    "最悪日=最も悪かった1日  負日=手数料前がマイナスだった日数  "
+    "許容料率=払えるメイカー料 bps/片道  飛越%=歩み値で説明できない約定数量[/dim]"
+)
+
+
+def _walk_cell(agg: dict, name: str, fmt: str) -> str:
+    value = agg.get(name, math.nan)
+    return "—" if isinstance(value, float) and math.isnan(value) else fmt.format(value)
+
+
+def _walk_table(title: str, ordered: list[tuple[tuple, dict]]) -> Table:
+    table = Table(title=title, header_style="bold cyan")
+    table.add_column("設定")
+    for head, _, _ in WALK_COLUMNS:
+        table.add_column(head, justify="right")
+    for key, agg in ordered:
+        table.add_row(
+            _walk_label(key), *(_walk_cell(agg, n, f) for _, n, f in WALK_COLUMNS)
+        )
+    return table
+
+
+def _walk_plain(title: str, ordered: list[tuple[tuple, dict]]) -> None:
+    """Tab-separated, because a table this wide wraps and stops being readable."""
+    console.print(f"# {title}", highlight=False, soft_wrap=True)
+    console.print(
+        "\t".join(["設定", *(h for h, _, _ in WALK_COLUMNS)]),
+        highlight=False,
+        soft_wrap=True,
+    )
+    for key, agg in ordered:
+        cells = [_walk_label(key), *(_walk_cell(agg, n, f) for _, n, f in WALK_COLUMNS)]
+        console.print("\t".join(cells), highlight=False, soft_wrap=True)
+
+
+def _walk_show(title: str, ordered: list[tuple[tuple, dict]], plain: bool) -> None:
+    if plain:
+        _walk_plain(title, ordered)
+    else:
+        console.print(_walk_table(title, ordered))
+
+
+async def cmd_walk(args: argparse.Namespace) -> int:
+    """Test settings across many published days, one day on disk at a time.
+
+    Two failures this exists to prevent, both already made in this repo.
+
+    **One day is not a sample.** The same settings filled 2,314 times in one
+    hour of USUSDT and zero times in the next, and a three-day BTC test swung
+    57bps between its best and worst day. Anything chosen on a single stretch
+    is chosen on noise.
+
+    **A setting chosen and judged on the same days is not a result.** The
+    +13.21 that looked like an answer was picked by sweeping one hour and
+    then read off that same hour. `--decide-until` splits the range: the
+    earlier days rank the settings, the later days are only ever *reported*,
+    never sorted, so the number that comes out of them is a measurement
+    rather than a selection.
+
+    The disk constraint drives the shape. A day of BTC quotes is larger than
+    the free space on the laptop holding it, so each day is fetched, run
+    against every setting, and deleted before the next is fetched. Only the
+    rows survive.
+    """
+    days = _archive_days(args)
+    instrument = await _archive_instrument(args)
+
+    axes = _sweep_axes(args) if _has_axes(args) else {}
+    _prepare_sweep_defaults(instrument, args, axes)
+    names = list(axes)
+    combos = list(itertools.product(*(axes[n] for n in names))) or [()]
+
+    cutoff = None
+    if args.decide_until:
+        from datetime import date as _date
+
+        try:
+            cutoff = _date.fromisoformat(args.decide_until)
+        except ValueError as exc:
+            raise ConfigError(f"--decide-until は YYYY-MM-DD で: {exc}") from exc
+        if not any(d <= cutoff for d in days) or not any(d > cutoff for d in days):
+            raise ConfigError(
+                f"--decide-until {cutoff} は期間を2つに割っていません。"
+                f"（{days[0]} 〜 {days[-1]}）"
+            )
+
+    work = Path(args.work)
+    console.print(
+        f"{instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
+        f"{len(days)}日 × {len(combos)}通り = {len(days) * len(combos)} 回の再生\n"
+        f"maker {args.maker_bps:g}bps（往復 {2 * args.maker_bps:g}bps）"
+        + (f"\n決定用: 〜{cutoff}   検証用: {cutoff}より後" if cutoff else "")
+    )
+
+    rows: list[dict] = []
+    skipped: list[str] = []
+    for day in days:
+        try:
+            haul = await download_archive_days(
+                instrument, args.symbol, [day], work, quiet=True
+            )
+            if haul.written == 0:
+                skipped.append(str(day))
+                console.print(f"[yellow]{day}: 未公開[/yellow]")
+                continue
+            if args.s3_bucket:
+                _walk_upload(args, instrument, day, work)
+            day_rows = await _run_combos(
+                instrument, args, names, combos, work, quiet=True
+            )
+            for row in day_rows:
+                row["day"] = day
+            rows.extend(day_rows)
+            best = max(
+                (r["pre_fee_bps"] for r in day_rows if not math.isnan(r["pre_fee_bps"])),
+                default=math.nan,
+            )
+            console.print(
+                f"  {day}: {haul.written:,} 件"
+                + (" [dim]気配は約定から推定[/dim]" if haul.inferred else "")
+                + f"  最良の手数料前 {best:+.2f}bps"
+            )
+        finally:
+            # The next day cannot be fetched until this one is gone. Deleting
+            # in `finally` means an interrupted run leaves the disk as it
+            # found it rather than one day short of full.
+            if not args.keep:
+                work.unlink(missing_ok=True)
+                work.with_suffix(work.suffix + ".meta.json").unlink(missing_ok=True)
+
+    if not rows:
+        console.print("[red]1日も走れませんでした。[/red]")
+        return 1
+
+    by_setting: dict[tuple, list[dict]] = {}
+    for row in rows:
+        by_setting.setdefault(_walk_key(row["settings"]), []).append(row)
+
+    console.rule("[bold cyan]日をまたいだ結果")
+    if cutoff is None:
+        ordered = sorted(
+            by_setting.items(),
+            key=lambda kv: (
+                math.isnan(_walk_aggregate(kv[1])["pre_fee_weighted"]),
+                -(_walk_aggregate(kv[1])["pre_fee_weighted"] or 0.0),
+            ),
+        )
+        _walk_show("全期間", [(k, _walk_aggregate(v)) for k, v in ordered], args.plain)
+        console.print(WALK_LEGEND)
+        console.print(
+            "\n[yellow]この表から設定を選ぶと、選んだ日で成績を測ることになります。"
+            "--decide-until で期間を割ってください。[/yellow]"
+        )
+        _walk_footer(rows, skipped)
+        return 0
+
+    decide = {k: [r for r in v if r["day"] <= cutoff] for k, v in by_setting.items()}
+    holdout = {k: [r for r in v if r["day"] > cutoff] for k, v in by_setting.items()}
+
+    ranked = sorted(
+        ((k, _walk_aggregate(v)) for k, v in decide.items() if v),
+        key=lambda kv: (
+            math.isnan(kv[1]["pre_fee_weighted"]),
+            -(kv[1]["pre_fee_weighted"] or 0.0),
+        ),
+    )
+    _walk_show(f"決定用（〜{cutoff}）— ここで選ぶ", ranked, args.plain)
+
+    # Deliberately not re-sorted: the hold-out is reported in the order the
+    # decision block produced, so no better-looking row down the table can be
+    # promoted after the fact. That promotion is the whole failure mode.
+    _walk_show(
+        f"検証用（{cutoff}より後）— 順位はつけない",
+        [(k, _walk_aggregate(holdout[k])) for k, _ in ranked if holdout.get(k)],
+        args.plain,
+    )
+    console.print(WALK_LEGEND)
+
+    if ranked:
+        chosen, chose_agg = ranked[0]
+        out_agg = _walk_aggregate(holdout.get(chosen, []))
+        console.print(
+            f"\n  決定用で最良: [bold]{_walk_label(chosen)}[/bold]\n"
+            f"    決定用 手数料前 {chose_agg['pre_fee_weighted']:+.2f}bps"
+            f"（{chose_agg['traded_days']}日中 負け{chose_agg['negative_days']}日）\n"
+            f"    検証用 手数料前 [bold]{out_agg['pre_fee_weighted']:+.2f}bps[/bold]"
+            f"（{out_agg['traded_days']}日中 負け{out_agg['negative_days']}日）\n"
+            f"    許容メイカー料（検証用）: {out_agg['max_maker_bps']:+.2f} bps/片道"
+        )
+    _walk_footer(rows, skipped)
+    return 0
+
+
+def _walk_footer(rows: list[dict], skipped: list[str]) -> None:
+    gaps = [r["gap_share"] for r in rows if not math.isnan(r.get("gap_share", math.nan))]
+    if gaps and statistics.fmean(gaps) > 50.0:
+        console.print(
+            f"\n[yellow]  約定数量の平均{statistics.fmean(gaps):.0f}%が板の飛び越えです。"
+            "1レベルのアーカイブ板と集約された歩み値では、気配が飛ぶ頻度のほうが"
+            "自分の価格で約定が出る頻度より高くなります。この割合では、"
+            "板の細かさではなく記録の粗さを測っている可能性があります。[/yellow]"
+        )
+    if skipped:
+        console.print(f"[dim]  未公開で飛ばした日: {', '.join(skipped)}[/dim]")
+
+
+def _walk_upload(
+    args: argparse.Namespace, instrument: Instrument, day, work: Path
+) -> None:
+    """Ship the day off before deleting it, so it can be re-read without re-fetching."""
+    from .sim.s3 import default_client
+
+    key = f"{args.s3_prefix.strip('/')}/{instrument.symbol}/{day}-{work.name}"
+    try:
+        default_client().upload_file(str(work), args.s3_bucket, key)
+    except Exception as exc:  # noqa: BLE001 - the study continues without the copy
+        console.print(f"  [red]{day} のS3転送失敗: {exc}[/red]")
+
+
+def _has_axes(args: argparse.Namespace) -> bool:
+    """Whether the caller actually asked for a grid.
+
+    `sweep` falls back to a distance sweep when told nothing, because a sweep
+    with no axis has nothing to do. `walk` does: measuring one setting across
+    many days is the point, so silently multiplying it into five variants
+    would quintuple a run already measured in hours.
+    """
+    return bool(
+        args.distances
+        or args.sizes
+        or getattr(args, "requotes", "")
+        or getattr(args, "latencies", "")
+        or getattr(args, "toxicity_thresholds", "")
+        or args.axis
+    )
 
 
 async def cmd_carry(args: argparse.Namespace) -> int:
@@ -3952,6 +4310,41 @@ def add_common(p: argparse.ArgumentParser) -> None:
     sim.add_argument("--taker-bps", type=float, default=4.0)
 
 
+def add_sweep_axis_args(p: argparse.ArgumentParser) -> None:
+    """The settings a grid can vary. Shared by `sweep` and `walk`."""
+    p.add_argument(
+        "--distances",
+        default=None,
+        help="ticks behind the touch to try; 'none' = uncapped (単独時の既定: 0,1,2,4,none)",
+    )
+    p.add_argument(
+        "--sizes",
+        default="",
+        help="quote sizes to try (default: just --size)",
+    )
+    p.add_argument(
+        "--requotes",
+        default="",
+        help="再計算間隔msの一覧（例: 100,50,20,10）",
+    )
+    p.add_argument(
+        "--latencies",
+        default="",
+        help="注文到着遅延msの一覧（例: 20,10,5,2）",
+    )
+    p.add_argument(
+        "--toxicity-thresholds",
+        default="",
+        help="選択的MMの片側停止score一覧（例: 0,0.2,0.4,0.6,0.8）",
+    )
+    p.add_argument(
+        "--axis",
+        action="append",
+        metavar="NAME=V1,V2",
+        help="任意の設定を軸にする (例: --axis gamma=0.6,3,9)。繰り返し指定可",
+    )
+
+
 def add_scan_args(p: argparse.ArgumentParser) -> None:
     """Arguments shared by `scan` and `watch` — watch is scan, repeated."""
     p.add_argument("--quote", default="USDT", help="建て通貨")
@@ -4033,37 +4426,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sw = sub.add_parser("sweep", help="replay one recording under many settings")
     add_common(p_sw)
     p_sw.add_argument("path", help="a .jsonl recording from `capture`")
-    p_sw.add_argument(
-        "--distances",
-        default=None,
-        help="ticks behind the touch to try; 'none' = uncapped (単独時の既定: 0,1,2,4,none)",
-    )
-    p_sw.add_argument(
-        "--sizes",
-        default="",
-        help="quote sizes to try (default: just --size)",
-    )
-    p_sw.add_argument(
-        "--requotes",
-        default="",
-        help="再計算間隔msの一覧（例: 100,50,20,10）",
-    )
-    p_sw.add_argument(
-        "--latencies",
-        default="",
-        help="注文到着遅延msの一覧（例: 20,10,5,2）",
-    )
-    p_sw.add_argument(
-        "--toxicity-thresholds",
-        default="",
-        help="選択的MMの片側停止score一覧（例: 0,0.2,0.4,0.6,0.8）",
-    )
-    p_sw.add_argument(
-        "--axis",
-        action="append",
-        metavar="NAME=V1,V2",
-        help="任意の設定を軸にする (例: --axis gamma=0.6,3,9)。繰り返し指定可",
-    )
+    add_sweep_axis_args(p_sw)
     p_sw.add_argument(
         "--source", default=None,
         help="capture 録画のどちらを再生するか (spot / perp)",
@@ -4407,6 +4770,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_vision.add_argument("--s3-bucket", default=None, help="保存先バケット")
     p_vision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
     p_vision.set_defaults(func=cmd_vision)
+
+    p_walk = sub.add_parser(
+        "walk",
+        help="公開アーカイブを1日ずつ落として設定を試し、消す（ディスクを埋めずに何十日も測る）",
+    )
+    add_common(p_walk)
+    add_sweep_axis_args(p_walk)
+    p_walk.add_argument("--start", required=True, help="開始日 YYYY-MM-DD")
+    p_walk.add_argument("--end", default=None, help="終了日。省略で開始日のみ")
+    p_walk.add_argument(
+        "--decide-until",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="この日までで設定を選び、それより後の日は報告のみ（順位をつけない）",
+    )
+    p_walk.add_argument(
+        "--work",
+        default="walk-day.jsonl.gz",
+        help="1日ぶんの作業ファイル。次の日を落とす前に消される",
+    )
+    p_walk.add_argument(
+        "--keep", action="store_true", help="作業ファイルを消さない（ディスクに注意）"
+    )
+    p_walk.add_argument("--s3-bucket", default=None, help="消す前に日ごとに退避する")
+    p_walk.add_argument("--s3-prefix", default="history")
+    p_walk.add_argument(
+        "--plain",
+        action="store_true",
+        help="表ではなくタブ区切りで出す（折り返さないので貼り付けやすい）",
+    )
+    p_walk.add_argument(
+        "--source", default="perp", help="再生する記録の系統（アーカイブは perp）"
+    )
+    p_walk.set_defaults(func=cmd_walk, headless=True)
 
     p_carry = sub.add_parser(
         "carry", help="現物買い・無期限先物売りを持ち続けたときのFunding収支を調べる"
