@@ -343,7 +343,54 @@ class TestFeedStatus:
 
         first = json.loads(out.read_text().splitlines()[0])
         assert first["k"] == "status"
-        assert first["state"] == "connected"
+        # "live" is the state the market view checks; every other word,
+        # "connected" included, leaves is_live false and every quote pulled.
+        assert first["state"] == "live"
+
+    def test_the_market_view_calls_the_replayed_feed_live(self, tmp_path, monkeypatch):
+        """The contract that matters, rather than the spelling of the state."""
+        import asyncio
+        from decimal import Decimal
+
+        from jsboard.cli import build_parser, cmd_vision
+        from jsboard.core.market import MarketView
+        from jsboard.feed.replay import ReplayFeed
+        from jsboard.research import vision
+
+        tape = archive(
+            [
+                f"1,0.0298,10,1,1,{MS},true",
+                f"2,0.0299,10,2,2,{MS + 1},false",
+                f"3,0.0298,10,3,3,{MS + 2},true",
+            ]
+        )
+
+        async def fake_fetch(url):
+            return None if "bookTicker" in url else tape
+
+        monkeypatch.setattr(vision, "fetch", fake_fetch)
+        out = tmp_path / "hist.jsonl"
+        args = build_parser().parse_args(
+            [
+                "vision", "--symbol", "USUSDT", "--start", "2026-09-01",
+                "--out", str(out), "--tick-size", "0.000001", "--lot-size", "1",
+            ]
+        )
+        asyncio.run(cmd_vision(args))
+
+        view = MarketView(instrument=INST, depth=5)
+
+        async def feed_it():
+            # Checked inside the loop: the replay signs off with a
+            # "disconnected: replay exhausted" line, so the view is never live
+            # once the file has been drained.
+            live = False
+            async for event in ReplayFeed(INST, out, speed=0, source="perp").stream():
+                view.apply(event)
+                live = live or view.is_live
+            return live
+
+        assert asyncio.run(feed_it())
 
     def test_the_status_carries_the_first_events_time(self, tmp_path, monkeypatch):
         """Stamped with now, it would read as a day-old feed and be pulled."""

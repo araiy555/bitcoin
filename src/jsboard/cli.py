@@ -2528,7 +2528,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
                     # every quote pulled and reports a flat zero, which reads
                     # exactly like a strategy that found nothing.
                     hello = _encode(
-                        FeedStatus(state="connected", detail="archive", ts_ns=stamped.ts_ns)
+                        FeedStatus(state="live", detail="archive", ts_ns=stamped.ts_ns)
                     )
                     hello[SOURCE_KEY] = "perp"
                     hello[RX_KEY] = stamped.ts_ns
