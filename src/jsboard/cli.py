@@ -2856,6 +2856,166 @@ def _walk_show(title: str, ordered: list[tuple[tuple, dict]], plain: bool) -> No
         console.print(_walk_table(title, ordered))
 
 
+async def cmd_xvision(args: argparse.Namespace) -> int:
+    """Both venues' published days, merged into one recording `xarb` can read.
+
+    `xarb` has existed unrun for the whole project because it only ate live
+    recordings, and a live recording of two exchanges costs an hour per hour.
+    The mechanism it measures is the one worth measuring — two contracts on
+    the same underlying, tied together by nothing but participants moving
+    between them, which is an ETF against its basket without the licence —
+    so the thing standing between it and an answer was a downloader.
+
+    What the merged file is and is not: Binance contributes its real quote
+    stream where published, Bybit only prints, so Bybit's side is a touch
+    inferred from the side that crossed. Both are therefore one level deep.
+    Where each venue's price *is* survives that; what a size larger than the
+    touch would cost does not.
+    """
+    from .research import bybit_vision
+    from .research.vision import (
+        AGG_TRADE_COLUMNS,
+        BOOK_TICKER_COLUMNS,
+        Stamped,
+        book_events,
+        book_from_tape,
+        daily_url,
+        fetch,
+        merge,
+        read_zip_csv,
+        trade_events,
+    )
+
+    days = _archive_days(args)
+    binance = await _archive_instrument(args)
+    bybit = (
+        binance
+        if args.tick_size and args.lot_size
+        else await fetch_bybit_instrument(args.symbol, "linear")
+    )
+    if binance.base != bybit.base or binance.quote != bybit.quote:
+        raise ConfigError(
+            f"同じ契約ではありません: Binance {binance.base}/{binance.quote}, "
+            f"Bybit {bybit.base}/{bybit.quote}"
+        )
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    written = {"binance": 0, "bybit": 0}
+    missing: list[str] = []
+
+    with _open_write(out) as fh:
+
+        def emit(source: str, event, ts_ns: int) -> None:
+            row = _encode(event)
+            row[SOURCE_KEY] = source
+            row[RX_KEY] = ts_ns
+            fh.write(json.dumps(row) + "\n")
+            written[source] += 1
+
+        for day in days:
+            console.print(f"[dim]{day}[/dim] 取得中…")
+            book_blob = await fetch(daily_url("bookTicker", args.symbol, day))
+            tape_blob = await fetch(daily_url("aggTrades", args.symbol, day))
+            by_blob = await bybit_vision.fetch(bybit_vision.daily_url(args.symbol, day))
+            if tape_blob is None or by_blob is None:
+                # Both venues or neither. A day present on one side only would
+                # replay as a spread against a frozen book, which is not a
+                # measurement of anything.
+                absent = "Binance" if tape_blob is None else "Bybit"
+                missing.append(f"{day} ({absent})")
+                console.print(f"  [yellow]{day}: {absent} に無し[/yellow]")
+                continue
+
+            if book_blob is None:
+                streams = {
+                    "binance": book_from_tape(
+                        read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), binance
+                    )
+                }
+            else:
+                streams = {
+                    "binance": merge(
+                        book_events(read_zip_csv(book_blob, BOOK_TICKER_COLUMNS), binance),
+                        trade_events(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), binance),
+                    )
+                }
+            streams["bybit"] = bybit_vision.book_events(
+                bybit_vision.read_gzip_csv(by_blob), bybit
+            )
+
+            # Each venue announces itself once, before its own first event.
+            # The risk and staleness gates hold everything until both sides
+            # report live, and an archive carries no such line.
+            greeted: set[str] = set()
+
+            def tag(source: str, stream):
+                # A generator expression here would look `source` up when the
+                # generator first runs rather than when it was built, by which
+                # time the loop has moved on: every event would carry the last
+                # venue's name and the spread between them would read as zero.
+                return (Stamped(s.ts_ns, (source, s.event)) for s in stream)
+
+            tagged = merge(*[tag(name, stream) for name, stream in streams.items()])
+            day_count = 0
+            for stamped in tagged:
+                source, event = stamped.event
+                if source not in greeted:
+                    greeted.add(source)
+                    emit(
+                        source,
+                        FeedStatus(state="live", detail="archive", ts_ns=stamped.ts_ns),
+                        stamped.ts_ns,
+                    )
+                emit(source, event, stamped.ts_ns)
+                day_count += 1
+            console.print(
+                f"  {day}: {day_count:,} 件"
+                + ("  [dim]Binanceの気配も約定から推定[/dim]" if book_blob is None else "")
+            )
+
+    write_meta(
+        out,
+        {
+            "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+            "bybit": {**_spec_dict(bybit, "perp"), "venue": "bybit"},
+        },
+        source="data.binance.vision + public.bybit.com",
+    )
+
+    total = written["binance"] + written["bybit"]
+    console.rule("[bold cyan]取引所間の過去データ取り込み完了")
+    console.print(
+        f"  銘柄   : {binance.symbol}\n"
+        f"  Binance: tick={binance.tick_size} lot={binance.lot_size}  "
+        f"{written['binance']:,} 件\n"
+        f"  Bybit  : tick={bybit.tick_size} lot={bybit.lot_size}  "
+        f"{written['bybit']:,} 件\n"
+        f"  期間   : {days[0]} 〜 {days[-1]}（{len(days)}日）\n"
+        f"  出力   : {out}  ({out.stat().st_size / 1e6:,.1f} MB)"
+    )
+    if missing:
+        console.print(f"  [yellow]片側しか無かった日: {', '.join(missing)}[/yellow]")
+    if total == 0:
+        raise ConfigError("1件も取り込めませんでした。銘柄名と日付を確認してください。")
+    if not written["binance"] or not written["bybit"]:
+        raise ConfigError(
+            "片方の取引所のイベントが0件です。価格差は測れません。"
+        )
+    if args.s3_bucket:
+        from .sim.s3 import default_client
+
+        key = f"{args.s3_prefix.strip('/')}/{binance.symbol}-x/{out.name}"
+        try:
+            default_client().upload_file(str(out), args.s3_bucket, key)
+        except Exception as exc:  # noqa: BLE001 - the local file is still there
+            console.print(f"  [red]S3 転送失敗: {exc}[/red]")
+        else:
+            console.print(f"  S3     : s3://{args.s3_bucket}/{key}")
+    console.print(f"\n[dim]  次: jsboard xarb {out} --plain[/dim]")
+    return 0
+
+
 async def cmd_walk(args: argparse.Namespace) -> int:
     """Test settings across many published days, one day on disk at a time.
 
@@ -4810,6 +4970,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_vision.add_argument("--s3-bucket", default=None, help="保存先バケット")
     p_vision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
     p_vision.set_defaults(func=cmd_vision)
+
+    p_xvision = sub.add_parser(
+        "xvision",
+        help="Binance/Bybitの公開アーカイブを同じ日で落として xarb 用に1本にする",
+    )
+    p_xvision.add_argument("--symbol", default="BTCUSDT")
+    p_xvision.add_argument("--start", required=True, help="開始日 YYYY-MM-DD")
+    p_xvision.add_argument("--end", default=None, help="終了日。省略で開始日のみ")
+    p_xvision.add_argument("--out", default="xhistory.jsonl.gz")
+    p_xvision.add_argument("--tick-size", default=None)
+    p_xvision.add_argument("--lot-size", default=None)
+    p_xvision.add_argument("--s3-bucket", default=None, help="保存先バケット")
+    p_xvision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
+    p_xvision.set_defaults(func=cmd_xvision)
 
     p_walk = sub.add_parser(
         "walk",

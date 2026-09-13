@@ -233,7 +233,7 @@ def iter_tagged(path: str | Path):
     book builds a book that never existed. Cross-venue work needs the
     opposite: both streams, still interleaved, each routed to its own book.
     """
-    with Path(path).open(encoding="utf-8") as fh:
+    with _open_text(Path(path)) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -252,7 +252,7 @@ def iter_tagged_timed(path: str | Path):
     not compare exchange clocks from two different products.  Old recordings
     without ``rx_ns`` remain usable by falling back to the event timestamp.
     """
-    with Path(path).open(encoding="utf-8") as fh:
+    with _open_text(Path(path)) as fh:
         for line in fh:
             line = line.strip()
             if not line:

@@ -126,6 +126,28 @@ def _ts_ns(raw: str) -> int:
     return value * 1_000_000 if value < 1_000_000_000_000_000 else value * 1_000
 
 
+def ts_ns_auto(raw: str) -> int:
+    """A timestamp in whatever unit the venue chose, as nanoseconds.
+
+    Bybit stamps seconds with a fractional part, Binance milliseconds, and
+    some files microseconds. A wrong guess does not raise — it puts the day
+    in 1970 or in the year 33658, and a merge of two venues then interleaves
+    one venue's whole day before the other's first print, which reads as a
+    spread of several percent that closes instantly.
+
+    The magnitudes are four orders of magnitude apart, so the current era
+    separates them unambiguously.
+    """
+    value = float(raw)
+    if value < 1e11:  # seconds until the year 5138
+        return int(value * 1e9)
+    if value < 1e14:  # milliseconds
+        return int(value * 1e6)
+    if value < 1e17:  # microseconds
+        return int(value * 1e3)
+    return int(value)
+
+
 @dataclass(frozen=True, slots=True)
 class Stamped:
     ts_ns: int
@@ -198,7 +220,9 @@ def trade_events(rows: Iterator[dict[str, str]], instrument: Instrument) -> Iter
 
 
 def book_from_tape(
-    rows: Iterator[dict[str, str]], instrument: Instrument
+    rows: Iterator[dict[str, str]],
+    instrument: Instrument,
+    trades=None,
 ) -> Iterator[Stamped]:
     """A touch inferred from the prints, for the days with no bookTicker.
 
@@ -220,11 +244,16 @@ def book_from_tape(
 
     What survives is the question this was built for: whether the tape reached
     a price, and at what cost. That is carried entirely by the prints.
+
+    `trades` names the reader for this venue's column layout — Binance's by
+    default, Bybit's when that archive is being read. The reconstruction is
+    identical once the aggressor is known; only the field that carries it
+    differs, and the two venues spell it as opposites.
     """
     bid: int | None = None
     ask: int | None = None
     one = max(1, instrument.to_lots("1") or 1)
-    for stamped in trade_events(rows, instrument):
+    for stamped in (trades or trade_events)(rows, instrument):
         tick = stamped.event
         if tick.aggressor is Side.SELL:
             bid = tick.price
