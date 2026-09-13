@@ -96,3 +96,40 @@ class TestLabel:
     def test_other_settings_print_plainly(self):
         assert _label("gamma", 0.6) == "0.6"
         assert _label("levels", 3) == "3"
+
+
+class TestANameThatIsNotASetting:
+    """The flag and the field it feeds are not always spelled the same.
+
+    `--min-half-spread` lands on the namespace as `min_half_spread`, but the
+    quoter field it sets is `min_half_spread_ticks`. Reading the field name
+    out of the source and handing it to --axis is the natural mistake, and it
+    is one edit from correct — so the error should say which edit.
+    """
+
+    def _axes_for(self, spec):
+        from jsboard.cli import ConfigError, _sweep_axes, build_parser
+
+        args = build_parser().parse_args(["sweep", "x.jsonl", "--axis", spec])
+        try:
+            _sweep_axes(args)
+        except ConfigError as exc:
+            return str(exc)
+        return ""
+
+    def test_a_near_miss_names_the_real_setting(self):
+        assert "min_half_spread" in self._axes_for("min_half_spread_ticks=1,2")
+
+    def test_a_typo_is_corrected(self):
+        assert "gamma" in self._axes_for("gama=1,2")
+
+    def test_something_unrecognisable_lists_what_is_available(self):
+        message = self._axes_for("zzzzzzzz=1,2")
+        assert "指定できるもの" in message
+        assert "gamma" in message
+
+    def test_plumbing_is_not_offered_as_a_setting(self):
+        """`--axis plain=...` would run the same configuration twice."""
+        message = self._axes_for("zzzzzzzz=1,2")
+        for plumbing in ("func", "plain", "path", "axis"):
+            assert f" {plumbing}," not in message

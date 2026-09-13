@@ -784,6 +784,36 @@ def _grid(spec: str, cast):
     return out
 
 
+# Present on the namespace but not a setting to sweep: plumbing, the axis
+# shorthands themselves, and the things that name the run rather than shape it.
+AXIS_NON_SETTINGS = frozenset(
+    {
+        "func", "path", "plain", "axis", "start", "end", "work", "keep",
+        "decide_until", "s3_bucket", "s3_prefix", "symbol", "source", "out",
+        "distances", "sizes", "requotes", "latencies", "toxicity_thresholds",
+        "since", "until", "headless", "tick_size", "lot_size",
+    }
+)
+
+
+def _axis_hint(args: argparse.Namespace, name: str) -> str:
+    """Point at the real name rather than at the help page.
+
+    The trap this exists for is a setting whose flag and whose attribute
+    differ: `--min-half-spread` arrives as `min_half_spread`, while the
+    quoter field it feeds is `min_half_spread_ticks`. Reading the field name
+    off the source and passing it to --axis is the natural mistake, and
+    "look it up in --help" is a poor answer when the answer is one edit away.
+    """
+    import difflib
+
+    known = sorted(n for n in vars(args) if n not in AXIS_NON_SETTINGS)
+    close = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+    if close:
+        return "  もしかして: " + " / ".join(close)
+    return "  指定できるもの: " + ", ".join(known)
+
+
 def _cast_like(current) -> object:
     """Cast a sweep value the way the parser would have cast the default.
 
@@ -853,8 +883,7 @@ def _sweep_axes(args: argparse.Namespace) -> dict[str, list]:
             raise ConfigError(f"--axis {spec} は name=v1,v2 の形で指定してください。")
         if not hasattr(args, name):
             raise ConfigError(
-                f"--axis {name} という設定はありません。"
-                f"  `jsboard sweep --help` で名前を確認してください。"
+                f"--axis {name} という設定はありません。{_axis_hint(args, name)}"
             )
         axes[name] = _grid(values, _cast_like(getattr(args, name)))
     return axes
