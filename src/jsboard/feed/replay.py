@@ -344,7 +344,11 @@ class ReplayFeed(Feed):
                     continue
                 event = _decode(raw)
                 ts = getattr(event, "ts_ns", None)
-                if ts is not None:
+                # A window selects data, not state. The line that says the feed
+                # is live sits at the head of the file, so filtering it out with
+                # everything else before the window leaves the risk gate holding
+                # every quote and the whole slice reporting a flat zero.
+                if ts is not None and not isinstance(event, FeedStatus):
                     if self.until_ns is not None and ts > self.until_ns:
                         break
                     if self.since_ns is not None and ts < self.since_ns:

@@ -516,3 +516,43 @@ class TestWindow:
 
         with pytest.raises(ConfigError):
             _parse_when("yesterday")
+
+
+class TestWindowKeepsState:
+    def test_a_window_that_starts_late_still_sees_the_feed_go_live(self, tmp_path):
+        """The live line sits at the head of the file, before any window."""
+        import asyncio
+        import json
+
+        from jsboard.core.market import MarketView
+        from jsboard.feed.base import FeedStatus
+        from jsboard.feed.replay import RX_KEY, SOURCE_KEY, ReplayFeed, _encode
+
+        path = tmp_path / "w.jsonl"
+        base = MS * 1_000_000
+        with path.open("w") as fh:
+            rows = [FeedStatus(state="live", detail="archive", ts_ns=base)]
+            for i in range(6):
+                blob = archive(
+                    [f"{i},0.0298,100,0.0299,200,{MS + i * 1000},{MS + i * 1000}"]
+                )
+                rows += [s.event for s in book_events(book_rows(blob), INST)]
+            for event in rows:
+                row = _encode(event)
+                row[SOURCE_KEY] = "perp"
+                row[RX_KEY] = getattr(event, "ts_ns", base)
+                fh.write(json.dumps(row) + "\n")
+
+        view = MarketView(instrument=INST, depth=5)
+
+        async def run():
+            live = False
+            feed = ReplayFeed(
+                INST, path, speed=0, source="perp", since_ns=(MS + 3000) * 1_000_000
+            )
+            async for event in feed.stream():
+                view.apply(event)
+                live = live or view.is_live
+            return live
+
+        assert asyncio.run(run())
