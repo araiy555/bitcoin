@@ -324,3 +324,73 @@ class TestExposureClockIsDeterministic:
         assert first["mean_abs_position"] == second["mean_abs_position"]
         # A pair of zeros would agree without proving anything.
         assert first["exposed_share"] > 0
+
+
+class TestGapThroughReachesThePnL:
+    """A fill with no print behind it still has to be booked like any other.
+
+    The venue can now fill an order the touch has crossed, but that is only
+    worth having if the fill reaches the position, the fees and the mark-out.
+    The mark-out is the part that is easy to get wrong: a book jump moves the
+    mid in the same instant it fills us, so marking against the mid *after*
+    the jump would hand back exactly the adverse move the fill just cost.
+    """
+
+    def _drive(self, mm, bid, ask, ts_ns):
+        from jsboard.feed.base import DepthSnapshot
+
+        one = BTC.to_lots("1")
+        mm.on_event(
+            DepthSnapshot(
+                bids=tuple((bid - i, one) for i in range(5)),
+                asks=tuple((ask + i, one) for i in range(5)),
+                last_update_id=ts_ns,
+                ts_ns=ts_ns,
+            )
+        )
+
+    def _live(self, mm):
+        from jsboard.feed.base import FeedStatus
+
+        mm.on_event(FeedStatus(state="live", detail="test", ts_ns=1_000_000_000))
+
+    async def test_a_jumped_book_moves_the_position_and_the_fees(self):
+        mm = build(maker_bps=1.0)
+        self._live(mm)
+        self._drive(mm, 5_000_000, 5_000_100, 1_000_000_000)
+        mm.requote(force=True)
+        assert mm.venue.open_orders(), "nothing resting to be jumped"
+
+        # 100 ticks below the old bid: every resting bid is now crossed.
+        self._drive(mm, 4_999_000, 4_999_100, 2_000_000_000)
+
+        assert mm.venue.gap_fills > 0
+        assert mm.position.lots > 0, "bought, so the position is long"
+        assert mm.position.fees_paid > 0
+        assert mm.stats.fills == mm.venue.gap_fills
+
+    async def test_the_adverse_move_is_charged_to_the_fill(self):
+        mm = build(maker_bps=0.0)
+        self._live(mm)
+        self._drive(mm, 5_000_000, 5_000_100, 1_000_000_000)
+        mm.requote(force=True)
+
+        self._drive(mm, 4_999_000, 4_999_100, 2_000_000_000)
+        assert mm.venue.gap_fills > 0
+
+        # The mid fell after we were filled long, so the position is under
+        # water. Marking against the post-jump mid would have shown zero.
+        assert mm.summary()["unrealized"] < 0
+
+    async def test_switching_it_off_reproduces_the_old_silence(self):
+        mm = build()
+        mm.venue.config.gap_through_fills = False
+        self._live(mm)
+        self._drive(mm, 5_000_000, 5_000_100, 1_000_000_000)
+        mm.requote(force=True)
+        resting = len(mm.venue.open_orders())
+
+        self._drive(mm, 4_999_000, 4_999_100, 2_000_000_000)
+
+        assert mm.venue.gap_fills == 0
+        assert len(mm.venue.open_orders()) == resting

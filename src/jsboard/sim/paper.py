@@ -12,15 +12,20 @@ What is modelled:
   * partial fills, and level depletion carrying through to better prices
   * order-entry latency, so quotes are not live the instant we decide them
 
-What is not, and where results will flatter us:
+Gap-throughs are handled in `on_book`. A resting bid that the public *ask*
+has dropped to or below is not a resting bid any more — that is a crossed
+market, which cannot stand for the length of a round trip, and in reality
+somebody took our price on the way past. Filling only on prints missed this
+entirely, and it missed it asymmetrically: the fills it skipped are the ones
+where the market immediately went against us, so every P&L the model produced
+was an upper bound rather than an estimate. It matters most exactly where a
+recording is thinnest — an aggregated tape and a one-level archive book will
+show the touch jumping far more often than they show a print at our price.
+
+What is still not modelled, and where results will flatter us:
   * market impact — our size never scares anyone off
   * hidden/iceberg liquidity sitting invisibly ahead of us
   * queue jumping by faster participants after we arrive
-  * gap-throughs — if the book jumps past a resting quote with no print in
-    between, nothing here fills it, though in reality someone would have
-    taken it on the way past. This is the largest single optimism in the
-    model: it under-counts exactly the adverse selection a maker most fears,
-    so treat the P&L as an upper bound rather than an estimate.
 
 `cancel_ahead_ratio` is the one honest knob for the biggest unknown: when
 depth at our level shrinks without a print, we cannot see whether those
@@ -73,6 +78,13 @@ class PaperConfig:
     allow_price_improvement: bool = True
     """Quoting inside the touch starts us at the front of a fresh level."""
 
+    gap_through_fills: bool = True
+    """Fill a resting order the public touch has crossed, print or no print.
+
+    Off only to reproduce the older, print-only numbers side by side; leaving
+    it off silently discards the adverse fills and inflates the result.
+    """
+
 
 @dataclass(slots=True)
 class PaperVenue:
@@ -95,6 +107,12 @@ class PaperVenue:
     prints_at_our_price: int = 0
     queue_absorbed_lots: int = 0
     filled_lots: int = 0
+
+    # Fills the tape never accounted for, kept separate because they are the
+    # ones a print-only model was throwing away. A run where they dominate is
+    # a run whose recording is too coarse to trust for anything finer.
+    gap_fills: int = 0
+    gap_filled_lots: int = 0
 
     def _now(self) -> int:
         return self.clock()
@@ -220,6 +238,62 @@ class PaperVenue:
 
             if order.remaining <= 0:
                 self.orders.pop(order.order_id, None)
+
+        self.fills.extend(produced)
+        return produced
+
+    def on_book(
+        self, best_bid: int | None, best_ask: int | None, ts_ns: int = 0
+    ) -> list[Fill]:
+        """Fill anything the public touch has moved through.
+
+        A bid of ours at or above the public ask is a crossed market. Nobody
+        leaves that standing: whoever posted the ask crossed our price to get
+        there, and we were the better-priced resting order, so we traded. The
+        same holds mirrored for our asks against the public bid.
+
+        The queue in front of us does not protect us here, and that is the
+        point. A print says *some* size traded at a price; a touch that has
+        moved past our level says the level was cleared out entirely. Sizing
+        the fill by whatever quantity the far touch shows afterwards would be
+        measuring the residue left behind by the sweep, not the sweep.
+        """
+        if not self.config.gap_through_fills:
+            return []
+        now = self._now()
+        produced: list[Fill] = []
+        for order in list(self.orders.values()):
+            if not order.is_active(now):
+                continue
+            if order.side is Side.BUY:
+                if best_ask is None or order.price < best_ask:
+                    continue
+                aggressor = Side.SELL
+            else:
+                if best_bid is None or order.price > best_bid:
+                    continue
+                aggressor = Side.BUY
+
+            fill_qty = order.remaining
+            order.remaining = 0
+            order.filled += fill_qty
+            order.queue_ahead = 0
+            self.filled_lots += fill_qty
+            self.gap_fills += 1
+            self.gap_filled_lots += fill_qty
+            produced.append(
+                Fill(
+                    price=order.price,
+                    qty=fill_qty,
+                    maker_id=order.order_id,
+                    taker_id=0,
+                    maker_owner=PAPER_OWNER,
+                    taker_owner="market",
+                    aggressor=aggressor,
+                    ts_ns=ts_ns or now,
+                )
+            )
+            self.orders.pop(order.order_id, None)
 
         self.fills.extend(produced)
         return produced

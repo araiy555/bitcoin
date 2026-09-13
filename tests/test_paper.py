@@ -258,3 +258,91 @@ class TestReachCounters:
             venue.on_trade(TradeTick(price=98, qty=1, aggressor=Side.BUY, trade_id=i))
         assert venue.prints_seen == 3
         assert venue.prints_at_our_price == 0
+
+
+class TestGapThrough:
+    """Fills the tape never explains — the model's old blind spot.
+
+    A resting bid the public ask has fallen to or below is a crossed market.
+    It cannot survive: whoever posted that ask crossed our price to reach it,
+    and we were the better-priced resting order. Counting only prints skipped
+    these, and it skipped them one-sidedly — the market that jumps through a
+    quote is the market that has just gone against it.
+    """
+
+    def test_a_book_that_jumps_past_our_bid_fills_it(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=50, best_opposite=101)
+        clock.advance_ms(20)
+
+        fills = venue.on_book(best_bid=98, best_ask=99)
+
+        assert [(f.price, f.qty) for f in fills] == [(100, 5)]
+        assert fills[0].aggressor is Side.SELL
+        assert venue.gap_fills == 1
+        assert venue.gap_filled_lots == 5
+
+    def test_a_book_that_jumps_past_our_ask_fills_it(self, venue, clock):
+        venue.place(ask(100, 5), visible_depth=50, best_opposite=99)
+        clock.advance_ms(20)
+
+        fills = venue.on_book(best_bid=101, best_ask=102)
+
+        assert [(f.price, f.qty) for f in fills] == [(100, 5)]
+        assert fills[0].aggressor is Side.BUY
+
+    def test_the_queue_does_not_protect_a_level_that_was_swept(self, venue, clock):
+        """A print says size traded; a moved touch says the level is gone."""
+        venue.place(bid(100, 5), visible_depth=1_000_000, best_opposite=101)
+        clock.advance_ms(20)
+
+        assert venue.on_book(best_bid=90, best_ask=91) != []
+
+    def test_a_touch_that_merely_reaches_us_does_not_fill(self, venue, clock):
+        """Our bid at the public bid is ordinary; only a cross is not."""
+        venue.place(bid(100, 5), visible_depth=10, best_opposite=101)
+        clock.advance_ms(20)
+
+        assert venue.on_book(best_bid=100, best_ask=101) == []
+        assert venue.gap_fills == 0
+
+    def test_an_order_still_in_flight_is_not_filled(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(1)  # latency is 10ms
+
+        assert venue.on_book(best_bid=98, best_ask=99) == []
+
+    def test_a_one_sided_book_fills_nothing_it_cannot_see(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+
+        assert venue.on_book(best_bid=None, best_ask=None) == []
+
+    def test_it_can_be_switched_off_to_reproduce_the_old_numbers(self, clock):
+        off = PaperVenue(
+            instrument=INST,
+            config=PaperConfig(latency_ms=10.0, gap_through_fills=False),
+            clock=clock,
+        )
+        off.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+
+        assert off.on_book(best_bid=90, best_ask=91) == []
+        assert off.open_orders() != []
+
+    def test_a_gap_fill_leaves_no_order_behind_to_fill_twice(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+
+        venue.on_book(best_bid=98, best_ask=99)
+
+        assert venue.open_orders() == []
+        assert venue.on_book(best_bid=98, best_ask=99) == []
+        assert venue.on_trade(sell_into(100, 5)) == []
+
+    def test_the_fill_carries_the_event_time_not_the_wall_clock(self, venue, clock):
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        clock.advance_ms(20)
+
+        fills = venue.on_book(best_bid=98, best_ask=99, ts_ns=777)
+
+        assert fills[0].ts_ns == 777

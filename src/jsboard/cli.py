@@ -325,7 +325,11 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
     )
     venue = PaperVenue(
         instrument=instrument,
-        config=PaperConfig(latency_ms=args.latency_ms, cancel_ahead_ratio=args.cancel_ahead),
+        config=PaperConfig(
+            latency_ms=args.latency_ms,
+            cancel_ahead_ratio=args.cancel_ahead,
+            gap_through_fills=not getattr(args, "no_gap_fills", False),
+        ),
     )
     position = Position(
         instrument=instrument,
@@ -496,13 +500,27 @@ def _reach_lines(mm: MarketMaker, s: dict) -> list[str]:
     reached = s.get("prints_at_our_price", 0)
     share = f"{reached / prints * 100:.1f}%" if prints else "—"
 
-    return [
+    lines = [
         f"  quote placement: inside {inside / total * 100:.0f}% / "
         f"at touch {at_touch / total * 100:.0f}% / behind {behind / total * 100:.0f}%"
         f"   queue ahead at touch: {queue}",
         f"  tape reach     : {reached:,} of {prints:,} prints ({share}) came to our price, "
         f"{s.get('queue_absorbed', 0):,.0f} {mm.instrument.base} of it absorbed ahead of us",
     ]
+
+    # How much of the result rests on fills no print explains. These are the
+    # adverse ones, so a high share is not a warning about the model — it is
+    # the shape of the market the recording caught.
+    gap = s.get("gap_fills", 0)
+    filled = s.get("filled", 0.0)
+    gap_qty = s.get("gap_filled", 0.0)
+    if gap:
+        gap_share = f"{gap_qty / filled * 100:.0f}%" if filled else "—"
+        lines.append(
+            f"  板の飛び越え   : {gap:,} 件 / {gap_qty:,.4f} {mm.instrument.base} "
+            f"（約定数量の{gap_share}）— 歩み値ではなく板が指値を通過した約定"
+        )
+    return lines
 
 
 def _toxicity_line(s: dict) -> str | None:
@@ -3920,6 +3938,14 @@ def add_common(p: argparse.ArgumentParser) -> None:
     sim = p.add_argument_group("simulation")
     sim.add_argument("--latency-ms", type=float, default=5.0)
     sim.add_argument("--cancel-ahead", type=float, default=0.5)
+    sim.add_argument(
+        "--no-gap-fills",
+        action="store_true",
+        help=(
+            "板が指値を飛び越えたときの約定を数えない（旧挙動）。"
+            "外すと不利な約定だけが消えるので、比較用途以外では使わないこと。"
+        ),
+    )
     # Binance's standard spot maker fee is 10bps, which no one market-makes
     # against; 0 is the market-maker / VIP tier this strategy assumes.
     sim.add_argument("--maker-bps", type=float, default=0.0)

@@ -121,54 +121,70 @@ class MarketMaker:
 
     def on_event(self, event: FeedEvent) -> list[Fill]:
         """Feed one market event through the whole pipeline."""
+        # The mid *before* the event lands is the reference both the
+        # attribution and the mark-out measure against: it is the price the
+        # market showed at the instant we traded. For a print it is the same
+        # either side of `apply`, but a book jump that fills us by crossing
+        # our price moves the mid in the same instant, and marking such a fill
+        # against the post-jump mid would credit us the adverse move it cost.
+        mid = self.market.mid
         self.market.apply(event)
 
         fills: list[Fill] = []
         if isinstance(event, TradeTick):
-            # The mid *before* our own fills are booked is the reference both
-            # the attribution and the mark-out measure against: it is the
-            # price the market showed at the instant we traded.
-            mid = self.market.mid
             fills = self.venue.on_trade(event)
-            now = self.clock()
-            for fill in fills:
-                # Our side of the trade, which is the opposite of the taker's
-                # when we were the maker. Both sides are possible on one fill
-                # only if we somehow traded with ourselves; book each anyway.
-                sides = []
-                if fill.maker_owner == PAPER_OWNER:
-                    sides.append(fill.aggressor.opposite.sign)
-                if fill.taker_owner == PAPER_OWNER:
-                    sides.append(fill.aggressor.sign)
-                if not sides:
-                    continue
-                before = self.position.fees_paid
-                self.position.apply(fill, PAPER_OWNER)
-                fee = self.position.fees_paid - before
-                for sign in sides:
-                    self.markout.on_fill(now, sign, fill.price, fill.qty, mid_ticks=mid)
-                    self.attribution.on_fill(
-                        price_ticks=fill.price,
-                        qty_lots=fill.qty,
-                        sign=sign,
-                        fee=fee / len(sides),
-                        mid_ticks=mid,
-                        now_ns=self._data_time_ns,
-                    )
-            if fills:
-                self.stats.fills += len(fills)
-                self.recent_fills.extend(fills)
-                del self.recent_fills[:-100]
         elif isinstance(event, (DepthDelta, DepthSnapshot)):
             for price, qty in event.bids:
                 self.venue.on_depth(Side.BUY, price, qty)
             for price, qty in event.asks:
                 self.venue.on_depth(Side.SELL, price, qty)
 
+        # Either kind of event can leave the touch past a quote of ours: a
+        # depth update by moving the book, a print by consuming the level it
+        # traded on. Both mean the same thing for a resting order.
+        fills += self.venue.on_book(
+            self.market.book.best_bid(),
+            self.market.book.best_ask(),
+            ts_ns=getattr(event, "ts_ns", 0) or 0,
+        )
+
+        if fills:
+            self._book_fills(fills, mid)
+
         mid_now = self.market.mid
         self.markout.poll(self.clock(), mid_now)
         self.attribution.on_mid(mid_now, self._data_time_ns)
         return fills
+
+    def _book_fills(self, fills: list[Fill], mid: float | None) -> None:
+        now = self.clock()
+        for fill in fills:
+            # Our side of the trade, which is the opposite of the taker's
+            # when we were the maker. Both sides are possible on one fill
+            # only if we somehow traded with ourselves; book each anyway.
+            sides = []
+            if fill.maker_owner == PAPER_OWNER:
+                sides.append(fill.aggressor.opposite.sign)
+            if fill.taker_owner == PAPER_OWNER:
+                sides.append(fill.aggressor.sign)
+            if not sides:
+                continue
+            before = self.position.fees_paid
+            self.position.apply(fill, PAPER_OWNER)
+            fee = self.position.fees_paid - before
+            for sign in sides:
+                self.markout.on_fill(now, sign, fill.price, fill.qty, mid_ticks=mid)
+                self.attribution.on_fill(
+                    price_ticks=fill.price,
+                    qty_lots=fill.qty,
+                    sign=sign,
+                    fee=fee / len(sides),
+                    mid_ticks=mid,
+                    now_ns=self._data_time_ns,
+                )
+        self.stats.fills += len(fills)
+        self.recent_fills.extend(fills)
+        del self.recent_fills[:-100]
 
     # -------------------------------------------------------------- quoting
 
@@ -364,6 +380,9 @@ class MarketMaker:
                 "prints_seen": self.venue.prints_seen,
                 "prints_at_our_price": self.venue.prints_at_our_price,
                 "queue_absorbed": self.instrument.qty_f(self.venue.queue_absorbed_lots),
+                "gap_fills": self.venue.gap_fills,
+                "gap_filled": self.instrument.qty_f(self.venue.gap_filled_lots),
+                "filled": self.instrument.qty_f(self.venue.filled_lots),
                 "toxicity": toxicity,
             }
         )
