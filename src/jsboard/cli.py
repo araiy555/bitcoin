@@ -2728,32 +2728,39 @@ def _walk_aggregate(rows: list[dict]) -> dict:
     Weighted by fills is what the account would have earned; the plain mean
     over days is whether it earned it *every* day or won one day and gave it
     back. A strategy that only survives as a total is a directional bet.
+
+    Which is why the pre-fee number is also split into what it was made of.
+    Widening the quotes turns the strategy into something else: an order
+    resting far from the mid is only reached when price travels to it, so it
+    buys drops and sells rallies and its P&L is the path the price took, not
+    the spread it quoted. The two components say which one is running.
+    Inventory carrying the result is a mean-reversion bet wearing a market
+    maker's clothes, and it will swing with the month rather than the volume.
     """
     fills = sum(r["fills"] for r in rows)
     scored = [r for r in rows if r["fills"] > 0 and not math.isnan(r["pre_fee_bps"])]
     pre = [r["pre_fee_bps"] for r in scored]
-    weighted = (
-        sum(r["pre_fee_bps"] * r["fills"] for r in scored) / sum(r["fills"] for r in scored)
-        if scored
-        else math.nan
-    )
+
+    def weighted(name: str) -> float:
+        usable = [r for r in scored if not math.isnan(r.get(name, math.nan))]
+        volume = sum(r["fills"] for r in usable)
+        if not volume:
+            return math.nan
+        return sum(r[name] * r["fills"] for r in usable) / volume
+
     gaps = [r["gap_share"] for r in rows if not math.isnan(r.get("gap_share", math.nan))]
     return {
         "days": len(rows),
         "traded_days": len(scored),
         "fills": fills,
-        "pre_fee_weighted": weighted,
+        "pre_fee_weighted": weighted("pre_fee_bps"),
         "pre_fee_mean": statistics.fmean(pre) if pre else math.nan,
         "pre_fee_worst": min(pre) if pre else math.nan,
         "negative_days": sum(1 for v in pre if v < 0),
+        "spread_bps": weighted("spread_bps"),
+        "inventory_bps": weighted("inventory_bps"),
         "gap_share": statistics.fmean(gaps) if gaps else math.nan,
-        "max_maker_bps": (
-            statistics.fmean(
-                [r["max_maker_bps"] for r in scored if not math.isnan(r["max_maker_bps"])]
-            )
-            if scored
-            else math.nan
-        ),
+        "max_maker_bps": weighted("max_maker_bps"),
     }
 
 
@@ -2768,6 +2775,8 @@ WALK_COLUMNS = [
     ("前平均", "pre_fee_mean", "{:+.2f}"),
     ("最悪日", "pre_fee_worst", "{:+.2f}"),
     ("負日", "negative_days", "{:,.0f}"),
+    ("spread", "spread_bps", "{:+.2f}"),
+    ("在庫", "inventory_bps", "{:+.2f}"),
     ("許容料率", "max_maker_bps", "{:+.2f}"),
     ("飛越%", "gap_share", "{:.0f}"),
 ]
@@ -2775,6 +2784,8 @@ WALK_COLUMNS = [
 WALK_LEGEND = (
     "[dim]前加重=手数料前bps(約定数で加重)  前平均=日ごとの単純平均  "
     "最悪日=最も悪かった1日  負日=手数料前がマイナスだった日数  "
+    "spread+在庫=手数料前の内訳。在庫が担っていれば逆張り（下落で買い上昇で売り）"
+    "であって、マーケットメイクではない  "
     "許容料率=払えるメイカー料 bps/片道  飛越%=歩み値で説明できない約定数量[/dim]"
 )
 

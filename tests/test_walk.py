@@ -221,3 +221,57 @@ class TestAggregate:
 
     def test_settings_are_keyed_independently_of_their_order(self):
         assert _walk_key({"a": 1, "b": 2}) == _walk_key({"b": 2, "a": 1})
+
+
+class TestWhichStrategyIsActuallyRunning:
+    """Widening the quotes stops being market making and nobody says so.
+
+    An order resting far from the mid is only reached when price travels to
+    it, so it buys drops and sells rallies. That is a mean-reversion bet, and
+    its P&L is the path price took rather than the spread it quoted. The
+    total alone cannot tell the two apart — the split can.
+    """
+
+    def _rows(self, spread, inventory):
+        return [
+            {
+                "fills": 100,
+                "pre_fee_bps": spread + inventory,
+                "spread_bps": spread,
+                "inventory_bps": inventory,
+                "gap_share": 10.0,
+                "max_maker_bps": 1.0,
+            }
+        ]
+
+    def test_the_components_survive_aggregation(self):
+        agg = _walk_aggregate(self._rows(0.4, 12.0))
+
+        assert agg["spread_bps"] == pytest.approx(0.4)
+        assert agg["inventory_bps"] == pytest.approx(12.0)
+        assert agg["pre_fee_weighted"] == pytest.approx(12.4)
+
+    def test_a_component_missing_on_some_days_does_not_poison_the_mean(self):
+        rows = self._rows(1.0, 1.0)
+        rows.append(
+            {
+                "fills": 100,
+                "pre_fee_bps": 3.0,
+                "spread_bps": 3.0,
+                "inventory_bps": float("nan"),
+                "gap_share": 10.0,
+                "max_maker_bps": 1.5,
+            }
+        )
+        agg = _walk_aggregate(rows)
+
+        assert agg["spread_bps"] == pytest.approx(2.0)
+        assert agg["inventory_bps"] == pytest.approx(1.0)
+
+    def test_the_split_reaches_the_printed_table(self, tmp_path, served, capsys):
+        args = walk_args(tmp_path, "--start", "2024-03-01", "--end", "2024-03-02", "--plain")
+        asyncio.run(cmd_walk(args))
+
+        out = capsys.readouterr().out
+        assert "spread" in out and "在庫" in out
+        assert "逆張り" in out
