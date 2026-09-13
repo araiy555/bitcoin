@@ -310,10 +310,18 @@ class ReplayFeed(Feed):
         *,
         speed: float = 1.0,
         source: str | None = None,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
     ) -> None:
         super().__init__(instrument)
         self.path = Path(path)
         self.speed = speed
+        self.since_ns = since_ns
+        self.until_ns = until_ns
+        """Replay only the events inside a window of the recording's own
+        clock. A day of archive and an hour recorded live can only be compared
+        over the same hour, and slicing by event count would cut a different
+        interval on each file."""
         self.source = source
         """Which `src` tag to replay. A `capture` recording interleaves spot
         and perp on one timeline, and feeding both into a single book would
@@ -336,6 +344,11 @@ class ReplayFeed(Feed):
                     continue
                 event = _decode(raw)
                 ts = getattr(event, "ts_ns", None)
+                if ts is not None:
+                    if self.until_ns is not None and ts > self.until_ns:
+                        break
+                    if self.since_ns is not None and ts < self.since_ns:
+                        continue
                 if self.speed > 0 and prev_ts is not None and ts is not None:
                     gap = (ts - prev_ts) / 1e9 / self.speed
                     if 0 < gap < 5.0:

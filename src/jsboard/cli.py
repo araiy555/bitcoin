@@ -657,10 +657,37 @@ async def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_when(text: str | None) -> int | None:
+    """An ISO time on the recording's own clock, in UTC.
+
+    Given as UTC because that is what the archives and the exchange stamps
+    are; reading it as local time would slice a different hour on a laptop
+    in Tokyo than on one in London.
+    """
+    if not text:
+        return None
+    from datetime import UTC, datetime
+
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ConfigError(f"時刻は 2026-08-13T11:27 の形式で: {exc}") from exc
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return int(when.timestamp() * 1e9)
+
+
 async def cmd_replay(args: argparse.Namespace) -> int:
     path = Path(args.path)
     instrument = _instrument_for_recording(path, args)
-    feed = ReplayFeed(instrument, path, speed=args.speed, source=args.source)
+    feed = ReplayFeed(
+        instrument,
+        path,
+        speed=args.speed,
+        source=args.source,
+        since_ns=_parse_when(args.since),
+        until_ns=_parse_when(args.until),
+    )
     mm = build_maker(instrument, args)
     # A recording carries the timestamps it was captured with. Judged against
     # the wall clock those are always in the past — a day-old capture reads as
@@ -3927,6 +3954,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep = sub.add_parser("replay", help="replay a capture")
     add_common(p_rep)
     p_rep.add_argument("path")
+    p_rep.add_argument("--since", default=None, help="この時刻以降だけ再生 (UTC, 2026-08-13T11:27)")
+    p_rep.add_argument("--until", default=None, help="この時刻まで再生 (UTC)")
     # A backtest wants the answer, not the wait: a one-hour recording replayed
     # at 1.0 takes an hour to say what it can say in seconds. Real time is the
     # exception here (watching the board move), so it is the flag, not the

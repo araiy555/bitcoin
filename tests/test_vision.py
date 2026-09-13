@@ -448,3 +448,71 @@ class TestThinBook:
         args = build_parser().parse_args(["replay", "us.jsonl"])
         inst = Instrument("USUSDT", Decimal("0.000001"), Decimal("1"))
         assert build_maker(inst, args).risk.limits.min_book_levels == 2
+
+
+class TestWindow:
+    """A day of archive and an hour recorded live compare only hour to hour."""
+
+    def written(self, tmp_path):
+        import json
+
+        from jsboard.feed.replay import RX_KEY, SOURCE_KEY, _encode
+
+        path = tmp_path / "w.jsonl"
+        with path.open("w") as fh:
+            for i in range(10):
+                ts = (MS + i * 1000) * 1_000_000
+                blob = archive([f"{i},0.0298,100,0.0299,200,{MS + i * 1000},{MS + i * 1000}"])
+                for stamped in book_events(book_rows(blob), INST):
+                    row = _encode(stamped.event)
+                    row[SOURCE_KEY] = "perp"
+                    row[RX_KEY] = ts
+                    fh.write(json.dumps(row) + "\n")
+        return path
+
+    def drain(self, path, **kw):
+        import asyncio
+
+        from jsboard.feed.replay import ReplayFeed
+
+        async def run():
+            return [
+                e
+                async for e in ReplayFeed(INST, path, speed=0, source="perp", **kw).stream()
+                if isinstance(e, DepthSnapshot)
+            ]
+
+        return asyncio.run(run())
+
+    def test_the_whole_file_replays_without_a_window(self, tmp_path):
+        assert len(self.drain(self.written(tmp_path))) == 10
+
+    def test_since_skips_the_earlier_events(self, tmp_path):
+        cut = (MS + 5000) * 1_000_000
+        assert len(self.drain(self.written(tmp_path), since_ns=cut)) == 5
+
+    def test_until_stops_at_the_boundary(self, tmp_path):
+        cut = (MS + 3000) * 1_000_000
+        assert len(self.drain(self.written(tmp_path), until_ns=cut)) == 4
+
+    def test_both_ends_together_take_the_middle(self, tmp_path):
+        events = self.drain(
+            self.written(tmp_path),
+            since_ns=(MS + 2000) * 1_000_000,
+            until_ns=(MS + 5000) * 1_000_000,
+        )
+        assert len(events) == 4
+
+    def test_the_cli_reads_a_bare_time_as_utc(self):
+        from jsboard.cli import _parse_when
+
+        # 2026-08-13 11:27:00 UTC
+        assert _parse_when("2026-08-13T11:27") == 1786620420_000_000_000
+
+    def test_a_malformed_time_is_refused(self):
+        import pytest
+
+        from jsboard.cli import ConfigError, _parse_when
+
+        with pytest.raises(ConfigError):
+            _parse_when("yesterday")
