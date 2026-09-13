@@ -39,7 +39,16 @@ from .feed.base import DepthDelta, DepthSnapshot, Feed, TradeTick
 from .feed.binance import BinanceFeed
 from .feed.binance_futures import FALLBACK_MODES, BinanceFuturesFeed
 from .feed.bybit import BybitFeed
-from .feed.replay import JsonlRecorder, ReplayFeed, SyntheticFeed, iter_tagged, iter_tagged_timed
+from .feed.replay import (
+    RX_KEY,
+    SOURCE_KEY,
+    JsonlRecorder,
+    ReplayFeed,
+    SyntheticFeed,
+    _encode,
+    iter_tagged,
+    iter_tagged_timed,
+)
 from .mm.fair_value import FairValueConfig, FairValueEstimator
 from .mm.inventory import FeeSchedule, Position
 from .mm.quoter import Quoter, QuoterConfig

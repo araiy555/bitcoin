@@ -237,3 +237,69 @@ class TestBookFromTape:
             ]
         )
         assert not any(isinstance(s.event, DepthSnapshot) for s in events)
+
+
+class TestCommandPath:
+    """The command's own body, which no unit test was touching.
+
+    Every helper here had tests and the command still died on its first run,
+    twice, on a missing import and a missing attribute. A test that never
+    executes the line cannot see either.
+    """
+
+    def run(self, tmp_path, monkeypatch, *, with_book):
+        import asyncio
+
+        from jsboard.cli import build_parser, cmd_vision
+        from jsboard.research import vision
+
+        book = archive([f"1,0.0298,100,0.0299,200,{MS},{MS}"])
+        tape = archive(
+            [
+                f"1,0.0298,10,1,1,{MS},true",
+                f"2,0.0299,10,2,2,{MS + 1},false",
+            ]
+        )
+
+        async def fake_fetch(url):
+            if "bookTicker" in url:
+                return book if with_book else None
+            return tape
+
+        monkeypatch.setattr(vision, "fetch", fake_fetch)
+        out = tmp_path / "hist.jsonl"
+        args = build_parser().parse_args(
+            [
+                "vision",
+                "--symbol", "USUSDT",
+                "--start", "2026-09-01",
+                "--out", str(out),
+                "--tick-size", "0.000001",
+                "--lot-size", "1",
+            ]
+        )
+        assert asyncio.run(cmd_vision(args)) == 0
+        return out
+
+    def test_a_day_with_quotes_is_written(self, tmp_path, monkeypatch):
+        out = self.run(tmp_path, monkeypatch, with_book=True)
+        assert out.stat().st_size > 0
+        assert out.with_suffix(".jsonl.meta.json").exists()
+
+    def test_a_day_without_quotes_falls_back_to_the_tape(self, tmp_path, monkeypatch):
+        out = self.run(tmp_path, monkeypatch, with_book=False)
+        assert out.stat().st_size > 0
+
+    def test_what_it_writes_can_be_replayed(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from jsboard.feed.replay import ReplayFeed
+
+        out = self.run(tmp_path, monkeypatch, with_book=False)
+
+        async def drain():
+            return [e async for e in ReplayFeed(INST, out, speed=0, source="perp").stream()]
+
+        events = asyncio.run(drain())
+        assert any(isinstance(e, DepthSnapshot) for e in events)
+        assert any(isinstance(e, TradeTick) for e in events)
