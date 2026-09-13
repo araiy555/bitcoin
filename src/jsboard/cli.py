@@ -2489,7 +2489,10 @@ async def cmd_vision(args: argparse.Namespace) -> int:
             book_blob = await fetch(book_url)
             tape_blob = await fetch(tape_url)
             if book_blob is None or tape_blob is None:
-                missing.append(f"{day}")
+                # Name the URL: a missing day and a wrong path look identical
+                # from the totals, and only one of them is worth retrying.
+                absent = book_url if book_blob is None else tape_url
+                missing.append(f"{day} ({absent})")
                 continue
             streams = [
                 book_events(read_zip_csv(book_blob, BOOK_TICKER_COLUMNS), instrument),
