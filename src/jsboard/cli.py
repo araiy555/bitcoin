@@ -294,6 +294,10 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             base_size_lots=instrument.to_lots(args.size),
             max_position_lots=instrument.to_lots(args.max_position),
             min_half_spread_ticks=args.min_half_spread,
+            # A constant floor does not travel between regimes: 48 ticks was
+            # struck 2,314 times in a busy hour and never once in a quiet one.
+            # The volatility term is what adapts, so it has to be reachable.
+            vol_multiplier=args.vol_multiplier,
             max_distance_ticks=getattr(args, "max_distance", None),
             # Quote at least wide enough to cover what the venue charges us.
             min_edge_bps=args.min_edge_bps if args.min_edge_bps is not None else args.maker_bps,
@@ -3676,6 +3680,12 @@ def add_common(p: argparse.ArgumentParser) -> None:
     mm.add_argument("--size", default=None, help=f"base quote size per level (既定 {DEFAULT_SIZE}、最小単位に満たなければ自動調整)")
     mm.add_argument("--max-position", default=None, help=f"inventory limit (既定 {DEFAULT_MAX_POSITION}、同上)")
     mm.add_argument("--min-half-spread", type=int, default=1, help="ticks")
+    mm.add_argument(
+        "--vol-multiplier",
+        type=float,
+        default=0.05,
+        help="ハーフスプレッドを直近ボラの何倍にするか。固定幅と違い相場つきに追随する",
+    )
     mm.add_argument(
         "--max-distance",
         type=int,

@@ -172,3 +172,26 @@ def test_a_backtest_runs_at_full_speed_unless_asked_otherwise() -> None:
     """
     assert build_parser().parse_args(["replay", "us.jsonl"]).speed == 0.0
     assert build_parser().parse_args(["replay", "us.jsonl", "--speed", "1"]).speed == 1.0
+
+
+def test_the_volatility_multiplier_reaches_the_quoter() -> None:
+    """A fixed tick floor does not survive a change of regime.
+
+    48 ticks was hit 2,314 times in one hour and zero times in the next; the
+    width has to come from the market's own movement for the same setting to
+    mean anything twice.
+    """
+    from decimal import Decimal
+
+    from jsboard.cli import build_maker
+    from jsboard.core.types import Instrument
+
+    args = build_parser().parse_args(
+        ["replay", "us.jsonl", "--vol-multiplier", "3.5"]
+    )
+    inst = Instrument("USUSDT", Decimal("0.000001"), Decimal("1"))
+    assert build_maker(inst, args).quoter.config.vol_multiplier == 3.5
+
+
+def test_the_multiplier_keeps_its_historical_default() -> None:
+    assert build_parser().parse_args(["replay", "x.jsonl"]).vol_multiplier == 0.05
