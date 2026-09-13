@@ -195,3 +195,45 @@ class TestEndToEnd:
         events = [e for e in asyncio.run(drain()) if isinstance(e, DepthSnapshot)]
         assert len(events) == 3
         assert events[0].bids[0][0] == INST.to_ticks("0.0298")
+
+
+class TestBookFromTape:
+    """The days with no published quote stream still have every print."""
+
+    def rows(self, lines):
+        return list(read_zip_csv(archive(lines), AGG_TRADE_COLUMNS))
+
+    def stream(self, lines):
+        from jsboard.research.vision import book_from_tape
+
+        return list(book_from_tape(iter(self.rows(lines)), INST))
+
+    def test_a_sell_aggressor_sets_the_bid_and_a_buy_sets_the_ask(self):
+        events = self.stream(
+            [
+                f"1,0.0298,10,1,1,{MS},true",  # seller crossed: that was the bid
+                f"2,0.0299,10,2,2,{MS + 1},false",  # buyer crossed: that was the ask
+            ]
+        )
+        snaps = [s.event for s in events if isinstance(s.event, DepthSnapshot)]
+        assert snaps[-1].bids[0][0] == INST.to_ticks("0.0298")
+        assert snaps[-1].asks[0][0] == INST.to_ticks("0.0299")
+
+    def test_no_book_before_both_sides_have_printed(self):
+        events = self.stream([f"1,0.0298,10,1,1,{MS},true"])
+        assert not any(isinstance(s.event, DepthSnapshot) for s in events)
+
+    def test_the_prints_themselves_are_still_emitted(self):
+        events = self.stream([f"1,0.0298,10,1,1,{MS},true"])
+        assert [type(s.event) for s in events] == [TradeTick]
+
+    def test_a_crossed_reconstruction_is_suppressed(self):
+        """Prints arrive out of order relative to the quote; a bid above the
+        ask is not a book anyone can quote against."""
+        events = self.stream(
+            [
+                f"1,0.0299,10,1,1,{MS},true",  # bid at 0.0299
+                f"2,0.0298,10,2,2,{MS + 1},false",  # ask below it
+            ]
+        )
+        assert not any(isinstance(s.event, DepthSnapshot) for s in events)

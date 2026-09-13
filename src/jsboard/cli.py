@@ -2454,6 +2454,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
         AGG_TRADE_COLUMNS,
         BOOK_TICKER_COLUMNS,
         book_events,
+        book_from_tape,
         daily_url,
         days_between,
         fetch,
@@ -2479,6 +2480,7 @@ async def cmd_vision(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    inferred = 0
     missing: list[str] = []
 
     with out.open("w", encoding="utf-8") as fh:
@@ -2488,16 +2490,26 @@ async def cmd_vision(args: argparse.Namespace) -> int:
             console.print(f"[dim]{day}[/dim] 取得中…")
             book_blob = await fetch(book_url)
             tape_blob = await fetch(tape_url)
-            if book_blob is None or tape_blob is None:
+            if tape_blob is None:
                 # Name the URL: a missing day and a wrong path look identical
                 # from the totals, and only one of them is worth retrying.
-                absent = book_url if book_blob is None else tape_url
-                missing.append(f"{day} ({absent})")
+                missing.append(f"{day} ({tape_url})")
                 continue
-            streams = [
-                book_events(read_zip_csv(book_blob, BOOK_TICKER_COLUMNS), instrument),
-                trade_events(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), instrument),
-            ]
+            if book_blob is None:
+                # Binance publishes the prints for every day and the quote
+                # stream only for some. Rather than skip the day, infer the
+                # touch from the side that crossed on each print — coarser,
+                # but it carries the one thing being measured here, which is
+                # whether the tape reached a price.
+                inferred += 1
+                streams = [
+                    book_from_tape(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), instrument)
+                ]
+            else:
+                streams = [
+                    book_events(read_zip_csv(book_blob, BOOK_TICKER_COLUMNS), instrument),
+                    trade_events(read_zip_csv(tape_blob, AGG_TRADE_COLUMNS), instrument),
+                ]
             day_count = 0
             for stamped in merge(*streams):
                 row = _encode(stamped.event)
@@ -2516,6 +2528,11 @@ async def cmd_vision(args: argparse.Namespace) -> int:
         f"  出力   : {out}  ({out.stat().st_size / 1e6:,.1f} MB)\n"
         f"  イベント: {written:,} 件"
     )
+    if inferred:
+        console.print(
+            f"  [yellow]気配を約定から推定した日: {inferred}/{len(days)}"
+            f"（bookTickerが未公開のため。板の厚みは入りません）[/yellow]"
+        )
     if missing:
         # A listing that starts mid-range, or today's file before it is
         # published. Saying which days are absent beats a total that silently

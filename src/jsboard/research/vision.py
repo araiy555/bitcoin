@@ -197,6 +197,52 @@ def trade_events(rows: Iterator[dict[str, str]], instrument: Instrument) -> Iter
         )
 
 
+def book_from_tape(
+    rows: Iterator[dict[str, str]], instrument: Instrument
+) -> Iterator[Stamped]:
+    """A touch inferred from the prints, for the days with no bookTicker.
+
+    Binance publishes aggTrades daily but not the quote stream, and bookDepth
+    is aggregated into percentage bands with no touch in it at all. The prints
+    still carry the side that crossed: a trade with the buyer as maker took the
+    bid, so that price *was* the bid, and one with the buyer as taker lifted the
+    ask. Tracking the last of each reconstructs a two-sided touch.
+
+    What this gives up, and in which direction:
+
+      **It only moves when something trades.** A quote that widens or narrows
+      without a print is invisible, so the reconstructed book is stale between
+      trades and lags the real one during a sweep.
+
+      **There is no size.** Both sides are emitted with a nominal one lot, so
+      queue position at the touch is meaningless here and any strategy that
+      depends on it cannot be judged from this stream.
+
+    What survives is the question this was built for: whether the tape reached
+    a price, and at what cost. That is carried entirely by the prints.
+    """
+    bid: int | None = None
+    ask: int | None = None
+    one = max(1, instrument.to_lots("1") or 1)
+    for stamped in trade_events(rows, instrument):
+        tick = stamped.event
+        if tick.aggressor is Side.SELL:
+            bid = tick.price
+        else:
+            ask = tick.price
+        if bid is not None and ask is not None and ask > bid:
+            yield Stamped(
+                stamped.ts_ns,
+                DepthSnapshot(
+                    bids=((bid, one),),
+                    asks=((ask, one),),
+                    last_update_id=tick.trade_id,
+                    ts_ns=stamped.ts_ns,
+                ),
+            )
+        yield stamped
+
+
 def merge(*streams: Iterator[Stamped]) -> Iterator[Stamped]:
     """Interleave by timestamp.
 
