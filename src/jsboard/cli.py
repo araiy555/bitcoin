@@ -297,7 +297,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             # A constant floor does not travel between regimes: 48 ticks was
             # struck 2,314 times in a busy hour and never once in a quiet one.
             # The volatility term is what adapts, so it has to be reachable.
-            vol_multiplier=args.vol_multiplier,
+            vol_multiplier=getattr(args, "vol_multiplier", 0.05),
             max_distance_ticks=getattr(args, "max_distance", None),
             # Quote at least wide enough to cover what the venue charges us.
             min_edge_bps=args.min_edge_bps if args.min_edge_bps is not None else args.maker_bps,
