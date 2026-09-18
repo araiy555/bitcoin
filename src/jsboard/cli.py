@@ -1550,6 +1550,12 @@ async def cmd_hedge(args: argparse.Namespace) -> int:
     for maker_bps in _grid(args.maker_fees, float):
         run_args = argparse.Namespace(**vars(args))
         run_args.maker_bps = maker_bps
+        # `--size` and `--max-position` default to None so an explicitly typed
+        # value is still refused on its own merits. Every other command fills
+        # them from the instrument's lot before checking; these two did not, so
+        # a plain run died inside Decimal on the string "None" — after the
+        # download it depends on had already finished.
+        _adapt_generic_defaults(maker_inst, run_args)
         _check_sizes(maker_inst, run_args)
         row = await _run_hedged(path, maker_inst, hedge_inst, run_args)
         row["maker_bps"] = maker_bps
@@ -1721,6 +1727,12 @@ async def cmd_pair(args: argparse.Namespace) -> int:
     for maker_bps in _grid(args.maker_fees, float):
         run_args = argparse.Namespace(**vars(args))
         run_args.maker_bps = maker_bps
+        # `--size` and `--max-position` default to None so an explicitly typed
+        # value is still refused on its own merits. Every other command fills
+        # them from the instrument's lot before checking; these two did not, so
+        # a plain run died inside Decimal on the string "None" — after the
+        # download it depends on had already finished.
+        _adapt_generic_defaults(maker_inst, run_args)
         _check_sizes(maker_inst, run_args)
         row = await _run_pair(path, maker_inst, hedge_inst, run_args)
         row["maker_bps"] = maker_bps
