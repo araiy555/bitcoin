@@ -730,6 +730,113 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_edge(args: argparse.Namespace) -> int:
+    """Mark-out per toxicity band, to see whether any band is worth quoting in.
+
+    Every mark-out this project has reported is an average over all fills.
+    That cannot distinguish "every fill is adverse" from "a minority of fills
+    is catastrophic and the rest are fine", and those call for opposite
+    decisions. This splits the same fills by the score that was showing when
+    they landed.
+
+    The gate is forced off: with it on, fills only occur in the band it
+    allows, so the bands the study exists to examine would come back empty.
+    """
+    from .research.edge import DEFAULT_EDGES, DEFAULT_HORIZONS, EdgeStudy
+    from .sim.s3 import is_s3_uri
+
+    path = args.path if is_s3_uri(args.path) else Path(args.path)
+    instrument = _instrument_for_recording(path, args)
+    _adapt_generic_defaults(instrument, args)
+    _check_sizes(instrument, args)
+
+    run_args = argparse.Namespace(**vars(args))
+    run_args.toxicity_threshold = 0.0  # measure the whole range, not the allowed band
+    mm = build_maker(instrument, run_args)
+    clock = attach_virtual_clock(mm)
+    study = EdgeStudy(edges=DEFAULT_EDGES, horizons_s=DEFAULT_HORIZONS)
+
+    console.print(
+        f"{Path(str(path)).name}: {instrument.symbol}  "
+        f"tick={instrument.tick_size} lot={instrument.lot_size}\n"
+        "[dim]毒性ゲートは無効にして走らせます（全スコア帯の約定を観測するため）[/dim]"
+    )
+
+    seen = 0
+    for src, event in iter_tagged(path):
+        if args.source and src != args.source:
+            continue
+        seen += 1
+        # The score the gate would have read at this instant, taken before the
+        # event lands: that is the state a live quoter decides on.
+        score = mm.toxicity.score(mm.market)
+        mid_before = mm.market.mid
+        for fill in mm.on_event(event):
+            if fill.maker_owner != PAPER_OWNER:
+                continue
+            study.on_fill(
+                clock(),
+                score,
+                fill.aggressor.opposite.sign,
+                float(fill.price),
+                instrument.qty_f(fill.qty),
+                mid_ticks=mid_before,
+            )
+        study.poll(clock(), mm.market.mid)
+        mm.requote()
+        if seen % 100_000 == 0:
+            console.print(f"[dim]  {seen:,} 件[/dim]", end="\r")
+
+    rows = study.rows()
+    if not rows:
+        console.print("[red]約定がありません。設定を確認してください。[/red]")
+        return 1
+
+    horizons = [f"mo_{h:g}s" for h in DEFAULT_HORIZONS]
+    header = ["スコア帯", "売買", "約定", *horizons]
+    if args.plain:
+        console.print("\t".join(header), highlight=False, soft_wrap=True)
+        for r in rows:
+            cells = [
+                f"{r['low']:+.1f}〜{r['high']:+.1f}",
+                r["side"],
+                f"{r['n']:,.0f}",
+                *(f"{r.get(h, math.nan):+.2f}" for h in horizons),
+            ]
+            console.print("\t".join(cells), highlight=False, soft_wrap=True)
+    else:
+        table = Table(title=f"{instrument.symbol} — スコア帯ごとの逆選択", header_style="bold cyan")
+        for label in header:
+            table.add_column(label, justify="right")
+        for r in rows:
+            table.add_row(
+                f"{r['low']:+.1f}〜{r['high']:+.1f}",
+                r["side"],
+                f"{r['n']:,.0f}",
+                *(f"{r.get(h, math.nan):+.2f}" for h in horizons),
+            )
+        console.print(table)
+
+    console.print(
+        "\n[dim]符号は自分に有利ならプラス（買った後に上がれば+、売った後に下がれば+）。"
+        "midからの変化なので、稼いだスプレッドは含みません。[/dim]"
+    )
+    best = max(
+        (r.get("mo_0.1s", -math.inf) for r in rows if r["n"] > 0), default=-math.inf
+    )
+    if best >= 0:
+        console.print(
+            f"[green]+100ms が0以上の帯があります（最良 {best:+.2f}bps）。"
+            "その帯でだけ出す設定を検討できます。[/green]"
+        )
+    else:
+        console.print(
+            f"[yellow]全帯で +100ms がマイナスです（最良 {best:+.2f}bps）。"
+            "このスコアでは、出して有利になる状態が見つかりません。[/yellow]"
+        )
+    return 0
+
+
 def _instrument_from_spec(spec: dict) -> Instrument:
     return Instrument(
         symbol=spec["symbol"],
@@ -5023,6 +5130,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_vision.add_argument("--s3-bucket", default=None, help="保存先バケット")
     p_vision.add_argument("--s3-prefix", default="history", help="バケット内の接頭辞")
     p_vision.set_defaults(func=cmd_vision)
+
+    p_edge = sub.add_parser(
+        "edge", help="毒性スコアの帯ごとに逆選択を出す（出して有利な状態があるか）"
+    )
+    add_common(p_edge)
+    p_edge.add_argument("path", help="capture / xcapture / vision の録画")
+    p_edge.add_argument(
+        "--source", default=None, help="録画のどちらを使うか (binance / bybit / spot / perp)"
+    )
+    p_edge.add_argument("--plain", action="store_true", help="タブ区切りで出す")
+    p_edge.set_defaults(func=cmd_edge, headless=True)
 
     p_xvision = sub.add_parser(
         "xvision",
