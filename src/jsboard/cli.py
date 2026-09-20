@@ -3379,6 +3379,98 @@ def _has_axes(args: argparse.Namespace) -> bool:
     )
 
 
+async def cmd_xcarry(args: argparse.Namespace) -> int:
+    """Whether venues disagree about funding by more than it costs to trade.
+
+    Holding spot against a short perpetual on one venue earns whatever that
+    venue publishes, and everyone collects the same number. A position that is
+    short where funding is high and long where it is low collects the
+    difference instead, and the difference is nobody's published rate.
+    """
+    from .research.xcarry import FETCHERS, SpreadStudy, pair_spreads
+
+    names = [v.strip().lower() for v in args.venues.split(",") if v.strip()]
+    unknown = [v for v in names if v not in FETCHERS]
+    if unknown:
+        raise ConfigError(
+            f"知らない取引所です: {', '.join(unknown)}。"
+            f"使えるのは {', '.join(sorted(FETCHERS))}"
+        )
+    if len(names) < 2:
+        raise ConfigError("--venues には2つ以上を指定してください（差を測るので）。")
+
+    venues = []
+    for name in names:
+        console.print(f"[dim]{name} の funding を取得中…[/dim]")
+        try:
+            got = await FETCHERS[name](args.symbol, days=args.days)
+        except Exception as exc:  # noqa: BLE001 - one venue must not stop the rest
+            console.print(f"  [yellow]{name}: 取得できません（{type(exc).__name__}: {exc}）[/yellow]")
+            continue
+        console.print(f"  {name}: {len(got.points):,} 回  （{got.interval_hours:g}時間ごと）")
+        if got.points:
+            venues.append(got)
+
+    if len(venues) < 2:
+        raise ConfigError("2取引所ぶんの履歴が揃いませんでした。")
+
+    spreads = pair_spreads(venues, tolerance_ms=int(args.tolerance_min * 60_000))
+    study = SpreadStudy(spreads, entry_cost_bps=args.entry_cost_bps)
+
+    console.rule(f"[bold cyan]{args.symbol.upper()} — 取引所間の Funding 差")
+    if study.n == 0:
+        console.print(
+            "[yellow]決済時刻が噛み合う組がありませんでした。"
+            "--tolerance-min を広げるか、期間を延ばしてください。[/yellow]"
+        )
+        return 1
+
+    console.print(
+        f"  対象     : {', '.join(v.venue for v in venues)}\n"
+        f"  期間     : {args.days:g}日\n"
+        f"  組の数   : {study.n:,}\n"
+        f"  建て費用 : {args.entry_cost_bps:g}bps（両取引所4脚、初回のみ）"
+    )
+    console.print(
+        f"\n  1時間あたり : 平均 {study.mean_hourly_bps:+.4f}bps / "
+        f"中央値 {study.median_hourly_bps:+.4f}bps\n"
+        f"  年率換算    : [bold]{study.annual_pct:+.2f}%[/bold]\n"
+        f"  費用の回収  : {study.payback_hours:,.1f}時間"
+        f"（{study.payback_hours / 24:,.1f}日）"
+    )
+
+    counts = study.pair_counts()
+    table = Table(title="どの組が何回", header_style="bold cyan")
+    for label in ("ショート側", "ロング側", "回数", "割合"):
+        table.add_column(label, justify="right")
+    for (short, long_), n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        table.add_row(short, long_, f"{n:,}", f"{n / study.n * 100:.1f}%")
+    console.print(table)
+
+    # The number this has to beat: holding the same trade on one venue.
+    baseline = args.baseline_annual_pct
+    console.print(
+        f"\n  単独保有（実測）: {baseline:+.2f}%/年"
+    )
+    if study.annual_pct > baseline:
+        console.print(
+            f"[green][bold]判定: 差のほうが大きい"
+            f"（{study.annual_pct:+.2f}% > {baseline:+.2f}%）。"
+            "費用と証拠金を入れて詰める価値があります。[/bold][/green]"
+        )
+    else:
+        console.print(
+            f"[yellow][bold]判定: 単独保有に届きません"
+            f"（{study.annual_pct:+.2f}% ≤ {baseline:+.2f}%）。"
+            "取引所をまたぐ意味がありません。[/bold][/yellow]"
+        )
+    console.print(
+        "\n[dim]  ロスカットと取引所リスクは入っていません。"
+        "両脚ぶんの証拠金が2箇所に要る点も、この年率には含まれていません。[/dim]"
+    )
+    return 0
+
+
 async def cmd_carry(args: argparse.Namespace) -> int:
     """Funding history turned into the worst case of holding the carry."""
     from .research.carry import CarryStudy, fetch_funding, parse_funding
@@ -5211,6 +5303,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--source", default="perp", help="再生する記録の系統（アーカイブは perp）"
     )
     p_walk.set_defaults(func=cmd_walk, headless=True)
+
+    p_xcarry = sub.add_parser(
+        "xcarry", help="取引所間の Funding 差を測る（高い方でショート・低い方でロング）"
+    )
+    p_xcarry.add_argument("--symbol", default="BTCUSDT")
+    p_xcarry.add_argument("--days", type=float, default=365.0, help="遡る日数")
+    p_xcarry.add_argument(
+        "--venues",
+        default="binance,bybit,hyperliquid",
+        help="比べる取引所をカンマ区切りで",
+    )
+    p_xcarry.add_argument(
+        "--tolerance-min",
+        type=float,
+        default=30.0,
+        help="決済時刻がこの分数以内なら同じ瞬間とみなす",
+    )
+    p_xcarry.add_argument(
+        "--entry-cost-bps", type=float, default=28.0, help="両取引所4脚ぶんの建て費用"
+    )
+    p_xcarry.add_argument(
+        "--baseline-annual-pct",
+        type=float,
+        default=5.21,
+        help="単独保有の実測値。これを超えなければ意味がない",
+    )
+    p_xcarry.set_defaults(func=cmd_xcarry)
 
     p_carry = sub.add_parser(
         "carry", help="現物買い・無期限先物売りを持ち続けたときのFunding収支を調べる"
