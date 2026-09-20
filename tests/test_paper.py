@@ -346,3 +346,109 @@ class TestGapThrough:
         fills = venue.on_book(best_bid=98, best_ask=99, ts_ns=777)
 
         assert fills[0].ts_ns == 777
+
+
+class TestCancelLatency:
+    """Getting out of the way is not instant, and that gap is the whole loss.
+
+    A maker loses to adverse selection in the window between seeing danger
+    and being off the book. Modelling cancellation as instantaneous hands the
+    strategy a perfect escape from every quote it regrets — the escape real
+    makers buy colocation for — and makes order-entry latency look irrelevant,
+    because an order rests a long time and pays its placement delay once.
+    """
+
+    def slow(self, clock, ms=20.0):
+        return PaperVenue(
+            instrument=INST,
+            config=PaperConfig(latency_ms=0.0, cancel_latency_ms=ms),
+            clock=clock,
+        )
+
+    def test_a_cancelled_order_still_fills_until_the_request_lands(self, clock):
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+
+        clock.advance_ms(10)  # request still in flight
+        fills = venue.on_trade(sell_into(100, 5))
+
+        assert [(f.price, f.qty) for f in fills] == [(100, 5)]
+        assert venue.doomed_fills == 1
+        assert venue.doomed_lots == 5
+
+    def test_once_the_request_lands_the_order_is_gone(self, clock):
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+
+        clock.advance_ms(30)
+        assert venue.on_trade(sell_into(100, 5)) == []
+        assert venue.doomed_fills == 0
+
+    def test_zero_latency_keeps_the_old_instant_behaviour(self, clock):
+        venue = PaperVenue(
+            instrument=INST, config=PaperConfig(latency_ms=0.0), clock=clock
+        )
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+
+        assert venue.on_trade(sell_into(100, 5)) == []
+        assert venue.open_orders() == []
+
+    def test_the_strategy_stops_seeing_an_order_it_asked_to_cancel(self, clock):
+        """It has decided the level is gone; it must not re-quote against it.
+
+        The venue still holds the order — and still fills it — which is the
+        point. What must not happen is the strategy treating it as live.
+        """
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+
+        assert venue.open_orders() == []
+        assert 1 in venue.orders  # the venue has not let go yet
+
+    def test_asking_twice_does_not_make_the_venue_faster(self, clock):
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+        clock.advance_ms(10)
+        venue.cancel(1)  # a second request must not restart or shorten the wait
+
+        clock.advance_ms(11)  # 21ms since the first request
+        assert venue.on_trade(sell_into(100, 5)) == []
+        assert venue.cancels_requested == 1
+
+    def test_cancel_all_is_also_delayed(self, clock):
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.place(bid(99, 5), visible_depth=0, best_opposite=101)
+
+        assert venue.cancel_all() == 2
+        clock.advance_ms(10)
+        assert venue.on_trade(sell_into(99, 10)) != []
+
+    def test_a_gap_through_also_catches_an_order_still_leaving(self, clock):
+        """The book jumping past us does not wait for our cancel either."""
+        venue = self.slow(clock)
+        venue.place(bid(100, 5), visible_depth=0, best_opposite=101)
+        venue.cancel(1)
+        clock.advance_ms(10)
+
+        assert venue.on_book(best_bid=98, best_ask=99) != []
+        assert venue.doomed_fills == 1
+
+    def test_slower_cancels_cost_more_fills(self, clock):
+        """The direction that makes colocation worth buying."""
+        caught = {}
+        for ms in (1.0, 50.0):
+            c = FakeClock()
+            venue = self.slow(c, ms)
+            for i in range(5):
+                venue.place(bid(100 - i, 5), visible_depth=0, best_opposite=101)
+            venue.cancel_all()
+            c.advance_ms(10)
+            venue.on_trade(sell_into(96, 100))
+            caught[ms] = venue.doomed_lots
+        assert caught[50.0] > caught[1.0]

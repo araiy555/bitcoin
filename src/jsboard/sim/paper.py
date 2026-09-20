@@ -11,6 +11,8 @@ What is modelled:
   * price improvement — quoting inside the touch puts us at the front
   * partial fills, and level depletion carrying through to better prices
   * order-entry latency, so quotes are not live the instant we decide them
+  * cancellation latency, so a quote we regret is still fillable until the
+    cancel reaches the venue
 
 Gap-throughs are handled in `on_book`. A resting bid that the public *ask*
 has dropped to or below is not a resting bid any more — that is a crossed
@@ -58,6 +60,14 @@ class PaperOrder:
     active_ns: int
     level_depth: int
     filled: int = 0
+    cancel_at_ns: int | None = None
+    """When a requested cancellation actually reaches the venue.
+
+    None means no cancellation has been asked for. Until this passes, the
+    order is still on the book and can still be filled — which is the whole
+    point: a maker loses to adverse selection precisely in the window between
+    seeing danger and being out of the way.
+    """
 
     @property
     def is_live(self) -> bool:
@@ -65,6 +75,9 @@ class PaperOrder:
 
     def is_active(self, now_ns: int) -> bool:
         return self.is_live and now_ns >= self.active_ns
+
+    def is_gone(self, now_ns: int) -> bool:
+        return self.cancel_at_ns is not None and now_ns >= self.cancel_at_ns
 
 
 @dataclass(slots=True)
@@ -77,6 +90,19 @@ class PaperConfig:
 
     allow_price_improvement: bool = True
     """Quoting inside the touch starts us at the front of a fresh level."""
+
+    cancel_latency_ms: float = 0.0
+    """Delay between asking to cancel and the order leaving the book.
+
+    Zero reproduces the old behaviour, in which a cancellation took effect
+    the instant it was decided. That is the single most generous assumption
+    in the model: it hands the strategy an infinitely fast escape from every
+    quote it regrets, which is exactly the escape a real maker is paying
+    colocation for. With it at zero, order-entry latency looks irrelevant —
+    an order rests for a long time and pays its placement delay once — and
+    the run-to-run differences vanish, which is not a finding about speed but
+    an artefact of never charging for being slow to leave.
+    """
 
     gap_through_fills: bool = True
     """Fill a resting order the public touch has crossed, print or no print.
@@ -114,6 +140,13 @@ class PaperVenue:
     gap_fills: int = 0
     gap_filled_lots: int = 0
 
+    # Fills that landed on an order we had already asked to cancel. This is
+    # the cost of not being fast enough to get out of the way, and it is the
+    # number colocation is bought to reduce.
+    cancels_requested: int = 0
+    doomed_fills: int = 0
+    doomed_lots: int = 0
+
     def _now(self) -> int:
         return self.clock()
 
@@ -149,16 +182,44 @@ class PaperVenue:
         return order
 
     def cancel(self, order_id: int) -> bool:
-        order = self.orders.pop(order_id, None)
-        return order is not None
+        """Ask for a cancellation; it lands `cancel_latency_ms` later."""
+        order = self.orders.get(order_id)
+        if order is None:
+            return False
+        if self.config.cancel_latency_ms <= 0:
+            del self.orders[order_id]
+            return True
+        if order.cancel_at_ns is None:
+            # A second request does not overtake the first: the venue is not
+            # made faster by asking twice.
+            order.cancel_at_ns = self._now() + int(self.config.cancel_latency_ms * 1e6)
+            self.cancels_requested += 1
+        return True
 
     def cancel_all(self) -> int:
-        n = len(self.orders)
-        self.orders.clear()
+        n = 0
+        for order in list(self.orders.values()):
+            if self.cancel(order.order_id):
+                n += 1
         return n
 
+    def _reap(self, now_ns: int) -> None:
+        """Remove orders whose cancellation has now reached the venue."""
+        for order_id, order in list(self.orders.items()):
+            if order.is_gone(now_ns):
+                del self.orders[order_id]
+
     def open_orders(self) -> list[PaperOrder]:
-        return [o for o in self.orders.values() if o.is_live]
+        """What the strategy may still act on.
+
+        An order with a cancellation in flight is deliberately excluded: the
+        strategy has decided it is gone and will not re-quote that level. The
+        venue still holds it — and still fills it — until the request lands.
+        """
+        self._reap(self._now())
+        return [
+            o for o in self.orders.values() if o.is_live and o.cancel_at_ns is None
+        ]
 
     # -------------------------------------------------------------- updates
 
@@ -184,6 +245,7 @@ class PaperVenue:
     def on_trade(self, trade: TradeTick) -> list[Fill]:
         """Apply a public print; returns the fills it generated for us."""
         now = self._now()
+        self._reap(now)
         # An aggressive buy consumes resting *sell* orders, and vice versa.
         our_side = trade.aggressor.opposite
         remaining = trade.qty
@@ -222,6 +284,10 @@ class PaperVenue:
             order.filled += fill_qty
             remaining -= fill_qty
             self.filled_lots += fill_qty
+            if order.cancel_at_ns is not None:
+                # We had already asked to be out of the way and were not.
+                self.doomed_fills += 1
+                self.doomed_lots += fill_qty
 
             produced.append(
                 Fill(
@@ -261,6 +327,7 @@ class PaperVenue:
         if not self.config.gap_through_fills:
             return []
         now = self._now()
+        self._reap(now)
         produced: list[Fill] = []
         for order in list(self.orders.values()):
             if not order.is_active(now):
@@ -281,6 +348,9 @@ class PaperVenue:
             self.filled_lots += fill_qty
             self.gap_fills += 1
             self.gap_filled_lots += fill_qty
+            if order.cancel_at_ns is not None:
+                self.doomed_fills += 1
+                self.doomed_lots += fill_qty
             produced.append(
                 Fill(
                     price=order.price,

@@ -328,6 +328,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
         config=PaperConfig(
             latency_ms=args.latency_ms,
             cancel_ahead_ratio=args.cancel_ahead,
+            cancel_latency_ms=getattr(args, "cancel_latency_ms", 0.0),
             gap_through_fills=not getattr(args, "no_gap_fills", False),
         ),
     )
@@ -511,6 +512,13 @@ def _reach_lines(mm: MarketMaker, s: dict) -> list[str]:
     # How much of the result rests on fills no print explains. These are the
     # adverse ones, so a high share is not a warning about the model — it is
     # the shape of the market the recording caught.
+    doomed = s.get("doomed_fills", 0)
+    if doomed:
+        lines.append(
+            f"  逃げ遅れ       : {doomed:,} 件 / {s.get('doomed_lots', 0.0):,.4f} "
+            f"{mm.instrument.base} — 取消を出した後に約定した分"
+            f"（取消遅延 {s.get('cancel_latency_ms', 0.0):g}ms）"
+        )
     gap = s.get("gap_fills", 0)
     filled = s.get("filled", 0.0)
     gap_qty = s.get("gap_filled", 0.0)
@@ -4656,6 +4664,15 @@ def add_common(p: argparse.ArgumentParser) -> None:
     sim = p.add_argument_group("simulation")
     sim.add_argument("--latency-ms", type=float, default=5.0)
     sim.add_argument("--cancel-ahead", type=float, default=0.5)
+    sim.add_argument(
+        "--cancel-latency-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "取消を出してから板から消えるまでのms。0は「即座に消える」で、"
+            "モデル最大の楽観。危ないと気づいてから逃げ切るまでの時間がここ。"
+        ),
+    )
     sim.add_argument(
         "--no-gap-fills",
         action="store_true",
