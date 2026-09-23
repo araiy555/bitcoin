@@ -86,6 +86,7 @@ from .sim.pair import CrossMarketFairValue, PairQuoteGate
 from .sim.paper import PAPER_OWNER, PaperConfig, PaperVenue
 from .sim.runner import attach_virtual_clock, run
 from .sim.s3 import RotatingJsonlSink, S3Target
+from .sim.s3 import check_access as check_s3_access
 from .ui.board import Board
 
 console = Console()
@@ -5499,6 +5500,16 @@ def main(argv: list[str] | None = None) -> int:
     ):
         args.max_events = 5_000
 
+    # Checked before any work: every command that takes a bucket otherwise
+    # finds out at its first upload — after a download, or two hours into a
+    # recording whose parts have been piling up on the local disk.
+    if getattr(args, "s3_bucket", None):
+        try:
+            check_s3_access(args.s3_bucket)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
+
     try:
         return asyncio.run(args.func(args))
     except ConfigError as exc:
@@ -5509,6 +5520,15 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         console.print("\n[dim]interrupted[/dim]")
         return 130
+    except Exception as exc:
+        # boto3 checks credentials only on the first request, so an expired
+        # login arrives mid-run as sixty lines of botocore. The remedy is one.
+        if not type(exc).__module__.startswith("botocore"):
+            raise
+        from .sim.s3 import describe_error
+
+        console.print(f"[red]{describe_error(exc)}[/red]")
+        return 1
 
 
 if __name__ == "__main__":

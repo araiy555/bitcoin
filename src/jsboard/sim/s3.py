@@ -100,6 +100,34 @@ def default_client():
         ) from exc
 
 
+def check_access(bucket: str, client=None) -> None:
+    """Fail now, in one line, if the bucket cannot be reached.
+
+    boto3 resolves credentials lazily, so an expired login surfaces only at
+    the first upload. For a capture that is the worst moment: the recording
+    carries on, every part fails, and each one stays on a disk that the
+    bucket was there to spare.
+    """
+    client = client or default_client()
+    try:
+        client.head_bucket(Bucket=bucket)
+    except Exception as exc:  # noqa: BLE001 - botocore has many types for this
+        raise RuntimeError(describe_error(exc, bucket)) from exc
+
+
+def describe_error(exc: BaseException, bucket: str | None = None) -> str:
+    """The remedy for an S3 failure, without the traceback around it."""
+    name = type(exc).__name__
+    where = f" s3://{bucket}" if bucket else ""
+    if name in {"LoginRefreshRequired", "TokenRetrievalError", "SSOTokenLoadError"} or (
+        "expired" in str(exc).lower()
+    ):
+        return f"AWSのログインが切れています{where}。ターミナルで aws login を実行してから再実行してください。"
+    if name in {"NoCredentialsError", "PartialCredentialsError"}:
+        return f"AWSの認証がありません{where}。aws login か aws configure を実行してください。"
+    return f"S3に接続できません{where}: {name}: {exc}"
+
+
 S3_SCHEME = "s3://"
 
 

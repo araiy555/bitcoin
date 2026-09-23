@@ -462,3 +462,61 @@ class TestAFolderOfParts:
         out = capsys.readouterr().out
         assert "tick=0.0001" in out  # the spec came from the bucket, not a guess
         assert "2 通り" in out
+
+
+class TestAnExpiredLogin:
+    """boto3 finds out on the first request; the user should find out at once."""
+
+    class LoginRefreshRequired(Exception):
+        pass
+
+    def test_a_capture_does_not_start_without_the_bucket(self, monkeypatch, capsys):
+        import jsboard.cli as cli
+
+        started = []
+
+        def refuse(bucket, client=None):
+            raise RuntimeError("AWSのログインが切れています。aws login")
+
+        monkeypatch.setattr(cli, "check_s3_access", refuse)
+        monkeypatch.setattr(cli, "cmd_capture", lambda args: started.append(1))
+        code = cli.main(["capture", "--symbol", "ADAUSDT", "--s3-bucket", "b"])
+        assert code == 1
+        assert not started
+        assert "aws login" in capsys.readouterr().out
+
+    def test_the_check_names_the_remedy(self):
+        from jsboard.sim.s3 import check_access
+
+        exc_type = self.LoginRefreshRequired
+
+        class Expired:
+            def head_bucket(self, Bucket):  # noqa: N803
+                raise exc_type("Your session has expired")
+
+        with pytest.raises(RuntimeError, match="aws login"):
+            check_access("b", client=Expired())
+
+    def test_a_botocore_error_mid_run_is_one_line(self, monkeypatch, capsys):
+        import jsboard.cli as cli
+
+        Boto = type("LoginRefreshRequired", (Exception,), {"__module__": "botocore.exceptions"})
+
+        async def boom(args):
+            raise Boto("Your session has expired")
+
+        monkeypatch.setattr(cli, "check_s3_access", lambda bucket, client=None: None)
+        parser = cli.build_parser()
+        real = parser.parse_args
+
+        def parse(argv):
+            args = real(argv)
+            args.func = boom
+            return args
+
+        monkeypatch.setattr(parser, "parse_args", parse)
+        monkeypatch.setattr(cli, "build_parser", lambda: parser)
+        assert cli.main(["sweep", "s3://b/x/", "--source", "perp"]) == 1
+        out = capsys.readouterr().out
+        assert "aws login" in out
+        assert "Traceback" not in out
