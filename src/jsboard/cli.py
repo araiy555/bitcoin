@@ -356,6 +356,8 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
                 flow_weight=getattr(args, "toxicity_flow_weight", 0.50),
                 book_weight=getattr(args, "toxicity_book_weight", 0.30),
                 microprice_weight=getattr(args, "toxicity_microprice_weight", 0.20),
+                lead_threshold_bps=getattr(args, "lead_threshold_bps", 0.0),
+                lead_basis_halflife_s=getattr(args, "lead_basis_halflife_s", 60.0),
             )
         ),
         config=StrategyConfig(requote_interval_ms=args.requote_ms),
@@ -716,6 +718,34 @@ def _parse_when(text: str | None) -> int | None:
     return int(when.timestamp() * 1e9)
 
 
+def attach_lead(mm: MarketMaker, path, args: argparse.Namespace):
+    """Give the toxicity gate a view of the lead venue; return what feeds it.
+
+    The lead book is read from the same recording, in file order, so it is
+    only ever as fresh as it was at that instant — never ahead of our own.
+    Returns None when no lead was asked for.
+    """
+    lead = getattr(args, "lead_source", None)
+    if not lead:
+        return None
+    from .sim.s3 import exists, meta_uri, read_bytes
+
+    meta_path = meta_uri(path)
+    sources = json.loads(read_bytes(meta_path)).get("sources") if exists(meta_path) else None
+    if not sources or lead not in sources:
+        raise ConfigError(
+            f"--lead-source {lead} は録画にありません。"
+            f"  使えるのは: {', '.join(sorted(sources or {})) or '（単一市場の録画）'}"
+        )
+    if lead == getattr(args, "source", None):
+        raise ConfigError("--lead-source と --source が同じです。別の市場を指定してください。")
+    lead_inst = _instrument_from_spec(sources[lead])
+    view = MarketView(instrument=lead_inst, depth=getattr(args, "depth", 20))
+    view.clock = mm.market.clock
+    mm.toxicity.lead = CrossMarketFairValue(mm.instrument, lead_inst, view)
+    return view.apply
+
+
 async def cmd_replay(args: argparse.Namespace) -> int:
     path = Path(args.path)
     instrument = _instrument_for_recording(path, args)
@@ -728,6 +758,8 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         until_ns=_parse_when(args.until),
     )
     mm = build_maker(instrument, args)
+    feed.lead_source = args.lead_source
+    feed.on_lead = attach_lead(mm, path, args)
     # A recording carries the timestamps it was captured with. Judged against
     # the wall clock those are always in the past — a day-old capture reads as
     # a book that is a day stale, and the risk gate pulls every quote before
@@ -906,7 +938,7 @@ AXIS_NON_SETTINGS = frozenset(
         "func", "path", "plain", "axis", "start", "end", "work", "keep",
         "decide_until", "s3_bucket", "s3_prefix", "symbol", "source", "out",
         "distances", "sizes", "requotes", "latencies", "toxicity_thresholds",
-        "since", "until", "headless", "tick_size", "lot_size",
+        "since", "until", "headless", "tick_size", "lot_size", "lead_source",
     }
 )
 
@@ -1114,6 +1146,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         ),
         "tox_one_sided_pct": tox.get("one_sided_share", 0.0) * 100.0,
         "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
+        "lead_pct": tox.get("lead_share", 0.0) * 100.0,
         **{
             f"age_{i}": value
             for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
@@ -1151,7 +1184,14 @@ async def _run_combos(
 
         mm = build_maker(instrument, run_args)
         attach_virtual_clock(mm)
-        feed = ReplayFeed(instrument, path, speed=0.0, source=args.source)
+        feed = ReplayFeed(
+            instrument,
+            path,
+            speed=0.0,
+            source=args.source,
+            lead_source=getattr(args, "lead_source", None),
+            on_lead=attach_lead(mm, path, run_args),
+        )
         await run(feed, mm, duration_s=None, max_events=args.max_events)
         row = _sweep_row(mm, mm.summary())
         row["settings"] = settings
@@ -1228,6 +1268,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("飛越%", "gap_share", "{:.0f}"),
         ("毒性片側%", "tox_one_sided_pct", "{:.0f}"),
         ("毒性全取消%", "tox_pull_pct", "{:.0f}"),
+        ("先行引%", "lead_pct", "{:.0f}"),
     ]
 
     def cell(row: dict, key: str, fmt: str) -> str:
@@ -4748,6 +4789,29 @@ def add_common(p: argparse.ArgumentParser) -> None:
     toxicity.add_argument("--toxicity-flow-weight", type=float, default=0.50)
     toxicity.add_argument("--toxicity-book-weight", type=float, default=0.30)
     toxicity.add_argument("--toxicity-microprice-weight", type=float, default=0.20)
+    toxicity.add_argument(
+        "--lead-source",
+        default=None,
+        help=(
+            "先行する市場として見る録画の系統（例: bybit, perp）。"
+            "板を見るだけで、そこでは取引しない"
+        ),
+    )
+    toxicity.add_argument(
+        "--lead-threshold-bps",
+        type=float,
+        default=0.0,
+        help=(
+            "先行市場がこれ以上ずれたら、動く先の側を引く（株の「先物が5bpずれたら引く」）。"
+            "0で無効"
+        ),
+    )
+    toxicity.add_argument(
+        "--lead-basis-halflife-s",
+        type=float,
+        default=60.0,
+        help="市場間の平常のずれを学習する半減期（秒）",
+    )
 
     risk = p.add_argument_group("risk")
     risk.add_argument("--max-notional", type=float, default=250_000.0)

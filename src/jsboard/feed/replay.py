@@ -14,7 +14,7 @@ import json
 import math
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from ..core.types import Instrument, Side
@@ -326,6 +326,8 @@ class ReplayFeed(Feed):
         source: str | None = None,
         since_ns: int | None = None,
         until_ns: int | None = None,
+        lead_source: str | None = None,
+        on_lead: Callable[[FeedEvent], None] | None = None,
     ) -> None:
         super().__init__(instrument)
         self.path = Path(path)
@@ -341,6 +343,10 @@ class ReplayFeed(Feed):
         and perp on one timeline, and feeding both into a single book would
         build a book that never existed. None replays every line, which is
         what a single-venue `record` file wants."""
+        self.lead_source = lead_source
+        self.on_lead = on_lead
+        """A second venue in the same file, handed to `on_lead` in file order
+        instead of being dropped, so a quoter can watch it without trading it."""
 
     async def stream(self) -> AsyncIterator[FeedEvent]:
         yield FeedStatus("connecting", str(self.path))
@@ -354,6 +360,9 @@ class ReplayFeed(Feed):
                 src = raw.pop(SOURCE_KEY, None)
                 for key in ENVELOPE_KEYS:
                     raw.pop(key, None)
+                if self.on_lead is not None and src is not None and src == self.lead_source:
+                    self.on_lead(_decode(raw))
+                    continue
                 if self.source is not None and src is not None and src != self.source:
                     continue
                 event = _decode(raw)

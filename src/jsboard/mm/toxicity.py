@@ -13,6 +13,13 @@ A positive score means upward pressure, so selling is the toxic side. A
 negative score means downward pressure, so buying is the toxic side. Moderate
 pressure removes only that side; extreme pressure pulls both sides. No future
 price or post-fill mark-out enters the decision.
+
+An optional fourth input looks at another venue. A market that leads this one
+(the future for an ETF, the other exchange for a coin) shows where this book
+is about to go; when it sits more than `lead_threshold_bps` away, the side it
+is moving toward is withdrawn. The persistent gap between the two venues is
+tracked with a slow average and removed first, so a standing basis is not
+read as a move.
 """
 
 from __future__ import annotations
@@ -36,6 +43,14 @@ class ToxicityConfig:
     book_weight: float = 0.30
     microprice_weight: float = 0.20
 
+    lead_threshold_bps: float = 0.0
+    """Withdraw the side the lead venue is moving toward once it sits this far
+    from our mid, net of the usual basis. Zero disables it."""
+
+    lead_basis_halflife_s: float = 60.0
+    """How slowly the standing gap between the venues is learned. Much shorter
+    and a real move is absorbed into the basis before it can be acted on."""
+
 
 @dataclass(frozen=True, slots=True)
 class ToxicityDecision:
@@ -58,6 +73,13 @@ class ToxicityDecision:
 @dataclass(slots=True)
 class ToxicityGate:
     config: ToxicityConfig = field(default_factory=ToxicityConfig)
+    lead: object | None = None
+    """Anything with ``estimate(market) -> price in our ticks | None``; in
+    practice :class:`jsboard.sim.pair.CrossMarketFairValue` over the other
+    venue's book."""
+    lead_blocks: int = 0
+    _basis_bps: float | None = None
+    _basis_ns: int = 0
 
     @staticmethod
     def _clip(value: float) -> float:
@@ -89,7 +111,52 @@ class ToxicityGate:
             / total_weight
         )
 
+    def lead_bps(self, market: MarketView) -> float | None:
+        """How far the lead venue sits from our mid, net of the usual gap.
+
+        Positive means the lead is above us: our book is about to rise, and
+        an ask left resting is the one that gets picked off.
+        """
+        if self.lead is None:
+            return None
+        mid = market.mid
+        lead = self.lead.estimate(market)
+        if not mid or lead is None:
+            return None
+        raw = (lead - mid) / mid * 1e4
+        now = int(market.clock())
+        if self._basis_bps is None:
+            self._basis_bps, self._basis_ns = raw, now
+            return 0.0
+        gap = raw - self._basis_bps
+        dt_s = max(0.0, (now - self._basis_ns) / 1e9)
+        halflife = self.config.lead_basis_halflife_s
+        weight = 1.0 - 0.5 ** (dt_s / halflife) if halflife > 0 else 1.0
+        self._basis_bps += weight * (raw - self._basis_bps)
+        self._basis_ns = now
+        return gap
+
     def evaluate(self, market: MarketView) -> ToxicityDecision:
+        decision = self._evaluate_own_book(market)
+        cfg = self.config
+        if cfg.lead_threshold_bps <= 0:
+            return decision
+        gap = self.lead_bps(market)
+        if gap is None:
+            return decision
+        if gap >= cfg.lead_threshold_bps:
+            blocked, reason = Side.SELL, f"lead {gap:+.1f}bps above; no asks"
+        elif gap <= -cfg.lead_threshold_bps:
+            blocked, reason = Side.BUY, f"lead {gap:+.1f}bps below; no bids"
+        else:
+            return decision
+        if blocked not in decision.allowed_sides:
+            return decision
+        self.lead_blocks += 1
+        allowed = decision.allowed_sides - {blocked}
+        return ToxicityDecision(decision.score, allowed, reason)
+
+    def _evaluate_own_book(self, market: MarketView) -> ToxicityDecision:
         cfg = self.config
         both = frozenset({Side.BUY, Side.SELL})
         if cfg.threshold <= 0:

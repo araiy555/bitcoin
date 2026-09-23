@@ -358,6 +358,7 @@ class MarketMaker:
             "pull_share": self.stats.toxicity_pulls / tox_n if tox_n else 0.0,
             "bid_block_share": self.stats.toxicity_bid_blocks / tox_n if tox_n else 0.0,
             "ask_block_share": self.stats.toxicity_ask_blocks / tox_n if tox_n else 0.0,
+            "lead_share": self.toxicity.lead_blocks / tox_n if tox_n else 0.0,
         }
         out.update(
             {

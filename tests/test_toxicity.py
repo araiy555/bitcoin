@@ -141,3 +141,129 @@ class TestStrategyIntegration:
         assert quotes.is_empty
         assert mm.venue.open_orders() == []
         assert mm.summary()["toxicity"]["pulls"] == 1
+
+
+class FixedLead:
+    """A lead venue whose price, in our ticks, the test sets directly."""
+
+    def __init__(self, price):
+        self.price = price
+
+    def estimate(self, _market):
+        return self.price
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1_000_000_000
+
+    def __call__(self):
+        return self.now
+
+
+def lead_gate(lead, threshold_bps=5.0, halflife_s=60.0, own=0.0) -> ToxicityGate:
+    return ToxicityGate(
+        ToxicityConfig(
+            threshold=own, lead_threshold_bps=threshold_bps, lead_basis_halflife_s=halflife_s
+        ),
+        lead=lead,
+    )
+
+
+class TestLeadVenue:
+    """The stock rule: when the future moves 5bps away, pull the side it moves toward."""
+
+    def setup_market(self):
+        market = market_with(500, 500)  # mid 101
+        clock = Clock()
+        market.clock = clock
+        return market, clock
+
+    def test_a_standing_gap_is_learned_not_acted_on(self):
+        market, _ = self.setup_market()
+        # 10bps apart from the start: that is the basis, not a move.
+        g = lead_gate(FixedLead(101 * 1.001))
+        decision = g.evaluate(market)
+        assert decision.permits(Side.BUY) and decision.permits(Side.SELL)
+
+    def test_lead_jumping_up_pulls_the_ask_only(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        g = lead_gate(lead)
+        g.evaluate(market)  # learns a zero basis
+        clock.now += 250_000_000
+        lead.price = 101 * 1.0006  # +6bps
+        decision = g.evaluate(market)
+        assert decision.permits(Side.BUY)
+        assert not decision.permits(Side.SELL)
+        assert "no asks" in decision.reason
+        assert g.lead_blocks == 1
+
+    def test_lead_dropping_pulls_the_bid_only(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        g = lead_gate(lead)
+        g.evaluate(market)
+        clock.now += 250_000_000
+        lead.price = 101 * 0.9994
+        decision = g.evaluate(market)
+        assert decision.permits(Side.SELL)
+        assert not decision.permits(Side.BUY)
+
+    def test_a_move_under_the_threshold_leaves_both_sides(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        g = lead_gate(lead)
+        g.evaluate(market)
+        clock.now += 250_000_000
+        lead.price = 101 * 1.0004  # +4bps < 5
+        decision = g.evaluate(market)
+        assert decision.permits(Side.BUY) and decision.permits(Side.SELL)
+
+    def test_the_basis_catches_up_over_the_halflife(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        g = lead_gate(lead, halflife_s=1.0)
+        g.evaluate(market)
+        lead.price = 101 * 1.001
+        for _ in range(20):
+            clock.now += 1_000_000_000
+            decision = g.evaluate(market)
+        # A gap that has persisted for twenty halflives is the new normal.
+        assert decision.permits(Side.BUY) and decision.permits(Side.SELL)
+
+    def test_no_lead_book_means_no_opinion(self):
+        market, _ = self.setup_market()
+        decision = lead_gate(FixedLead(None)).evaluate(market)
+        assert decision.permits(Side.BUY) and decision.permits(Side.SELL)
+
+    def test_disabled_without_a_threshold(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        g = lead_gate(lead, threshold_bps=0.0)
+        g.evaluate(market)
+        lead.price = 101 * 1.01
+        assert g.evaluate(market).permits(Side.SELL)
+
+    def test_combines_with_the_own_book_gate(self):
+        # Own book says "no asks"; lead says "no bids" → nothing left to quote.
+        market = market_with(900, 100, Side.BUY)
+        clock = Clock()
+        market.clock = clock
+        lead = FixedLead(101.0)
+        g = lead_gate(lead, own=0.4)
+        g.evaluate(market)
+        clock.now += 250_000_000
+        lead.price = market.mid * 0.999
+        assert g.evaluate(market).pulled
+
+    def test_the_maker_places_no_ask_when_the_lead_is_up(self):
+        market, clock = self.setup_market()
+        lead = FixedLead(101.0)
+        mm = maker(market, lead_gate(lead))
+        mm.requote(force=True)
+        clock.now += 250_000_000
+        lead.price = 101 * 1.001
+        quotes = mm.requote(force=True)
+        assert quotes.bids and quotes.asks == ()
+        assert mm.summary()["toxicity"]["lead_share"] > 0
