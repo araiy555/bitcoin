@@ -330,7 +330,8 @@ class ReplayFeed(Feed):
         on_lead: Callable[[FeedEvent], None] | None = None,
     ) -> None:
         super().__init__(instrument)
-        self.path = Path(path)
+        # A bucket location stays a string: Path() folds "s3://" into "s3:/".
+        self.path = path if str(path).startswith("s3://") else Path(path)
         self.speed = speed
         self.since_ns = since_ns
         self.until_ns = until_ns

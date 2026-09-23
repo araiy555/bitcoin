@@ -67,6 +67,14 @@ class S3Target:
             f"/date={when:%Y-%m-%d}/hour={when:%H}/{start_ns}-{seq:05d}.jsonl.gz"
         )
 
+    def meta_key(self, symbol: str) -> str:
+        """The spec file for everything under one symbol's folder.
+
+        It sits where a reader given that folder looks for it, so the folder
+        alone is enough to replay the recording.
+        """
+        return f"{self.prefix.strip('/')}/symbol={symbol.upper()}/meta.json"
+
 
 def default_client():
     """boto3's own credential chain, and nothing else.
@@ -108,6 +116,67 @@ def split_uri(uri: str | Path) -> tuple[str, str]:
     return bucket, key
 
 
+def is_prefix(uri: str | Path) -> bool:
+    """A folder in the bucket: every rotated part under it is one recording."""
+    return is_s3_uri(uri) and str(uri).endswith("/")
+
+
+def list_parts(uri: str | Path) -> list[str]:
+    """The parts under a folder, oldest first.
+
+    The key layout puts date, hour and start time in fixed-width fields, so
+    sorting by name is sorting by time.
+    """
+    bucket, prefix = split_uri(uri)
+    client = default_client()
+    keys: list[str] = []
+    token = None
+    while True:
+        request = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            request["ContinuationToken"] = token
+        page = client.list_objects_v2(**request)
+        keys += [
+            item["Key"]
+            for item in page.get("Contents", [])
+            if item["Key"].endswith((".jsonl.gz", ".jsonl"))
+        ]
+        if not page.get("IsTruncated"):
+            break
+        token = page["NextContinuationToken"]
+    return [f"{S3_SCHEME}{bucket}/{key}" for key in sorted(keys)]
+
+
+class _Parts:
+    """Several parts read as one file, one object open at a time."""
+
+    def __init__(self, uris: list[str]) -> None:
+        self.uris = uris
+        self._fh = None
+
+    def __enter__(self) -> _Parts:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __iter__(self):
+        for uri in self.uris:
+            self._fh = open_text(uri)
+            try:
+                yield from self._fh
+            finally:
+                self.close()
+
+    def read(self) -> str:
+        return "".join(self)
+
+
 def open_text(uri: str | Path):
     """A recording as text, wherever it lives and however it is compressed.
 
@@ -121,6 +190,11 @@ def open_text(uri: str | Path):
     several hundred megabytes and a replay reads it once, front to back.
     """
     text = str(uri)
+    if is_prefix(text):
+        parts = list_parts(text)
+        if not parts:
+            raise FileNotFoundError(f"{text} に録画がありません")
+        return _Parts(parts)
     if not is_s3_uri(text):
         path = Path(text)
         if path.suffix == ".gz":
@@ -146,6 +220,8 @@ def read_bytes(uri: str | Path) -> bytes:
 def exists(uri: str | Path) -> bool:
     if not is_s3_uri(uri):
         return Path(uri).exists()
+    if is_prefix(uri):
+        return bool(list_parts(uri))
     bucket, key = split_uri(uri)
     try:
         default_client().head_object(Bucket=bucket, Key=key)
@@ -157,6 +233,8 @@ def exists(uri: str | Path) -> bool:
 def meta_uri(uri: str | Path) -> str:
     """Where a recording's spec file sits, on either kind of location."""
     text = str(uri)
+    if is_prefix(text):
+        return text + "meta.json"
     if is_s3_uri(text):
         return text + ".meta.json"
     path = Path(text)
@@ -279,6 +357,16 @@ class RotatingJsonlSink:
             archive.unlink(missing_ok=True)
         if not self.keep_local:
             part.unlink(missing_ok=True)
+
+    def upload_meta(self, meta: Path) -> str | None:
+        """Put the spec file beside the parts; return its key, or None on failure."""
+        key = self.target.meta_key(self.symbol)
+        try:
+            self.client.upload_file(str(meta), self.target.bucket, key)
+        except Exception as exc:  # noqa: BLE001 - the recording itself must go on
+            self.failed.append(f"{key}: {exc}")
+            return None
+        return key
 
     # ---------------------------------------------------------------- status
 

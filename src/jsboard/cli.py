@@ -895,11 +895,14 @@ def _instrument_for_recording(path: Path, args: argparse.Namespace) -> Instrumen
     perp do not share a tick size and guessing wrong silently rescales every
     price in the file.
     """
-    meta_path = path.with_suffix(path.suffix + ".meta.json")
-    if not meta_path.exists():
+    from .sim.s3 import exists, meta_uri, read_bytes
+
+    meta_loc = meta_uri(path)
+    if not exists(meta_loc):
         return build_instrument(args.symbol, args.tick_size, args.lot_size)
 
-    meta = json.loads(meta_path.read_text())
+    meta = json.loads(read_bytes(meta_loc))
+    meta_name = meta_loc.rsplit("/", 1)[-1]
     sources = meta.get("sources")
     if not sources:
         return _instrument_from_spec(meta)
@@ -909,12 +912,12 @@ def _instrument_for_recording(path: Path, args: argparse.Namespace) -> Instrumen
         if len(sources) == 1:
             return _instrument_from_spec(next(iter(sources.values())))
         raise ConfigError(
-            f"{meta_path.name} は {', '.join(sorted(sources))} を含んでいます。\n"
+            f"{meta_name} は {', '.join(sorted(sources))} を含んでいます。\n"
             f"  --source でどちらを再生するか指定してください（例: --source perp）。"
         )
     if wanted not in sources:
         raise ConfigError(
-            f"--source {wanted} は {meta_path.name} にありません。"
+            f"--source {wanted} は {meta_name} にありません。"
             f"  使えるのは: {', '.join(sorted(sources))}"
         )
     return _instrument_from_spec(sources[wanted])
@@ -1210,10 +1213,14 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
     so the comparison is a controlled one rather than a comparison of two
     different hours.
     """
-    path = Path(args.path)
-    if not path.exists():
+    from .sim.s3 import exists, is_s3_uri
+
+    # A bucket folder stays a string: Path() would fold "s3://" into "s3:/".
+    path = args.path if is_s3_uri(args.path) else Path(args.path)
+    if not exists(path):
         console.print(f"[red]{path} がありません。まず capture で録画してください。[/red]")
         return 1
+    name = str(path) if is_s3_uri(path) else path.name
 
     instrument = _instrument_for_recording(path, args)
     axes = _sweep_axes(args)
@@ -1235,7 +1242,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
     combos = list(itertools.product(*(axes[n] for n in names)))
 
     console.print(
-        f"{path.name}: {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
+        f"{name}: {instrument.symbol}  tick={instrument.tick_size} lot={instrument.lot_size}\n"
         f"{len(combos)} 通りを同じ録画に対して再生します "
         f"(maker {args.maker_bps:g}bps → 往復 {2 * args.maker_bps:g}bps)\n"
         f"軸: {', '.join(f'{n}={len(axes[n])}' for n in names)}"
@@ -1286,7 +1293,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
             console.print("\t".join(cells), highlight=False, soft_wrap=True)
         return 0
 
-    table = Table(title=f"{instrument.symbol} — sweep ({path.name})", padding=(0, 1))
+    table = Table(title=f"{instrument.symbol} — sweep ({name})", padding=(0, 1))
     for name in names:
         table.add_column(name.replace("_", " "), justify="right")
     for header, _, _ in columns:
@@ -3839,12 +3846,9 @@ async def cmd_capture(args: argparse.Namespace) -> int:
 
     capture.on_event = on_event
 
-    try:
-        result = await capture.run(duration_s=args.duration, max_events=args.max_events)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]中断しました。[/yellow]")
-        return 130
-
+    # Written before the first event rather than after the last: a recording
+    # stopped with Ctrl-C is still a recording, and without its spec a replay
+    # has to guess tick and lot.
     meta = write_meta(
         out,
         specs,
@@ -3852,6 +3856,20 @@ async def cmd_capture(args: argparse.Namespace) -> int:
         basis_sample_ms=basis_sample_ms,
         basis_depth=args.basis_depth if basis_sample_ms is not None else None,
     )
+    if sink is not None:
+        key = sink.upload_meta(meta)
+        if key is not None:
+            folder = key.rsplit("/", 1)[0]
+            console.print(
+                f"  [dim]解析するときはこのフォルダを指定: "
+                f"s3://{args.s3_bucket}/{folder}/[/dim]"
+            )
+
+    try:
+        result = await capture.run(duration_s=args.duration, max_events=args.max_events)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]中断しました。[/yellow]")
+        return 130
 
     console.print()
     console.rule("[bold cyan]記録完了")

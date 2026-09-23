@@ -327,3 +327,138 @@ class TestRecordingsInTheBucket:
 
         monkeypatch.setattr(s3, "default_client", FakeClient)
         assert [src for src, _ in iter_tagged("s3://b/h/r.jsonl.gz")] == ["binance"]
+
+
+class FakeBucket:
+    """list_objects_v2 / get_object / head_object over an in-memory dict."""
+
+    def __init__(self, objects: dict[str, bytes], page_size: int = 1000):
+        self.objects = objects
+        self.page_size = page_size
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+        keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start : start + self.page_size]
+        more = start + self.page_size < len(keys)
+        out = {"Contents": [{"Key": k} for k in page], "IsTruncated": more}
+        if more:
+            out["NextContinuationToken"] = str(start + self.page_size)
+        return out
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        import io
+
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def head_object(self, Bucket, Key):  # noqa: N803
+        if Key not in self.objects:
+            raise KeyError(Key)
+        return {}
+
+
+class TestAFolderOfParts:
+    """A capture sent to the bucket arrives as many parts; replay needs one file.
+
+    Reassembling it on the laptop needs the disk the bucket was meant to
+    spare, so the folder itself has to be readable.
+    """
+
+    def parts(self):
+        target = S3Target(bucket="b", prefix="raw/alt")
+        # Deliberately out of order, across an hour boundary, with a meta file
+        # and an unrelated object mixed in.
+        late = target.key_for("ADAUSDT", 1_757_003_600 * NS, 2)
+        early = target.key_for("ADAUSDT", 1_757_000_000 * NS, 1)
+        return target, {
+            late: gzip.compress(b'{"n":2}\n{"n":3}\n'),
+            early: gzip.compress(b'{"n":0}\n{"n":1}\n'),
+            target.meta_key("ADAUSDT"): b'{"sources":{}}',
+            "raw/alt/symbol=ADAUSDT/notes.txt": b"ignore me",
+        }
+
+    def test_parts_are_read_oldest_first_as_one_stream(self, monkeypatch):
+        import jsboard.sim.s3 as s3
+
+        _, objects = self.parts()
+        monkeypatch.setattr(s3, "default_client", lambda: FakeBucket(objects))
+        with s3.open_text("s3://b/raw/alt/symbol=ADAUSDT/") as fh:
+            lines = [json.loads(line)["n"] for line in fh]
+        assert lines == [0, 1, 2, 3]
+
+    def test_listing_follows_every_page(self, monkeypatch):
+        import jsboard.sim.s3 as s3
+
+        _, objects = self.parts()
+        monkeypatch.setattr(s3, "default_client", lambda: FakeBucket(objects, page_size=1))
+        assert len(s3.list_parts("s3://b/raw/alt/symbol=ADAUSDT/")) == 2
+
+    def test_the_spec_sits_where_the_folder_reader_looks(self):
+        from jsboard.sim.s3 import meta_uri
+
+        target, _ = self.parts()
+        folder = "s3://b/" + target.meta_key("ADAUSDT").rsplit("/", 1)[0] + "/"
+        assert meta_uri(folder) == "s3://b/" + target.meta_key("ADAUSDT")
+
+    def test_an_empty_folder_is_not_a_recording(self, monkeypatch):
+        import jsboard.sim.s3 as s3
+
+        monkeypatch.setattr(s3, "default_client", lambda: FakeBucket({}))
+        assert not s3.exists("s3://b/raw/none/")
+        with pytest.raises(FileNotFoundError):
+            s3.open_text("s3://b/raw/none/")
+
+    def test_the_sink_uploads_the_spec_beside_its_parts(self, tmp_path):
+        client = FakeS3()
+        meta = tmp_path / "cap.jsonl.meta.json"
+        meta.write_text("{}")
+        s = sink(tmp_path, client)
+        assert s.upload_meta(meta) == "raw/symbol=BTCUSDT/meta.json"
+        s.close()
+        assert "b/raw/symbol=BTCUSDT/meta.json" in client.objects
+
+    @pytest.mark.asyncio
+    async def test_sweep_runs_straight_off_the_folder(self, monkeypatch, capsys):
+        import jsboard.sim.s3 as s3
+        from jsboard.cli import build_parser
+        from jsboard.feed.base import DepthSnapshot
+        from jsboard.feed.replay import _encode
+
+        spec = {
+            "symbol": "ADAUSDT", "tick_size": "0.0001", "lot_size": "1",
+            "base": "ADA", "quote": "USDT", "market": "perp",
+        }
+        rows = [{"k": "status", "state": "live", "detail": "", "ts_ns": NS, "src": "perp"}]
+        for i in range(20):
+            ts = NS + i * 100_000_000
+            row = _encode(
+                DepthSnapshot(
+                    bids=tuple((9000 - j, 50_000) for j in range(5)),
+                    asks=tuple((9002 + j, 50_000) for j in range(5)),
+                    last_update_id=i,
+                    ts_ns=ts,
+                )
+            )
+            row.update({"src": "perp", "rx_ns": ts})
+            rows.append(row)
+        body = "\n".join(json.dumps(r) for r in rows) + "\n"
+        target = S3Target(bucket="b", prefix="raw/alt")
+        half = len(body.splitlines()) // 2
+        lines = body.splitlines(keepends=True)
+        objects = {
+            target.key_for("ADAUSDT", NS, 1): gzip.compress("".join(lines[:half]).encode()),
+            target.key_for("ADAUSDT", 2 * NS, 2): gzip.compress("".join(lines[half:]).encode()),
+            target.meta_key("ADAUSDT"): json.dumps({"sources": {"perp": spec}}).encode(),
+        }
+        monkeypatch.setattr(s3, "default_client", lambda: FakeBucket(objects))
+
+        args = build_parser().parse_args(
+            [
+                "sweep", "s3://b/raw/alt/symbol=ADAUSDT/", "--source", "perp",
+                "--axis=cancel_ahead=0,1", "--plain",
+            ]
+        )
+        assert await args.func(args) == 0
+        out = capsys.readouterr().out
+        assert "tick=0.0001" in out  # the spec came from the bucket, not a guess
+        assert "2 通り" in out
