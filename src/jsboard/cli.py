@@ -2535,6 +2535,111 @@ async def cmd_xcapture(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_dexcapture(args: argparse.Namespace) -> int:
+    """Record a Hyperliquid perp with Binance's beside it, as the lead market.
+
+    The venue we would quote on and the venue that moves first, on one
+    receive-time clock: replaying the first with `--source hyperliquid` and
+    watching the second with `--lead-source binance` is the stock rule —
+    pull the side the future is moving toward — on a coin.
+    """
+    from .feed.hyperliquid import HyperliquidFeed, coin_for
+    from .feed.hyperliquid import fetch_instrument as fetch_hl_instrument
+
+    coin = (args.coin or coin_for(args.symbol)).upper()
+    try:
+        hl = await fetch_hl_instrument(coin)
+        binance = await fetch_futures_instrument(args.symbol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+
+    sources = {
+        "hyperliquid": HyperliquidFeed(hl),
+        "binance": BinanceFuturesFeed(
+            binance,
+            depth_ms=args.binance_depth_ms,
+            open_interest_interval=60.0,
+            rest_fallback="never",
+        ),
+    }
+    specs = {
+        "hyperliquid": {**_spec_dict(hl, "perp"), "venue": "hyperliquid"},
+        "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+    }
+    out = Path(args.out)
+    # Written first: a recording stopped early still says what its ticks are.
+    meta = write_meta(out, specs)
+
+    sink = None
+    if args.s3_bucket:
+        try:
+            sink = RotatingJsonlSink(
+                path=out,
+                target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
+                symbol=args.symbol.upper(),
+                rotate_seconds=args.rotate_minutes * 60.0,
+                keep_local=args.keep_local,
+            )
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
+        key = sink.upload_meta(meta)
+        if key is not None:
+            console.print(
+                f"  [dim]解析するときはこのフォルダを指定: "
+                f"s3://{args.s3_bucket}/{key.rsplit('/', 1)[0]}/[/dim]"
+            )
+
+    capture = MultiCapture(sources, out, sink=sink)
+    console.rule(f"[bold cyan]{coin} Hyperliquid + Binance 録画")
+    console.print(
+        f"  Hyperliquid: {coin}  tick={hl.tick_size} lot={hl.lot_size}\n"
+        f"  Binance    : {binance.symbol}  tick={binance.tick_size} lot={binance.lot_size}\n"
+        f"  停止       : {args.duration:,.0f}秒後\n"
+        + (
+            f"  S3         : s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/"
+            f"symbol={args.symbol.upper()}/  ({args.rotate_minutes:g}分ごと)\n"
+            if sink is not None
+            else f"  出力       : {out}\n"
+        )
+    )
+
+    last_report = [time.monotonic()]
+
+    def on_event(_name, _event) -> None:
+        now = time.monotonic()
+        if now - last_report[0] < 10.0:
+            return
+        last_report[0] = now
+        parts = [f"{name}[{st.status}] {st.events:,}" for name, st in capture.stats.items()]
+        console.print(f"  [dim]{' | '.join(parts)}[/dim]")
+
+    capture.on_event = on_event
+    try:
+        result = await capture.run(duration_s=args.duration, max_events=args.max_events)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]中断しました。[/yellow]")
+        return 130
+
+    console.rule("[bold cyan]録画完了")
+    console.print(
+        f"  時間     : {result.duration_s:,.1f}秒\n"
+        f"  イベント : {result.total_events:,}件"
+    )
+    for name, st in result.stats.items():
+        console.print(f"  {name}: {st.events:,}件 / 切断 {st.errors}回")
+    if sink is not None:
+        summary = sink.summary()
+        console.print(f"  S3       : {len(summary['uploaded']):,} 個を転送")
+        for failure in summary["failed"]:
+            console.print(f"    [red]転送失敗（ローカルに残置）: {failure}[/red]")
+    return 0
+
+
 def _replay_two_market_capture(
     path: Path,
     engine: CrossExchangeArb,
@@ -5255,6 +5360,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_xcap.add_argument("--binance-depth-ms", type=int, default=100, choices=(100, 250, 500))
     p_xcap.add_argument("--bybit-depth", type=int, default=50, choices=(1, 50, 200, 1000))
     p_xcap.set_defaults(func=cmd_xcapture)
+
+    p_dex = sub.add_parser(
+        "dexcapture", help="Hyperliquidの板とBinanceの板（先行市場）を同時に記録する"
+    )
+    p_dex.add_argument("--symbol", default="ADAUSDT", help="Binance側の銘柄")
+    p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
+    p_dex.add_argument("--out", default="dex.jsonl")
+    p_dex.add_argument("--duration", type=float, default=43200.0, help="録画秒数")
+    p_dex.add_argument("--max-events", type=int, default=None)
+    p_dex.add_argument("--binance-depth-ms", type=int, default=100, choices=(100, 250, 500))
+    dex_s3 = p_dex.add_argument_group("S3")
+    dex_s3.add_argument("--s3-bucket", default=None)
+    dex_s3.add_argument("--s3-prefix", default="raw/dex")
+    dex_s3.add_argument("--rotate-minutes", type=float, default=5.0)
+    dex_s3.add_argument("--keep-local", action="store_true")
+    p_dex.set_defaults(func=cmd_dexcapture)
 
     p_xarb = sub.add_parser("xarb", help="Binance/Bybit価格差を実板・往復費用込みで再生する")
     p_xarb.add_argument("path", help="xcaptureで作った.jsonl")
