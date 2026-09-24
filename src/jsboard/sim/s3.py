@@ -35,6 +35,7 @@ name keeps parts sortable inside a partition.
 from __future__ import annotations
 
 import gzip
+import re
 import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -175,6 +176,25 @@ def list_parts(uri: str | Path) -> list[str]:
     return [f"{S3_SCHEME}{bucket}/{key}" for key in sorted(keys)]
 
 
+_PART_NAME = re.compile(r"(\d{16,20})-(\d{5})\.jsonl(?:\.gz)?$")
+
+
+def local_parts(folder: str | Path) -> list[str]:
+    """Every part under a local folder, oldest first, however it got there.
+
+    A capture whose login expired mid-run leaves its early parts in the
+    bucket and its late ones on disk, named differently. Both names carry
+    the start time and sequence, so sorting on those rebuilds one timeline
+    without copying either half into a single file.
+    """
+    found = []
+    for path in Path(folder).rglob("*.jsonl*"):
+        match = _PART_NAME.search(path.name)
+        if match and path.is_file():
+            found.append(((int(match[1]), int(match[2])), str(path)))
+    return [path for _, path in sorted(found)]
+
+
 class _Parts:
     """Several parts read as one file, one object open at a time."""
 
@@ -223,6 +243,11 @@ def open_text(uri: str | Path):
         if not parts:
             raise FileNotFoundError(f"{text} に録画がありません")
         return _Parts(parts)
+    if not is_s3_uri(text) and Path(text).is_dir():
+        parts = local_parts(text)
+        if not parts:
+            raise FileNotFoundError(f"{text} に録画の分割ファイルがありません")
+        return _Parts(parts)
     if not is_s3_uri(text):
         path = Path(text)
         if path.suffix == ".gz":
@@ -263,6 +288,8 @@ def meta_uri(uri: str | Path) -> str:
     text = str(uri)
     if is_prefix(text):
         return text + "meta.json"
+    if not is_s3_uri(text) and Path(text).is_dir():
+        return str(Path(text) / "meta.json")
     if is_s3_uri(text):
         return text + ".meta.json"
     path = Path(text)

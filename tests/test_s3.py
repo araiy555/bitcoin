@@ -520,3 +520,32 @@ class TestAnExpiredLogin:
         out = capsys.readouterr().out
         assert "aws login" in out
         assert "Traceback" not in out
+
+
+class TestHalfInTheBucketHalfOnDisk:
+    """A login that expires mid-capture splits one recording in two places."""
+
+    def test_both_halves_read_back_as_one_timeline(self, tmp_path):
+        from jsboard.sim.s3 import meta_uri, open_text
+
+        target = S3Target(bucket="b", prefix="raw/alt2")
+        # Early parts as `aws s3 sync` lays them out: gzipped, in date/hour folders.
+        for start, seq, body in ((1_757_000_000, 1, "0\n1\n"), (1_757_003_600, 2, "2\n")):
+            key = target.key_for("ADAUSDT", start * NS, seq)
+            dest = tmp_path / key.split("symbol=ADAUSDT/")[1]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(gzip.compress(body.encode()))
+        # Late parts as the sink left them after failing to upload.
+        (tmp_path / f"cap-ADAUSDT-{1_757_007_200 * NS}-00003.jsonl").write_text("3\n")
+        (tmp_path / f"cap-ADAUSDT-{1_757_010_800 * NS}-00004.jsonl").write_text("4\n")
+        (tmp_path / "meta.json").write_text("{}")
+
+        with open_text(tmp_path) as fh:
+            assert [line.strip() for line in fh] == ["0", "1", "2", "3", "4"]
+        assert meta_uri(tmp_path) == str(tmp_path / "meta.json")
+
+    def test_an_empty_folder_says_so(self, tmp_path):
+        from jsboard.sim.s3 import open_text
+
+        with pytest.raises(FileNotFoundError):
+            open_text(tmp_path)
