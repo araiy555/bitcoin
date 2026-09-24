@@ -2535,41 +2535,20 @@ async def cmd_xcapture(args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_dexcapture(args: argparse.Namespace) -> int:
-    """Record a Hyperliquid perp with Binance's beside it, as the lead market.
+async def _record_with_lead(
+    args: argparse.Namespace,
+    *,
+    title: str,
+    folder_symbol: str,
+    sources: dict,
+    specs: dict,
+) -> int:
+    """Record a venue we would quote on and the one that moves first.
 
-    The venue we would quote on and the venue that moves first, on one
-    receive-time clock: replaying the first with `--source hyperliquid` and
-    watching the second with `--lead-source binance` is the stock rule —
-    pull the side the future is moving toward — on a coin.
+    Both books go onto one receive-time clock, so replaying the first with
+    `--source` and watching the second with `--lead-source` is the stock rule
+    — pull the side the future is moving toward — on another market.
     """
-    from .feed.hyperliquid import HyperliquidFeed, coin_for
-    from .feed.hyperliquid import fetch_instrument as fetch_hl_instrument
-
-    coin = (args.coin or coin_for(args.symbol)).upper()
-    try:
-        hl = await fetch_hl_instrument(coin)
-        binance = await fetch_futures_instrument(args.symbol)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
-        hint = describe_tls_error(exc)
-        if hint:
-            console.print(f"[yellow]{hint}[/yellow]")
-        return 1
-
-    sources = {
-        "hyperliquid": HyperliquidFeed(hl),
-        "binance": BinanceFuturesFeed(
-            binance,
-            depth_ms=args.binance_depth_ms,
-            open_interest_interval=60.0,
-            rest_fallback="never",
-        ),
-    }
-    specs = {
-        "hyperliquid": {**_spec_dict(hl, "perp"), "venue": "hyperliquid"},
-        "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
-    }
     out = Path(args.out)
     # Written first: a recording stopped early still says what its ticks are.
     meta = write_meta(out, specs)
@@ -2580,7 +2559,7 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
             sink = RotatingJsonlSink(
                 path=out,
                 target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
-                symbol=args.symbol.upper(),
+                symbol=folder_symbol,
                 rotate_seconds=args.rotate_minutes * 60.0,
                 keep_local=args.keep_local,
             )
@@ -2595,16 +2574,18 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
             )
 
     capture = MultiCapture(sources, out, sink=sink)
-    console.rule(f"[bold cyan]{coin} Hyperliquid + Binance 録画")
+    console.rule(f"[bold cyan]{title}")
+    for name, spec in specs.items():
+        console.print(
+            f"  {name:<12}: {spec['symbol']}  tick={spec['tick_size']} lot={spec['lot_size']}"
+        )
     console.print(
-        f"  Hyperliquid: {coin}  tick={hl.tick_size} lot={hl.lot_size}\n"
-        f"  Binance    : {binance.symbol}  tick={binance.tick_size} lot={binance.lot_size}\n"
-        f"  停止       : {args.duration:,.0f}秒後\n"
+        f"  停止        : {args.duration:,.0f}秒後\n"
         + (
-            f"  S3         : s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/"
-            f"symbol={args.symbol.upper()}/  ({args.rotate_minutes:g}分ごと)\n"
+            f"  S3          : s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/"
+            f"symbol={folder_symbol.upper()}/  ({args.rotate_minutes:g}分ごと)\n"
             if sink is not None
-            else f"  出力       : {out}\n"
+            else f"  出力        : {out}\n"
         )
     )
 
@@ -2638,6 +2619,77 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
         for failure in summary["failed"]:
             console.print(f"    [red]転送失敗（ローカルに残置）: {failure}[/red]")
     return 0
+
+
+def _binance_lead(instrument: Instrument, depth_ms: int):
+    return BinanceFuturesFeed(
+        instrument, depth_ms=depth_ms, open_interest_interval=60.0, rest_fallback="never"
+    )
+
+
+async def cmd_dexcapture(args: argparse.Namespace) -> int:
+    """Hyperliquid's perp, with Binance's beside it as the lead market."""
+    from .feed.hyperliquid import HyperliquidFeed, coin_for
+    from .feed.hyperliquid import fetch_instrument as fetch_hl_instrument
+
+    coin = (args.coin or coin_for(args.symbol)).upper()
+    try:
+        hl = await fetch_hl_instrument(coin)
+        binance = await fetch_futures_instrument(args.symbol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+    return await _record_with_lead(
+        args,
+        title=f"{coin} Hyperliquid + Binance 録画",
+        folder_symbol=args.symbol.upper(),
+        sources={
+            "hyperliquid": HyperliquidFeed(hl),
+            "binance": _binance_lead(binance, args.binance_depth_ms),
+        },
+        specs={
+            "hyperliquid": {**_spec_dict(hl, "perp"), "venue": "hyperliquid"},
+            "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+        },
+    )
+
+
+async def cmd_gmocapture(args: argparse.Namespace) -> int:
+    """A GMO Coin book, with Binance's perp beside it as the lead market.
+
+    The two are priced in different currencies; the lead gate compares them
+    as a ratio against a slowly learned basis, so yen against dollars is a
+    standing offset rather than a move.
+    """
+    from .feed.gmo import GmoFeed
+    from .feed.gmo import fetch_instrument as fetch_gmo_instrument
+
+    lead_symbol = (args.lead_symbol or args.symbol.split("_")[0] + "USDT").upper()
+    try:
+        gmo = await fetch_gmo_instrument(args.symbol)
+        binance = await fetch_futures_instrument(lead_symbol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+    return await _record_with_lead(
+        args,
+        title=f"{args.symbol} GMOコイン + Binance {lead_symbol} 録画",
+        folder_symbol=args.symbol.upper(),
+        sources={
+            "gmo": GmoFeed(gmo),
+            "binance": _binance_lead(binance, args.binance_depth_ms),
+        },
+        specs={
+            "gmo": {**_spec_dict(gmo, "leverage" if "_" in args.symbol else "spot"), "venue": "gmo"},
+            "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+        },
+    )
 
 
 def _replay_two_market_capture(
@@ -5361,21 +5413,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_xcap.add_argument("--bybit-depth", type=int, default=50, choices=(1, 50, 200, 1000))
     p_xcap.set_defaults(func=cmd_xcapture)
 
+    def add_lead_capture_args(p, *, prefix: str) -> None:
+        p.add_argument("--out", default=f"{prefix}.jsonl")
+        p.add_argument("--duration", type=float, default=43200.0, help="録画秒数")
+        p.add_argument("--max-events", type=int, default=None)
+        p.add_argument("--binance-depth-ms", type=int, default=100, choices=(100, 250, 500))
+        group = p.add_argument_group("S3")
+        group.add_argument("--s3-bucket", default=None)
+        group.add_argument("--s3-prefix", default=f"raw/{prefix}")
+        group.add_argument("--rotate-minutes", type=float, default=5.0)
+        group.add_argument("--keep-local", action="store_true")
+
     p_dex = sub.add_parser(
         "dexcapture", help="Hyperliquidの板とBinanceの板（先行市場）を同時に記録する"
     )
     p_dex.add_argument("--symbol", default="ADAUSDT", help="Binance側の銘柄")
     p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
-    p_dex.add_argument("--out", default="dex.jsonl")
-    p_dex.add_argument("--duration", type=float, default=43200.0, help="録画秒数")
-    p_dex.add_argument("--max-events", type=int, default=None)
-    p_dex.add_argument("--binance-depth-ms", type=int, default=100, choices=(100, 250, 500))
-    dex_s3 = p_dex.add_argument_group("S3")
-    dex_s3.add_argument("--s3-bucket", default=None)
-    dex_s3.add_argument("--s3-prefix", default="raw/dex")
-    dex_s3.add_argument("--rotate-minutes", type=float, default=5.0)
-    dex_s3.add_argument("--keep-local", action="store_true")
+    add_lead_capture_args(p_dex, prefix="dex")
     p_dex.set_defaults(func=cmd_dexcapture)
+
+    p_gmo = sub.add_parser(
+        "gmocapture", help="GMOコインの板とBinanceの板（先行市場）を同時に記録する"
+    )
+    p_gmo.add_argument(
+        "--symbol", default="XRP_JPY", help="GMO側の銘柄。レバレッジは XRP_JPY、現物は XRP"
+    )
+    p_gmo.add_argument(
+        "--lead-symbol", default=None, help="Binance先物側の銘柄。既定は XRP_JPY → XRPUSDT"
+    )
+    add_lead_capture_args(p_gmo, prefix="gmo")
+    p_gmo.set_defaults(func=cmd_gmocapture)
 
     p_xarb = sub.add_parser("xarb", help="Binance/Bybit価格差を実板・往復費用込みで再生する")
     p_xarb.add_argument("path", help="xcaptureで作った.jsonl")

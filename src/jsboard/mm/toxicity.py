@@ -24,6 +24,7 @@ read as a move.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from ..core.market import MarketView
@@ -123,7 +124,13 @@ class ToxicityGate:
         lead = self.lead.estimate(market)
         if not mid or lead is None:
             return None
-        raw = (lead - mid) / mid * 1e4
+        if lead <= 0:
+            return None
+        # A log ratio, not a difference over our mid: the lead may be priced
+        # in another currency (dollars against yen), and a difference would
+        # shrink every move on it by the exchange rate. As a ratio the rate is
+        # a standing offset, which the basis below absorbs.
+        raw = math.log(lead / mid) * 1e4
         now = int(market.clock())
         if self._basis_bps is None:
             self._basis_bps, self._basis_ns = raw, now
