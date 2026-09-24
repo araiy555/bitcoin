@@ -27,6 +27,10 @@ class TestSpec:
         assert inst.lot_size == Decimal("1")
         assert (inst.base, inst.quote) == ("XRP", "JPY")
 
+    def test_a_whole_number_step_prints_as_one(self):
+        inst = instrument_from_rule({**RULE, "sizeStep": "10"})
+        assert str(inst.lot_size) == "10"
+
     def test_timestamps_are_utc(self):
         assert ts_ns("2026-09-24T00:00:00.500Z") == 1_790_208_000_500_000_000
 

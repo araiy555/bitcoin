@@ -41,14 +41,20 @@ def ts_ns(text: str | None) -> int:
     return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1e9)
 
 
+def _step(text) -> Decimal:
+    """`"10"` stays `10`; `normalize()` alone would print it as `1E+1`."""
+    value = Decimal(str(text)).normalize()
+    return value.quantize(Decimal(1)) if value == value.to_integral() else value
+
+
 def instrument_from_rule(rule: dict) -> Instrument:
     """One row of `/public/v1/symbols`."""
     symbol = rule["symbol"]
     base, _, quote = symbol.partition("_")
     return Instrument(
         symbol=symbol,
-        tick_size=Decimal(str(rule["tickSize"])).normalize(),
-        lot_size=Decimal(str(rule["sizeStep"])).normalize(),
+        tick_size=_step(rule["tickSize"]),
+        lot_size=_step(rule["sizeStep"]),
         base=base,
         quote=quote or "JPY",
     )
