@@ -267,3 +267,54 @@ class TestLeadVenue:
         quotes = mm.requote(force=True)
         assert quotes.bids and quotes.asks == ()
         assert mm.summary()["toxicity"]["lead_share"] > 0
+
+
+class TestInventoryAge:
+    """No closing bell in crypto: age stands in for it."""
+
+    def aged_maker(self, lots, age_s, limit_s=30.0):
+        from jsboard.mm.strategy import StrategyConfig
+
+        market = market_with(500, 500)  # bid 100 / ask 102
+        clock = Clock()
+        market.clock = clock
+        mm = maker(market, gate(threshold=0.0))
+        mm.config = StrategyConfig(max_inventory_age_s=limit_s)
+        mm.clock = clock
+        market.last_update_ns = clock.now
+        mm.position.lots = lots
+        mm._track_inventory_age()
+        clock.now += int(age_s * 1e9)
+        market.last_update_ns = clock.now
+        return mm
+
+    def test_fresh_inventory_quotes_both_sides(self):
+        mm = self.aged_maker(lots=50, age_s=5)
+        quotes = mm.requote(force=True)
+        assert quotes.bids and quotes.asks
+
+    def test_stale_long_only_offers_inside_the_touch(self):
+        mm = self.aged_maker(lots=50, age_s=60)
+        quotes = mm.requote(force=True)
+        assert quotes.bids == ()
+        [ask] = quotes.asks
+        assert ask.price == 101  # one tick inside the 102 offer
+        assert ask.qty == 10  # base size, not the whole position at once
+        assert mm.summary()["toxicity"]["unwind_share"] > 0
+
+    def test_stale_short_only_bids_inside_the_touch(self):
+        mm = self.aged_maker(lots=-50, age_s=60)
+        quotes = mm.requote(force=True)
+        assert quotes.asks == ()
+        assert quotes.bids[0].price == 101
+
+    def test_disabled_by_default(self):
+        mm = self.aged_maker(lots=50, age_s=600, limit_s=0.0)
+        quotes = mm.requote(force=True)
+        assert quotes.bids and quotes.asks
+
+    def test_going_flat_resets_the_clock(self):
+        mm = self.aged_maker(lots=50, age_s=60)
+        mm.position.lots = 0
+        mm._track_inventory_age()
+        assert not mm._inventory_is_stale()

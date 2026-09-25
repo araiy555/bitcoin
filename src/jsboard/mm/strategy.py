@@ -39,6 +39,17 @@ class StrategyConfig:
     max_orders_per_cycle: int = 12
     """Backstop against a pathological cycle flooding the venue."""
 
+    max_inventory_age_s: float = 0.0
+    """Once a same-signed position has been held this long, stop adding to it
+    and put the reducing quote one tick inside the touch. Zero disables it.
+
+    Quoting both sides earns the spread only while inventory turns over. Held
+    for minutes it stops being a maker's position and becomes a bet on the
+    coin's direction — which on a short recording decides the whole result.
+    This is the crypto version of the stock rule "close before the bell":
+    there is no bell, so age stands in for it, and the exit is passive
+    because crossing to exit costs a taker fee."""
+
 
 @dataclass(slots=True)
 class StrategyStats:
@@ -64,6 +75,7 @@ class StrategyStats:
     toxicity_bid_blocks: int = 0
     toxicity_ask_blocks: int = 0
     last_toxicity_score: float = 0.0
+    unwind_cycles: int = 0
 
     @property
     def mean_queue_ahead_ratio(self) -> float:
@@ -92,6 +104,8 @@ class MarketMaker:
     last_decision: RiskDecision | None = None
     last_toxicity: ToxicityDecision | None = None
     recent_fills: list[Fill] = field(default_factory=list)
+    _inventory_since_ns: int | None = field(default=None, init=False)
+    _inventory_sign: int = field(default=0, init=False)
     quote_filter: Callable[[QuoteSet], QuoteSet] | None = None
     """Optional final gate applied before orders reach the venue.
 
@@ -182,9 +196,51 @@ class MarketMaker:
                     mid_ticks=mid,
                     now_ns=self._data_time_ns,
                 )
+        self._track_inventory_age()
         self.stats.fills += len(fills)
         self.recent_fills.extend(fills)
         del self.recent_fills[:-100]
+
+    def _track_inventory_age(self) -> None:
+        """Restart the clock whenever the position goes flat or flips side."""
+        lots = self.position.lots
+        sign = (lots > 0) - (lots < 0)
+        if sign == 0:
+            self._inventory_since_ns = None
+        elif sign != self._inventory_sign or self._inventory_since_ns is None:
+            self._inventory_since_ns = self._data_time_ns or self.clock()
+        self._inventory_sign = sign
+
+    def _inventory_is_stale(self) -> bool:
+        limit = self.config.max_inventory_age_s
+        since = self._inventory_since_ns
+        if limit <= 0 or since is None or self.position.lots == 0:
+            return False
+        now = self._data_time_ns or self.clock()
+        return (now - since) >= limit * 1e9
+
+    def _unwind_quotes(self, desired: QuoteSet) -> QuoteSet:
+        """Only the side that reduces the position, one tick inside the touch."""
+        best_bid, best_ask = self.market.book.best_bid(), self.market.book.best_ask()
+        if best_bid is None or best_ask is None:
+            return desired
+        lots = self.position.lots
+        qty = min(abs(lots), max(1, self.quoter.config.base_size_lots))
+        if lots > 0:
+            price = max(best_ask - 1, best_bid + 1)
+            bids, asks = (), (Quote(Side.SELL, price, qty),)
+        else:
+            price = min(best_bid + 1, best_ask - 1)
+            bids, asks = (Quote(Side.BUY, price, qty),), ()
+        self.stats.unwind_cycles += 1
+        return QuoteSet(
+            bids=bids,
+            asks=asks,
+            fair_value=desired.fair_value,
+            reservation=desired.reservation,
+            half_spread=desired.half_spread,
+            reason="inventory held too long; unwinding",
+        )
 
     # -------------------------------------------------------------- quoting
 
@@ -258,6 +314,10 @@ class MarketMaker:
                 reason="; ".join(reasons),
             )
             self.stats.last_decision = f"ONE_SIDED: {desired.reason}"
+
+        if self._inventory_is_stale():
+            desired = self._unwind_quotes(desired)
+            self.stats.last_decision = f"UNWIND: {desired.reason}"
 
         if self.quote_filter is not None:
             desired = self.quote_filter(desired)
@@ -359,6 +419,7 @@ class MarketMaker:
             "bid_block_share": self.stats.toxicity_bid_blocks / tox_n if tox_n else 0.0,
             "ask_block_share": self.stats.toxicity_ask_blocks / tox_n if tox_n else 0.0,
             "lead_share": self.toxicity.lead_blocks / tox_n if tox_n else 0.0,
+            "unwind_share": self.stats.unwind_cycles / tox_n if tox_n else 0.0,
         }
         out.update(
             {
