@@ -132,3 +132,5 @@ async def test_sweep_quotes_gmo_while_watching_binance(tmp_path, capsys):
     assert await args.func(args) == 0
     out = capsys.readouterr().out
     assert "XRP_JPY" in out and "2 通り" in out
+    # The day's drift is kept out of one column, so skill can be read apart from luck.
+    assert "10秒内計" in out

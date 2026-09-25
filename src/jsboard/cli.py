@@ -1124,7 +1124,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
     bps = mm.attribution.per_round_trip_bps(matched)
     a = s.get("attribution") or {}
     tox = s.get("toxicity") or {}
-    return {
+    row = {
         "fills": int(s["fills"]),
         "capture_bps": capture,
         "net_bps": capture - 2.0 * mm.position.fees.maker_bps,
@@ -1156,6 +1156,17 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
             for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
         },
     }
+    # What the quoting earned before the price had time to wander: spread plus
+    # inventory held under ten seconds, plus fees. Over a few hours the 10s+
+    # term is the day's trend, not skill — on a recording where the coin rose
+    # it turns a losing quoter into the best row, so it is kept out of here.
+    buckets = [row.get(f"age_{i}", math.nan) for i in range(3)]
+    row["short_bps"] = (
+        row["spread_bps"] + sum(buckets) + row["fee_bps"]
+        if not any(math.isnan(v) for v in (row["spread_bps"], row["fee_bps"], *buckets))
+        else math.nan
+    )
+    return row
 
 
 async def _run_combos(
@@ -1272,6 +1283,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("100ms-1s", "age_1", "{:+.2f}"),
         ("1-10s", "age_2", "{:+.2f}"),
         ("10s+", "age_3", "{:+.2f}"),
+        ("10秒内計", "short_bps", "{:+.2f}"),
         ("許容料率", "max_maker_bps", "{:+.2f}"),
         ("飛越%", "gap_share", "{:.0f}"),
         ("毒性片側%", "tox_one_sided_pct", "{:.0f}"),
