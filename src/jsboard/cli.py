@@ -2688,6 +2688,7 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
         bitbank_books,
         gmo_books,
         ranked,
+        slack_text,
     )
 
     timeout = aiohttp.ClientTimeout(total=15)
@@ -2760,6 +2761,26 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
             )
         )
         console.print(f"  保存: {out}")
+
+    if args.slack:
+        # The webhook is a credential: it comes from the environment (a CI
+        # secret), never from the command line where it would land in logs.
+        import os
+
+        url = os.environ.get("SLACK_WEBHOOK_URL")
+        if not url:
+            console.print("[red]--slack には環境変数 SLACK_WEBHOOK_URL が必要です。[/red]")
+            return 1
+        taken = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+        try:
+            async with make_session() as session, session.post(
+                url, json={"text": slack_text(books, taken)}, timeout=timeout
+            ) as resp:
+                resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Slack への送信に失敗しました: {type(exc).__name__}[/red]")
+            return 1
+        console.print("  Slack に送信しました")
     return 0
 
 
@@ -5590,6 +5611,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_jp.add_argument("--all", action="store_true", help="候補以外も表示する")
     p_jp.add_argument(
         "--out", default=None, help="結果をJSONで保存（{date} は日付に置換）"
+    )
+    p_jp.add_argument(
+        "--slack", action="store_true", help="環境変数 SLACK_WEBHOOK_URL の宛先に結果を送る"
     )
     p_jp.set_defaults(func=cmd_jpscan)
 

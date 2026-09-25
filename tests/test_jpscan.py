@@ -73,3 +73,59 @@ def test_a_thin_book_is_flagged():
 def test_candidates_rank_first():
     order = [f"{b.venue} {b.symbol}" for b in ranked(list(books().values()))]
     assert order[0] == "bitbank ada_jpy"
+
+
+def test_the_slack_message_leads_with_candidates_and_says_why_others_fell_out():
+    from jsboard.research.jpscan import slack_text
+
+    text = slack_text(ranked(list(books().values())), "2026-09-25 09:00")
+    lines = text.splitlines()
+    assert "候補 1 件" in lines[1]
+    assert "ada_jpy" in lines[2]
+    assert "狙われやすい 1" in text and "業者が詰めている 1" in text
+
+
+def test_a_day_without_candidates_says_so():
+    from jsboard.research.jpscan import slack_text
+
+    gmo = gmo_books(GMO_SYMBOLS)
+    add_gmo_tickers(gmo, GMO_TICKERS)
+    assert "条件を満たす銘柄がありません" in slack_text(list(gmo.values()), "x")
+
+
+def test_slack_without_a_webhook_refuses(monkeypatch, capsys):
+    import asyncio
+
+    import jsboard.cli as cli
+
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+
+    class Resp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        async def json(self):
+            return {"data": {"pairs": []}} if "pairs" in self.url else {"data": []}
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, url, timeout=None):
+            r = Resp()
+            r.url = url
+            return r
+
+    monkeypatch.setattr(cli, "make_session", lambda **kw: Session())
+    args = cli.build_parser().parse_args(["jpscan", "--samples", "1", "--slack"])
+    assert asyncio.run(args.func(args)) == 1
+    assert "SLACK_WEBHOOK_URL" in capsys.readouterr().out

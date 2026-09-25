@@ -1,0 +1,51 @@
+# Daily screen of Japanese exchange books for the shape that paid on bitbank
+# ADA, posted to Slack. The webhook lives in the repository secret
+# SLACK_WEBHOOK_URL and never appears in this file or in the logs.
+name: jpscan
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 09:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Screen and post
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: jsboard jpscan --all --out "jpscan/{date}.json" --slack
+
+      - name: Keep the day's numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jpscan-${{ github.run_id }}
+          path: jpscan/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Say so when it breaks
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$SLACK_WEBHOOK_URL" ] || exit 0
+          python -c 'import json, os; print(json.dumps({"text": "jpscan が失敗しました: " + os.environ["RUN_URL"]}))' \
+            | curl -sS -X POST -H "Content-Type: application/json" --data @- "$SLACK_WEBHOOK_URL"

@@ -147,3 +147,24 @@ def as_record(book: Book) -> dict:
         "volume_jpy": round(book.volume_jpy),
         "verdict": book.verdict(),
     }
+
+
+def slack_text(books: list[Book], taken_at: str, limit: int = 10) -> str:
+    """The day's screen as a Slack message: candidates, then why the rest fell out."""
+    from collections import Counter
+
+    candidates = [b for b in books if b.verdict() == "候補"]
+    lines = [f"*国内取引所スキャン {taken_at}*", f"候補 {len(candidates)} 件 / 全 {len(books)} 銘柄"]
+    for b in candidates[:limit]:
+        lines.append(
+            f"• {b.venue} `{b.symbol}`  spread {b.spread_bps:.2f}bps  "
+            f"リベート {b.rebate_bps:+.1f}  成行 {b.taker_bps:.1f}  "
+            f"取り分/片道 {b.edge_bps:+.2f}  出来高 {b.volume_jpy / 1e8:,.1f}億円"
+        )
+    if not candidates:
+        lines.append("今日は条件を満たす銘柄がありません。")
+    reasons = Counter(b.verdict() for b in books if b.verdict() != "候補")
+    if reasons:
+        lines.append("除外: " + " / ".join(f"{k} {v}" for k, v in reasons.most_common()))
+    lines.append("_候補は録画して検証するまで勝てるとは言えません。_")
+    return "\n".join(lines)
