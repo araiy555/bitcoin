@@ -2674,6 +2674,95 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
     )
 
 
+async def cmd_jpscan(args: argparse.Namespace) -> int:
+    """Rank Japanese exchange books by the shape that paid on bitbank ADA."""
+    import asyncio as _asyncio
+    from datetime import UTC, datetime
+
+    import aiohttp
+
+    from .research.jpscan import (
+        add_bitbank_tickers,
+        add_gmo_tickers,
+        as_record,
+        bitbank_books,
+        gmo_books,
+        ranked,
+    )
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    console.print(
+        f"[dim]bitbank と GMOコインの全銘柄を {args.samples} 回"
+        f"（{args.interval:g}秒間隔）観測します…[/dim]"
+    )
+    try:
+        async with make_session() as session:
+            async def get(url: str) -> dict:
+                async with session.get(url, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+
+            bb = bitbank_books(await get("https://api.bitbank.cc/v1/spot/pairs"))
+            gmo = gmo_books(await get("https://api.coin.z.com/public/v1/symbols"))
+            for n in range(args.samples):
+                add_bitbank_tickers(bb, await get("https://public.bitbank.cc/tickers"))
+                add_gmo_tickers(gmo, await get("https://api.coin.z.com/public/v1/ticker"))
+                if n + 1 < args.samples:
+                    await _asyncio.sleep(args.interval)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]取得に失敗しました: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+
+    books = ranked([*bb.values(), *gmo.values()])
+    shown = [b for b in books if b.verdict() == "候補"] if not args.all else books
+
+    table = Table(box=None, header_style="bold dim", padding=(0, 1))
+    for title, justify in (
+        ("取引所", "left"), ("銘柄", "left"), ("spread", "right"), ("リベート", "right"),
+        ("成行手数料", "right"), ("取り分/片道", "right"), ("24h出来高(円)", "right"),
+        ("判定", "left"),
+    ):
+        table.add_column(title, justify=justify)
+    for b in shown[: args.top]:
+        style = "green" if b.verdict() == "候補" else "dim"
+        table.add_row(
+            b.venue,
+            b.symbol,
+            f"{b.spread_bps:.2f}",
+            f"{b.rebate_bps:+.2f}",
+            f"{b.taker_bps:.1f}",
+            f"{b.edge_bps:+.2f}",
+            f"{b.volume_jpy:,.0f}",
+            f"[{style}]{b.verdict()}[/{style}]",
+        )
+    console.rule("[bold cyan]bitbank ADA と同じ形の銘柄")
+    console.print(table)
+    candidates = sum(b.verdict() == "候補" for b in books)
+    console.print(
+        f"\n  {len(books)} 銘柄中 候補 [bold]{candidates}[/bold] 件"
+        "  （bps。取り分 = スプレッドの半分 + リベート。狙われる損は引く前の数字）\n"
+        "  [dim]候補は録画して検証するまで勝てるとは言えません。"
+        "判定の基準は research/jpscan.py の冒頭にあります。[/dim]"
+    )
+
+    if args.out:
+        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out = Path(args.out.replace("{date}", stamp[:10]))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {"taken_at": stamp, "books": [as_record(b) for b in books]},
+                ensure_ascii=False,
+                indent=1,
+            )
+        )
+        console.print(f"  保存: {out}")
+    return 0
+
+
 async def cmd_bbcapture(args: argparse.Namespace) -> int:
     """A bitbank book, with Binance's perp beside it as the lead market.
 
@@ -5493,6 +5582,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
     add_lead_capture_args(p_dex, prefix="dex")
     p_dex.set_defaults(func=cmd_dexcapture)
+
+    p_jp = sub.add_parser("jpscan", help="国内取引所で bitbank ADA と同じ形の銘柄を探す")
+    p_jp.add_argument("--samples", type=int, default=10, help="観測回数")
+    p_jp.add_argument("--interval", type=float, default=3.0, help="観測の間隔（秒）")
+    p_jp.add_argument("--top", type=int, default=30)
+    p_jp.add_argument("--all", action="store_true", help="候補以外も表示する")
+    p_jp.add_argument(
+        "--out", default=None, help="結果をJSONで保存（{date} は日付に置換）"
+    )
+    p_jp.set_defaults(func=cmd_jpscan)
 
     p_bb = sub.add_parser(
         "bbcapture", help="bitbankの板とBinanceの板（先行市場）を同時に記録する"
