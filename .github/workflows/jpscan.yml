@@ -29,7 +29,9 @@ jobs:
       - name: Screen and post
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: jsboard jpscan --all --out "jpscan/{date}.json" --slack
+        # Ten minutes of samples: one moment of a book is noise (GMO spot XRP
+        # read 9.95bps and 1.22bps twenty minutes apart).
+        run: jsboard jpscan --all --samples 60 --interval 10 --out "jpscan/{date}.json" --slack
 
       - name: Keep the day's numbers
         if: always()
