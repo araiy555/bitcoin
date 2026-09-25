@@ -2657,6 +2657,42 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
     )
 
 
+async def cmd_bbcapture(args: argparse.Namespace) -> int:
+    """A bitbank book, with Binance's perp beside it as the lead market.
+
+    bitbank charges takers 0.12% and pays makers 0.02%, so picking off a stale
+    quote costs more than most of the moves that would make it stale — the
+    opposite of GMO's fee-free leverage book, where that is what lost.
+    """
+    from .feed.bitbank import BitbankFeed
+    from .feed.bitbank import fetch_instrument as fetch_bb_instrument
+
+    pair = args.pair.lower()
+    lead_symbol = (args.lead_symbol or pair.split("_")[0].upper() + "USDT").upper()
+    try:
+        bb = await fetch_bb_instrument(pair)
+        binance = await fetch_futures_instrument(lead_symbol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        hint = describe_tls_error(exc)
+        if hint:
+            console.print(f"[yellow]{hint}[/yellow]")
+        return 1
+    return await _record_with_lead(
+        args,
+        title=f"{pair} bitbank + Binance {lead_symbol} 録画",
+        folder_symbol=pair.upper(),
+        sources={
+            "bitbank": BitbankFeed(bb),
+            "binance": _binance_lead(binance, args.binance_depth_ms),
+        },
+        specs={
+            "bitbank": {**_spec_dict(bb, "spot"), "venue": "bitbank"},
+            "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+        },
+    )
+
+
 async def cmd_gmocapture(args: argparse.Namespace) -> int:
     """A GMO Coin book, with Binance's perp beside it as the lead market.
 
@@ -5431,6 +5467,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
     add_lead_capture_args(p_dex, prefix="dex")
     p_dex.set_defaults(func=cmd_dexcapture)
+
+    p_bb = sub.add_parser(
+        "bbcapture", help="bitbankの板とBinanceの板（先行市場）を同時に記録する"
+    )
+    p_bb.add_argument("--pair", default="ada_jpy", help="bitbank側の銘柄（例: ada_jpy）")
+    p_bb.add_argument(
+        "--lead-symbol", default=None, help="Binance先物側の銘柄。既定は ada_jpy → ADAUSDT"
+    )
+    add_lead_capture_args(p_bb, prefix="bitbank")
+    p_bb.set_defaults(func=cmd_bbcapture)
 
     p_gmo = sub.add_parser(
         "gmocapture", help="GMOコインの板とBinanceの板（先行市場）を同時に記録する"
