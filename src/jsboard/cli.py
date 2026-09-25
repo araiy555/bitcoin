@@ -2724,7 +2724,7 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
     for title, justify in (
         ("取引所", "left"), ("銘柄", "left"), ("spread", "right"), ("リベート", "right"),
         ("成行手数料", "right"), ("取り分/片道", "right"), ("24h出来高(円)", "right"),
-        ("判定", "left"),
+        ("規模", "right"), ("判定", "left"),
     ):
         table.add_column(title, justify=justify)
     for b in shown[: args.top]:
@@ -2737,6 +2737,7 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
             f"{b.taker_bps:.1f}",
             f"{b.edge_bps:+.2f}",
             f"{b.volume_jpy:,.0f}",
+            f"{b.scale:,.1f}",
             f"[{style}]{b.verdict()}[/{style}]",
         )
     console.rule("[bold cyan]bitbank ADA と同じ形の銘柄")
@@ -2744,7 +2745,8 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
     candidates = sum(b.verdict() == "候補" for b in books)
     console.print(
         f"\n  {len(books)} 銘柄中 候補 [bold]{candidates}[/bold] 件"
-        "  （bps。取り分 = スプレッドの半分 + リベート。狙われる損は引く前の数字）\n"
+        "  （bps。取り分 = スプレッドの半分 + リベート。狙われる損は引く前の数字。"
+        "規模 = 取り分 × 出来高(億円)、この順に並べています）\n"
         "  [dim]候補は録画して検証するまで勝てるとは言えません。"
         "判定の基準は research/jpscan.py の冒頭にあります。[/dim]"
     )

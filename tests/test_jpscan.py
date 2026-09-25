@@ -27,10 +27,12 @@ BB_TICKERS = {"data": [
 ]}
 GMO_SYMBOLS = {"data": [
     {"symbol": "XRP_JPY", "makerFee": "0", "takerFee": "0"},
+    {"symbol": "SOL_JPY", "makerFee": "0", "takerFee": "0.0003"},
     {"symbol": "ADA", "makerFee": "-0.0003", "takerFee": "0.0009"},
 ]}
 GMO_TICKERS = {"data": [
     {"symbol": "XRP_JPY", "bid": "241.40", "ask": "241.57", "last": "241.5", "volume": "20000000"},
+    {"symbol": "SOL_JPY", "bid": "30000", "ask": "30030", "last": "30010", "volume": "20000"},
     {"symbol": "ADA", "bid": "36.95", "ask": "37.01", "last": "37.0", "volume": "100000"},
 ]}
 
@@ -82,7 +84,7 @@ def test_the_slack_message_leads_with_candidates_and_says_why_others_fell_out():
     lines = text.splitlines()
     assert "候補 1 件" in lines[1]
     assert "ada_jpy" in lines[2]
-    assert "狙われやすい 1" in text and "業者が詰めている 1" in text
+    assert "狙われやすい 2" in text and "業者が詰めている 1" in text
 
 
 def test_a_day_without_candidates_says_so():
@@ -129,3 +131,18 @@ def test_slack_without_a_webhook_refuses(monkeypatch, capsys):
     args = cli.build_parser().parse_args(["jpscan", "--samples", "1", "--slack"])
     assert asyncio.run(args.func(args)) == 1
     assert "SLACK_WEBHOOK_URL" in capsys.readouterr().out
+
+
+def test_a_thin_toll_on_takers_is_still_too_thin():
+    # GMO's other leverage books charge takers 3bps: the XRP_JPY mechanism
+    # that lost, with a small fee on it.
+    assert books()["gmo SOL_JPY"].verdict() == "狙われやすい"
+
+
+def test_a_wide_spread_on_an_empty_book_does_not_outrank_a_busy_one():
+    from jsboard.research.jpscan import Book
+
+    busy = Book("bitbank", "busy", -2.0, 12.0, [5.0], volume_jpy=3e8)
+    empty = Book("gmo", "empty", -3.0, 9.0, [30.0], volume_jpy=0.6e8)
+    assert busy.edge_bps < empty.edge_bps
+    assert ranked([empty, busy])[0] is busy

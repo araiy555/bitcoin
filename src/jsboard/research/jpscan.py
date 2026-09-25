@@ -10,8 +10,11 @@ spread alone:
 * bitbank's ADA won: a few bps of spread, a maker rebate, and a 12bps taker
   fee that makes picking off a stale quote cost more than most moves.
 
-So a book is a candidate when all three hold, and is ranked by what a maker
-earns per side before being picked off: half the spread plus the rebate.
+So a book is a candidate when all three hold. Candidates are ranked by
+what a maker earns per side before being picked off (half the spread plus
+the rebate) times the day's volume: a wide spread on a book that barely
+trades is wide because nobody is there, and ranking by edge alone put
+exactly those first.
 That is a screen, not a result — adverse selection only shows up in a
 recorded replay, which is the second stage.
 """
@@ -21,8 +24,10 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass, field
 
-MIN_TAKER_BPS = 3.0
-"""Below this, stale quotes are picked off for free (GMO leverage)."""
+MIN_TAKER_BPS = 5.0
+"""Below this, stale quotes are picked off too cheaply. GMO's leverage XRP
+(0bps) lost; GMO's other leverage books charge 3bps, the same mechanism
+with a thin toll. 5bps is GMO spot, the lowest a tested book has had."""
 
 MIN_SPREAD_BPS = 1.0
 """Below this, the rebate has already been competed away (bitbank XRP)."""
@@ -53,6 +58,11 @@ class Book:
     def edge_bps(self) -> float:
         """Per side, before adverse selection: half the spread plus the rebate."""
         return self.spread_bps / 2.0 + self.rebate_bps
+
+    @property
+    def scale(self) -> float:
+        """Edge times the day's volume, in bps × 100M yen: size of the prize."""
+        return self.edge_bps * self.volume_jpy / 1e8
 
     def verdict(self) -> str:
         if not self.spreads_bps:
@@ -128,10 +138,11 @@ def add_gmo_tickers(books: dict[str, Book], payload: dict) -> None:
 
 
 def ranked(books: list[Book]) -> list[Book]:
-    """Candidates first by edge, then everything else by volume."""
+    """Candidates first by edge × volume, then everything else by volume."""
+
     def key(book: Book) -> tuple[bool, float]:
         candidate = book.verdict() == "候補"
-        return (not candidate, -(book.edge_bps if candidate else book.volume_jpy))
+        return (not candidate, -(book.scale if candidate else book.volume_jpy))
 
     return sorted(books, key=key)
 
@@ -144,6 +155,7 @@ def as_record(book: Book) -> dict:
         "rebate_bps": round(book.rebate_bps, 3),
         "taker_bps": round(book.taker_bps, 3),
         "edge_bps": round(book.edge_bps, 3),
+        "scale": round(book.scale, 3),
         "volume_jpy": round(book.volume_jpy),
         "verdict": book.verdict(),
     }
@@ -159,12 +171,13 @@ def slack_text(books: list[Book], taken_at: str, limit: int = 10) -> str:
         lines.append(
             f"• {b.venue} `{b.symbol}`  spread {b.spread_bps:.2f}bps  "
             f"リベート {b.rebate_bps:+.1f}  成行 {b.taker_bps:.1f}  "
-            f"取り分/片道 {b.edge_bps:+.2f}  出来高 {b.volume_jpy / 1e8:,.1f}億円"
+            f"取り分/片道 {b.edge_bps:+.2f}  出来高 {b.volume_jpy / 1e8:,.1f}億円  "
+            f"規模 {b.scale:,.1f}"
         )
     if not candidates:
         lines.append("今日は条件を満たす銘柄がありません。")
     reasons = Counter(b.verdict() for b in books if b.verdict() != "候補")
     if reasons:
         lines.append("除外: " + " / ".join(f"{k} {v}" for k, v in reasons.most_common()))
-    lines.append("_候補は録画して検証するまで勝てるとは言えません。_")
+    lines.append("_規模 = 取り分 × 出来高(億円)。候補は録画して検証するまで勝てるとは言えません。_")
     return "\n".join(lines)
