@@ -2,7 +2,6 @@
 
 import gzip
 import json
-import math
 from decimal import Decimal
 
 import pytest
