@@ -549,3 +549,22 @@ class TestHalfInTheBucketHalfOnDisk:
 
         with pytest.raises(FileNotFoundError):
             open_text(tmp_path)
+
+
+class TestADaysFolder:
+    def test_a_day_reads_the_spec_written_for_the_symbol(self):
+        from jsboard.sim.s3 import meta_uri
+
+        day = "s3://b/raw/live/symbol=ADA_JPY/date=2026-09-26/"
+        assert meta_uri(day) == "s3://b/raw/live/symbol=ADA_JPY/meta.json"
+
+    def test_an_hour_reads_it_too(self):
+        from jsboard.sim.s3 import meta_uri
+
+        hour = "s3://b/raw/live/symbol=ADA_JPY/date=2026-09-26/hour=03/"
+        assert meta_uri(hour) == "s3://b/raw/live/symbol=ADA_JPY/meta.json"
+
+    def test_the_symbol_folder_is_unchanged(self):
+        from jsboard.sim.s3 import meta_uri
+
+        assert meta_uri("s3://b/raw/symbol=X/") == "s3://b/raw/symbol=X/meta.json"

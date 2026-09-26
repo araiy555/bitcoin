@@ -286,6 +286,9 @@ def exists(uri: str | Path) -> bool:
 def meta_uri(uri: str | Path) -> str:
     """Where a recording's spec file sits, on either kind of location."""
     text = str(uri)
+    # A day's folder (…/symbol=X/date=YYYY-MM-DD/) shares the spec written
+    # once at the symbol level, beside every day of the recording.
+    text = re.sub(r"(/)date=[^/]+/(hour=[^/]+/)?$", r"\1", text)
     if is_prefix(text):
         return text + "meta.json"
     if not is_s3_uri(text) and Path(text).is_dir():

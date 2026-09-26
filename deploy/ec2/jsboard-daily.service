@@ -1,0 +1,10 @@
+[Unit]
+Description=jsboard: replay yesterday under fixed settings and post to Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+ExecStart=/opt/jsboard/venv/bin/jsboard daily --s3-bucket ${JSBOARD_BUCKET} --targets ${JSBOARD_TARGETS} --slack

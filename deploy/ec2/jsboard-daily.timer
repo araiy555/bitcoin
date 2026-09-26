@@ -1,0 +1,10 @@
+[Unit]
+Description=jsboard: daily replay at 09:20 JST
+
+[Timer]
+# The server clock is UTC; the report covers the UTC day that just ended.
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

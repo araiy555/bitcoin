@@ -1,0 +1,15 @@
+[Unit]
+Description=jsboard: record %i with Binance as the lead market
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+StateDirectory=jsboard
+ExecStart=/opt/jsboard/capture.sh %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

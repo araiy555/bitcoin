@@ -2674,6 +2674,104 @@ async def cmd_dexcapture(args: argparse.Namespace) -> int:
     )
 
 
+def _first_mid(path, source: str, instrument: Instrument) -> float:
+    """The first two-sided price the recording shows for one venue."""
+    for src, event in iter_tagged(path):
+        if src == source and isinstance(event, DepthSnapshot) and event.bids and event.asks:
+            return (event.bids[0][0] + event.asks[0][0]) / 2 * float(instrument.tick_size)
+    raise RuntimeError(f"{source} の板が録画にありません")
+
+
+async def cmd_daily(args: argparse.Namespace) -> int:
+    """Replay yesterday's live recording of each book under fixed settings."""
+    from datetime import UTC, datetime, timedelta
+
+    from .research.daily import (
+        FIXED_FLAGS,
+        MAKER_BPS,
+        DayResult,
+        Target,
+        day_folder,
+        size_for,
+        slack_text,
+    )
+    from .sim.s3 import default_client, exists, read_bytes
+
+    date = args.date or (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        targets = [Target.parse(t.strip()) for t in args.targets.split(",") if t.strip()]
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    results: list[DayResult] = []
+    for target in targets:
+        path = day_folder(args.s3_bucket, args.s3_prefix, target, date)
+        if not exists(path):
+            results.append(DayResult(target, note="録画なし"))
+            continue
+        console.print(f"[dim]{target.label} {date} を再生中…[/dim]")
+        try:
+            base = ["sweep", path, "--source", target.venue, "--lead-source", "binance"]
+            instrument = _instrument_for_recording(path, build_parser().parse_args(base))
+            size = size_for(args.order_jpy, _first_mid(path, target.venue, instrument),
+                            instrument.lot_size)
+            run_args = build_parser().parse_args([
+                *base, *FIXED_FLAGS, f"--maker-bps={MAKER_BPS[target.venue]}",
+                "--size", size, "--max-position", str(Decimal(size) * 10),
+            ])
+            rows = await _run_combos(instrument, run_args, [], [()], path, quiet=True)
+        except Exception as exc:  # noqa: BLE001 - one bad book must not hide the others
+            results.append(DayResult(target, note=f"検証に失敗: {type(exc).__name__}: {exc}"))
+            continue
+        if not rows:
+            results.append(DayResult(target, note="注文を出せる設定になりませんでした"))
+            continue
+        row = rows[0]
+        results.append(
+            DayResult(
+                target,
+                fills=row["fills"],
+                short_bps=row["short_bps"],
+                after_fees_bps=row["attributed_bps"],
+            )
+        )
+
+    reports = f"s3://{args.s3_bucket}/{args.reports_prefix.strip('/')}"
+    history = []
+    for back in range(1, 8):
+        day = (datetime.fromisoformat(date) - timedelta(days=back)).strftime("%Y-%m-%d")
+        uri = f"{reports}/{day}.json"
+        if exists(uri):
+            history.append(json.loads(read_bytes(uri)))
+
+    text = slack_text(date, results, history)
+    console.print(text)
+    report = {"date": date, "results": [r.record() for r in results]}
+    bucket, _, key = f"{reports}/{date}.json"[len("s3://"):].partition("/")
+    default_client().put_object(
+        Bucket=bucket, Key=key, Body=json.dumps(report, ensure_ascii=False).encode()
+    )
+
+    if args.slack:
+        import os
+
+        url = os.environ.get("SLACK_WEBHOOK_URL")
+        if not url:
+            console.print("[red]--slack には環境変数 SLACK_WEBHOOK_URL が必要です。[/red]")
+            return 1
+        import aiohttp
+
+        try:
+            async with make_session() as session, session.post(
+                url, json={"text": text}, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Slack への送信に失敗しました: {type(exc).__name__}[/red]")
+            return 1
+    return 0
+
+
 async def cmd_jpscan(args: argparse.Namespace) -> int:
     """Rank Japanese exchange books by the shape that paid on bitbank ADA."""
     import asyncio as _asyncio
@@ -5605,6 +5703,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
     add_lead_capture_args(p_dex, prefix="dex")
     p_dex.set_defaults(func=cmd_dexcapture)
+
+    p_daily = sub.add_parser("daily", help="前日の録画を固定設定で検証し、Slackに送る")
+    p_daily.add_argument(
+        "--targets", default="bitbank:ada_jpy", help="取引所:銘柄 をカンマ区切りで"
+    )
+    p_daily.add_argument("--date", default=None, help="UTCの日付 YYYY-MM-DD。既定は前日")
+    p_daily.add_argument("--order-jpy", type=float, default=10_000.0, help="1回の注文金額（円）")
+    p_daily.add_argument("--s3-bucket", required=True)
+    p_daily.add_argument("--s3-prefix", default="raw/live", help="録画の置き場所")
+    p_daily.add_argument("--reports-prefix", default="reports/daily", help="日次結果の置き場所")
+    p_daily.add_argument("--slack", action="store_true")
+    p_daily.set_defaults(func=cmd_daily)
 
     p_jp = sub.add_parser("jpscan", help="国内取引所で bitbank ADA と同じ形の銘柄を探す")
     p_jp.add_argument("--samples", type=int, default=10, help="観測回数")
