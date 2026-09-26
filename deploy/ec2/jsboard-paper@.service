@@ -1,0 +1,14 @@
+[Unit]
+Description=jsboard: paper-trade %i on the live book (no orders are sent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+ExecStart=/opt/jsboard/venv/bin/jsboard paper --target %i --slack --log-every 300
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

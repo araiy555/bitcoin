@@ -2772,6 +2772,146 @@ async def cmd_daily(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _post_slack(text: str) -> bool:
+    """Send `text` to the webhook in SLACK_WEBHOOK_URL; False if unset or refused."""
+    import os
+
+    import aiohttp
+
+    url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not url:
+        return False
+    try:
+        async with make_session() as session, session.post(
+            url, json={"text": text}, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - a failed post must not stop trading
+        console.print(f"[yellow]Slack への送信に失敗しました: {type(exc).__name__}[/yellow]")
+        return False
+    return True
+
+
+async def _live_book(target):
+    """The instrument and live feed for a `venue:symbol` target."""
+    if target.venue == "bitbank":
+        from .feed.bitbank import BitbankFeed
+        from .feed.bitbank import fetch_instrument as fetch_bb
+
+        instrument = await fetch_bb(target.symbol)
+        return instrument, BitbankFeed(instrument)
+    from .feed.gmo import GmoFeed
+    from .feed.gmo import fetch_instrument as fetch_gmo
+
+    instrument = await fetch_gmo(target.symbol)
+    return instrument, GmoFeed(instrument)
+
+
+async def cmd_paper(args: argparse.Namespace) -> int:
+    """Run the fixed-setting maker on a live book with simulated fills.
+
+    The same settings the morning replay uses, the same lead gate on
+    Binance, the same paper venue — but on the live feed, around the clock,
+    so each day's result is observed rather than replayed. No order leaves
+    this process.
+    """
+    import asyncio as _asyncio
+    from datetime import UTC, datetime
+
+    from .mm.papertrade import DailyTally
+    from .mm.papertrade import slack_text as paper_slack_text
+    from .research.daily import FIXED_FLAGS, MAKER_BPS, Target, size_for
+
+    try:
+        target = Target.parse(args.target)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    try:
+        instrument, feed = await _live_book(target)
+        lead_inst = await fetch_futures_instrument(
+            (args.lead_symbol or f"{instrument.base}USDT").upper()
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]銘柄仕様を取得できません: {type(exc).__name__}: {exc}[/red]")
+        return 1
+
+    # The order size is set in yen, so the first two-sided book fixes it.
+    stream = feed.stream()
+    buffered = []
+    price = None
+    async for event in stream:
+        buffered.append(event)
+        if isinstance(event, DepthSnapshot) and event.bids and event.asks:
+            price = (event.bids[0][0] + event.asks[0][0]) / 2 * float(instrument.tick_size)
+            break
+    if price is None:
+        console.print("[red]板を受け取れませんでした。[/red]")
+        return 1
+    size = size_for(args.order_jpy, price, instrument.lot_size)
+    run_args = build_parser().parse_args([
+        "sweep", "-", "--source", target.venue, *FIXED_FLAGS,
+        f"--maker-bps={MAKER_BPS[target.venue]}",
+        "--size", size, "--max-position", str(Decimal(size) * 10),
+        "--max-drawdown", str(args.max_loss_jpy),
+    ])
+    mm = build_maker(instrument, run_args)
+    lead_view = MarketView(instrument=lead_inst, depth=20)
+    lead_view.clock = mm.market.clock
+    mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
+
+    async def pump_lead() -> None:
+        async for event in _binance_lead(lead_inst, 100).stream():
+            lead_view.apply(event)
+
+    async def events():
+        for event in buffered:
+            yield event
+        async for event in stream:
+            yield event
+
+    label = f"{target.venue} {target.symbol}"
+    console.rule(f"[bold cyan]紙上トレード {label}")
+    console.print(
+        f"  1回 {size} {instrument.base}（約 {args.order_jpy:,.0f} 円）"
+        f"  在庫上限 {Decimal(size) * 10} {instrument.base}"
+        f"  損失上限 {args.max_loss_jpy:,.0f} 円\n"
+        f"  先行市場: Binance {lead_inst.symbol}  注文は一切出しません"
+    )
+    def day() -> str:
+        return datetime.now(UTC).strftime("%Y-%m-%d")
+
+    tally = DailyTally(day())
+    lead_task = _asyncio.create_task(pump_lead())
+    last_log = time.monotonic()
+    reason = "feed ended"
+    try:
+        async for event in events():
+            mm.on_event(event)
+            mm.requote()
+            if time.monotonic() - last_log >= args.log_every:
+                last_log = time.monotonic()
+                s = mm.summary()
+                console.print(
+                    f"  損益 {s['total']:+,.0f} {instrument.quote}  約定 {int(s['fills']):,}"
+                    f"  在庫 {s['position']:+,.4g} {instrument.base}  {mm.stats.last_decision}"
+                )
+            report = tally.roll(day(), mm.summary())
+            if report is not None and args.slack:
+                await _post_slack(
+                    paper_slack_text(label, instrument.quote, instrument.base, report, mm.summary())
+                )
+            if mm.risk.halted:
+                reason = f"停止: {mm.risk.halt_reason}"
+                break
+    finally:
+        lead_task.cancel()
+        mm.flatten()
+    console.print(f"[yellow]{reason}[/yellow]")
+    if args.slack:
+        await _post_slack(f":octagonal_sign: 紙上トレード {label} が止まりました: {reason}")
+    return 1
+
+
 async def cmd_jpscan(args: argparse.Namespace) -> int:
     """Rank Japanese exchange books by the shape that paid on bitbank ADA."""
     import asyncio as _asyncio
@@ -5703,6 +5843,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_dex.add_argument("--coin", default=None, help="Hyperliquid側の銘柄。既定は--symbolから")
     add_lead_capture_args(p_dex, prefix="dex")
     p_dex.set_defaults(func=cmd_dexcapture)
+
+    p_paper = sub.add_parser("paper", help="本物の板で仮想の注文を出して24時間動かす（注文は出さない）")
+    p_paper.add_argument("--target", default="bitbank:ada_jpy", help="取引所:銘柄")
+    p_paper.add_argument("--lead-symbol", default=None, help="Binance先物の銘柄。既定は ADAUSDT など")
+    p_paper.add_argument("--order-jpy", type=float, default=10_000.0, help="1回の注文金額（円）")
+    p_paper.add_argument(
+        "--max-loss-jpy", type=float, default=3_000.0, help="この損失で止める（円）"
+    )
+    p_paper.add_argument("--log-every", type=float, default=60.0, help="状態を表示する間隔（秒）")
+    p_paper.add_argument("--slack", action="store_true", help="日ごとの結果と停止を Slack に送る")
+    p_paper.set_defaults(func=cmd_paper)
 
     p_daily = sub.add_parser("daily", help="前日の録画を固定設定で検証し、Slackに送る")
     p_daily.add_argument(

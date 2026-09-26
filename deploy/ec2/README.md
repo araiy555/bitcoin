@@ -62,6 +62,20 @@ sudo systemctl enable --now jsboard-daily.timer
 銘柄を増やすときは `jsboard-capture@bitbank:xlm_jpy` のように足して、
 `/etc/jsboard.env` の `JSBOARD_TARGETS` にも同じ銘柄を足します。
 
+## 紙上トレード（本物の板・仮想の注文）
+
+毎朝の検証と同じ固定設定で、本物の板を見ながら仮想の注文を24時間出し続けます。
+**注文は一切出しません。** 1日ごとの損益と約定の回数が、UTC の日付が変わった直後
+（日本時間9時）に Slack に届きます。損失が3,000円に達するか、何かで止まった場合も
+Slack に知らせます（止まっても30秒後に自動で再開します）。
+
+```
+sudo systemctl enable --now jsboard-paper@bitbank:ada_jpy
+sudo journalctl -u 'jsboard-paper@*' -n 20 --no-pager    # 5分ごとの損益
+```
+
+t2.micro はメモリが 1GB しかないので、紙上トレードはまず1銘柄から始めてください。
+
 ## 確認
 
 ```
