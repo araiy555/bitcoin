@@ -119,3 +119,80 @@ def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
         )
     lines.append("_10秒内計 = スプレッド + 10秒以内の在庫損益 + 手数料（その日の値動きの運を除いた実力）。_")
     return "\n".join(lines)
+
+
+HALT_PREFIX = "control/halt"
+"""A flag here stops paper (and later live) quoting for one book until removed."""
+
+PAPER_PREFIX = "reports/paper"
+
+READY_DAYS = 10
+READY_MIN_POSITIVE = 8
+"""Go-live bar: of the last ten daily replays, eight with a positive quoting
+edge, no two-day losing streak among them, and paper trading ahead overall."""
+
+
+def halt_key(target: Target) -> str:
+    return f"{HALT_PREFIX}/{target.venue}_{target.symbol}.json"
+
+
+def paper_key(target: Target, day: str) -> str:
+    return f"{PAPER_PREFIX}/{day}/{target.venue}_{target.symbol}.json"
+
+
+def _edges(key: str, today: float, history: list[dict]) -> list[float | None]:
+    """Quoting edge per day, today first, None where the day had no replay."""
+    out: list[float | None] = [None if math.isnan(today) else today]
+    for day in history:
+        row = next((r for r in day.get("results", []) if r.get("target") == key), None)
+        out.append(None if row is None else row.get("short_bps"))
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class Readiness:
+    days: int
+    positive: int
+    streak_seen: bool
+    paper_total: float | None
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.days >= READY_DAYS
+            and self.positive >= READY_MIN_POSITIVE
+            and not self.streak_seen
+            and self.paper_total is not None
+            and self.paper_total > 0
+        )
+
+    def text(self) -> str:
+        def mark(ok: bool) -> str:
+            return ":white_check_mark:" if ok else ":x:"
+
+        paper = "記録なし" if self.paper_total is None else f"{self.paper_total:+,.0f}円"
+        verdict = (
+            "*本番に進める条件を満たしました*"
+            if self.ready
+            else f"条件まで あと {max(0, READY_DAYS - self.days)} 日分のデータが必要"
+            if self.days < READY_DAYS
+            else "条件を満たしていません"
+        )
+        return (
+            f"  本番の条件: {mark(self.positive >= READY_MIN_POSITIVE)} 実力プラス "
+            f"{self.positive}/{self.days}日（{READY_MIN_POSITIVE}/{READY_DAYS}以上）  "
+            f"{mark(not self.streak_seen)} 2日連続マイナスなし  "
+            f"{mark(self.paper_total is not None and self.paper_total > 0)} 紙上の合計 {paper}"
+            f"\n  → {verdict}"
+        )
+
+
+def readiness(
+    key: str, today: float, history: list[dict], paper_total: float | None
+) -> Readiness:
+    edges = _edges(key, today, history)[:READY_DAYS]
+    known = [e for e in edges if e is not None]
+    streak = any(
+        a is not None and b is not None and a < 0 and b < 0 for a, b in zip(edges, edges[1:], strict=False)
+    )
+    return Readiness(len(known), sum(e > 0 for e in known), streak, paper_total)

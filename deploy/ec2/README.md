@@ -76,6 +76,20 @@ sudo journalctl -u 'jsboard-paper@*' -n 20 --no-pager    # 5分ごとの損益
 
 t2.micro はメモリが 1GB しかないので、紙上トレードはまず1銘柄から始めてください。
 
+### 自動停止と本番の条件
+
+毎朝の検証で `10秒内計` が2日続けてマイナスになると、その銘柄に停止フラグが立ち、
+紙上トレードは1分以内に注文を止めます（Slack に通知）。確認して再開するときは:
+
+```
+/opt/jsboard/venv/bin/jsboard resume --target bitbank:ada_jpy --s3-bucket jsboard-capture
+```
+
+手で止めるときは `jsboard halt --target bitbank:ada_jpy --s3-bucket jsboard-capture` です。
+
+毎朝の Slack には、本番に進める条件の進み具合も出ます。直近10日の検証のうち8日以上で
+実力がプラス、2日連続マイナスが一度もない、紙上トレードの合計がプラス、の3つです。
+
 ## 確認
 
 ```

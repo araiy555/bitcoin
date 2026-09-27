@@ -74,3 +74,42 @@ async def test_the_loop_runs_the_maker_and_reports_when_the_feed_ends(monkeypatc
     assert "注文は一切出しません" in out
     assert "約定" in out
     assert posted and "止まりました" in posted[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_halt_flag_keeps_the_maker_from_quoting(monkeypatch, capsys):
+    import jsboard.cli as cli
+    import jsboard.sim.s3 as s3
+
+    class Bucket:
+        objects = {"control/halt/bitbank_ada_jpy.json": b"{}"}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in self.objects:
+                raise KeyError(Key)
+
+    async def live_book(target):
+        return INST, Book(INST)
+
+    async def futures(symbol):
+        return LEAD
+
+    posted = []
+
+    async def post(text):
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_futures_instrument", futures)
+    monkeypatch.setattr(cli, "_binance_lead", lambda inst, ms: Lead(inst))
+    monkeypatch.setattr(cli, "_post_slack", post)
+    args = cli.build_parser().parse_args(
+        ["paper", "--log-every", "0", "--slack", "--s3-bucket", "b"]
+    )
+    await args.func(args)
+    out = capsys.readouterr().out
+    assert "停止フラグ" in out
+    assert "約定 0" in out  # never quoted, so never filled
+    assert any("停止中" in p for p in posted)

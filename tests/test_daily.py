@@ -109,3 +109,67 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
     assert row["target"] == "bitbank:ada_jpy"
     assert row["note"] == "" and row["fills"] > 0, row
     assert row["short_bps"] is not None
+
+
+def daily_history(*edges):
+    return [{"results": [{"target": "bitbank:ada_jpy", "short_bps": e}]} for e in edges]
+
+
+class TestReadiness:
+    def test_ten_good_days_and_paper_ahead_is_ready(self):
+        from jsboard.research.daily import readiness
+
+        r = readiness("bitbank:ada_jpy", 3.0, daily_history(2, 1, -1, 4, 2, 3, 1, -0.5, 2), 5_000)
+        assert (r.days, r.positive, r.streak_seen) == (10, 8, False)
+        assert r.ready and "満たしました" in r.text()
+
+    def test_a_two_day_streak_anywhere_in_the_window_blocks_it(self):
+        from jsboard.research.daily import readiness
+
+        r = readiness("bitbank:ada_jpy", 3.0, daily_history(2, -1, -1, 4, 2, 3, 1, 2, 2), 5_000)
+        assert r.streak_seen and not r.ready
+
+    def test_too_few_days_says_how_many_more(self):
+        from jsboard.research.daily import readiness
+
+        r = readiness("bitbank:ada_jpy", 3.0, daily_history(2, 1), 900)
+        assert not r.ready and "あと 7 日分" in r.text()
+
+    def test_paper_behind_blocks_it(self):
+        from jsboard.research.daily import readiness
+
+        r = readiness("bitbank:ada_jpy", 3.0, daily_history(*[2] * 9), -10)
+        assert not r.ready
+
+
+class FlagBucket:
+    def __init__(self):
+        self.objects = {}
+
+    def head_object(self, Bucket, Key):  # noqa: N803
+        if Key not in self.objects:
+            raise KeyError(Key)
+
+    def put_object(self, Bucket, Key, Body):  # noqa: N803
+        self.objects[Key] = Body
+
+    def delete_object(self, Bucket, Key):  # noqa: N803
+        self.objects.pop(Key, None)
+
+
+def test_halt_and_resume_set_and_clear_the_flag(monkeypatch):
+    import asyncio
+
+    import jsboard.sim.s3 as s3
+    from jsboard.cli import build_parser
+
+    bucket = FlagBucket()
+    monkeypatch.setattr(s3, "default_client", lambda: bucket)
+    def run(argv):
+        args = build_parser().parse_args(argv)
+        return asyncio.run(args.func(args))
+
+    assert run(["halt", "--target", "bitbank:ada_jpy", "--s3-bucket", "b"]) == 0
+    assert "control/halt/bitbank_ada_jpy.json" in bucket.objects
+    assert run(["resume", "--target", "bitbank:ada_jpy", "--s3-bucket", "b"]) == 0
+    assert bucket.objects == {}

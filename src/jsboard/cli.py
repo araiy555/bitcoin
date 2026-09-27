@@ -2687,11 +2687,17 @@ async def cmd_daily(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime, timedelta
 
     from .research.daily import (
+        ALERT_AFTER_DAYS,
         FIXED_FLAGS,
         MAKER_BPS,
+        READY_DAYS,
         DayResult,
         Target,
         day_folder,
+        halt_key,
+        losing_streak,
+        paper_key,
+        readiness,
         size_for,
         slack_text,
     )
@@ -2738,17 +2744,49 @@ async def cmd_daily(args: argparse.Namespace) -> int:
 
     reports = f"s3://{args.s3_bucket}/{args.reports_prefix.strip('/')}"
     history = []
-    for back in range(1, 8):
+    for back in range(1, READY_DAYS):
         day = (datetime.fromisoformat(date) - timedelta(days=back)).strftime("%Y-%m-%d")
         uri = f"{reports}/{day}.json"
         if exists(uri):
             history.append(json.loads(read_bytes(uri)))
 
-    text = slack_text(date, results, history)
+    client = default_client()
+    lines = [slack_text(date, results, history)]
+    for r in results:
+        if r.note:
+            continue
+        key = f"{r.target.venue}:{r.target.symbol}"
+        # A book that has stopped paying is stopped here, not just reported:
+        # the flag halts paper (and later live) quoting until someone looks.
+        if losing_streak(key, r.short_bps, history) >= ALERT_AFTER_DAYS:
+            flag = halt_key(r.target)
+            if not exists(f"s3://{args.s3_bucket}/{flag}"):
+                client.put_object(
+                    Bucket=args.s3_bucket,
+                    Key=flag,
+                    Body=json.dumps(
+                        {"since": date, "reason": f"実力が{ALERT_AFTER_DAYS}日連続マイナス"},
+                        ensure_ascii=False,
+                    ).encode(),
+                )
+            lines.append(
+                f":octagonal_sign: {r.target.label} の紙上トレードを自動停止しました。"
+                f"再開: `jsboard resume --target {key} --s3-bucket {args.s3_bucket}`"
+            )
+        paper_uri = f"s3://{args.s3_bucket}/{paper_key(r.target, date)}"
+        paper_total = (
+            json.loads(read_bytes(paper_uri)).get("cumulative_total")
+            if exists(paper_uri)
+            else None
+        )
+        lines.append(
+            f"• {r.target.label}\n" + readiness(key, r.short_bps, history, paper_total).text()
+        )
+    text = "\n".join(lines)
     console.print(text)
     report = {"date": date, "results": [r.record() for r in results]}
     bucket, _, key = f"{reports}/{date}.json"[len("s3://"):].partition("/")
-    default_client().put_object(
+    client.put_object(
         Bucket=bucket, Key=key, Body=json.dumps(report, ensure_ascii=False).encode()
     )
 
@@ -2820,7 +2858,8 @@ async def cmd_paper(args: argparse.Namespace) -> int:
 
     from .mm.papertrade import DailyTally
     from .mm.papertrade import slack_text as paper_slack_text
-    from .research.daily import FIXED_FLAGS, MAKER_BPS, Target, size_for
+    from .research.daily import FIXED_FLAGS, MAKER_BPS, Target, halt_key, paper_key, size_for
+    from .sim.s3 import default_client, exists
 
     try:
         target = Target.parse(args.target)
@@ -2884,10 +2923,34 @@ async def cmd_paper(args: argparse.Namespace) -> int:
     lead_task = _asyncio.create_task(pump_lead())
     last_log = time.monotonic()
     reason = "feed ended"
+    halt_uri = f"s3://{args.s3_bucket}/{halt_key(target)}" if args.s3_bucket else None
+    halted = False
+    last_halt_check = -math.inf
+
+    async def check_halt() -> None:
+        """Honour the flag the morning check sets when the book stops paying."""
+        nonlocal halted, last_halt_check
+        if halt_uri is None or time.monotonic() - last_halt_check < 60:
+            return
+        last_halt_check = time.monotonic()
+        now_halted = exists(halt_uri)
+        if now_halted and not halted:
+            mm.flatten()
+            console.print("[yellow]停止フラグがあるので注文を止めました[/yellow]")
+            if args.slack:
+                await _post_slack(f":pause_button: 紙上トレード {label} は停止中です（停止フラグ）")
+        elif halted and not now_halted:
+            console.print("[green]停止フラグが消えたので再開します[/green]")
+            if args.slack:
+                await _post_slack(f":arrow_forward: 紙上トレード {label} を再開しました")
+        halted = now_halted
+
     try:
         async for event in events():
+            await check_halt()
             mm.on_event(event)
-            mm.requote()
+            if not halted:
+                mm.requote()
             if time.monotonic() - last_log >= args.log_every:
                 last_log = time.monotonic()
                 s = mm.summary()
@@ -2896,10 +2959,24 @@ async def cmd_paper(args: argparse.Namespace) -> int:
                     f"  在庫 {s['position']:+,.4g} {instrument.base}  {mm.stats.last_decision}"
                 )
             report = tally.roll(day(), mm.summary())
-            if report is not None and args.slack:
-                await _post_slack(
-                    paper_slack_text(label, instrument.quote, instrument.base, report, mm.summary())
-                )
+            if report is not None:
+                cumulative = mm.summary()
+                if args.s3_bucket:
+                    # Kept for the morning check, which needs paper's running
+                    # total to decide whether the book is ready for money.
+                    record = {**report, "cumulative_total": cumulative["total"],
+                              "cumulative_fills": cumulative["fills"]}
+                    try:
+                        default_client().put_object(
+                            Bucket=args.s3_bucket, Key=paper_key(target, report["day"]),
+                            Body=json.dumps(record).encode(),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reporting must not stop trading
+                        console.print(f"[yellow]紙上の記録を保存できません: {exc}[/yellow]")
+                if args.slack:
+                    await _post_slack(
+                        paper_slack_text(label, instrument.quote, instrument.base, report, cumulative)
+                    )
             if mm.risk.halted:
                 reason = f"停止: {mm.risk.halt_reason}"
                 break
@@ -2910,6 +2987,36 @@ async def cmd_paper(args: argparse.Namespace) -> int:
     if args.slack:
         await _post_slack(f":octagonal_sign: 紙上トレード {label} が止まりました: {reason}")
     return 1
+
+
+async def cmd_halt(args: argparse.Namespace) -> int:
+    """Stop quoting one book until `resume`; the paper loop checks every minute."""
+    from datetime import UTC, datetime
+
+    from .research.daily import Target, halt_key
+    from .sim.s3 import default_client
+
+    target = Target.parse(args.target)
+    default_client().put_object(
+        Bucket=args.s3_bucket,
+        Key=halt_key(target),
+        Body=json.dumps(
+            {"since": datetime.now(UTC).isoformat(), "reason": args.reason}, ensure_ascii=False
+        ).encode(),
+    )
+    console.print(f"{target.label} に停止フラグを立てました（1分以内に止まります）")
+    return 0
+
+
+async def cmd_resume(args: argparse.Namespace) -> int:
+    """Remove a book's halt flag, set by hand or by the morning check."""
+    from .research.daily import Target, halt_key
+    from .sim.s3 import default_client
+
+    target = Target.parse(args.target)
+    default_client().delete_object(Bucket=args.s3_bucket, Key=halt_key(target))
+    console.print(f"{target.label} の停止フラグを消しました（1分以内に再開します）")
+    return 0
 
 
 async def cmd_jpscan(args: argparse.Namespace) -> int:
@@ -5857,7 +5964,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_paper.add_argument("--log-every", type=float, default=60.0, help="状態を表示する間隔（秒）")
     p_paper.add_argument("--slack", action="store_true", help="日ごとの結果と停止を Slack に送る")
+    p_paper.add_argument(
+        "--s3-bucket", default=None, help="日ごとの結果を保存し、停止フラグを確認するバケット"
+    )
     p_paper.set_defaults(func=cmd_paper)
+
+    for name, func, text in (
+        ("halt", cmd_halt, "1銘柄の注文を止める（resume まで）"),
+        ("resume", cmd_resume, "止めた銘柄を再開する"),
+    ):
+        p_ctl = sub.add_parser(name, help=text)
+        p_ctl.add_argument("--target", required=True, help="取引所:銘柄")
+        p_ctl.add_argument("--s3-bucket", required=True)
+        if name == "halt":
+            p_ctl.add_argument("--reason", default="手動で停止")
+        p_ctl.set_defaults(func=func)
 
     p_daily = sub.add_parser("daily", help="前日の録画を固定設定で検証し、Slackに送る")
     p_daily.add_argument(
