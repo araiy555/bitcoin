@@ -86,3 +86,44 @@ async def test_a_day_records_always_plus_top_candidates_and_files_the_list(
         "bitbank:ada_jpy", "bitbank:xlm_jpy", "gmo:SOL"
     ]
     assert "raw/live/symbol=SOL/meta.json" in bucket.objects
+
+
+@pytest.mark.asyncio
+async def test_recording_stops_before_the_disk_fills(monkeypatch, tmp_path, capsys):
+    import shutil
+    from collections import namedtuple
+
+    import jsboard.cli as cli
+    import jsboard.sim.s3 as s3
+
+    bucket = Bucket()
+    monkeypatch.setattr(s3, "default_client", lambda: bucket)
+
+    class Endless(Feed):
+        async def stream(self):
+            import asyncio
+
+            yield FeedStatus("live", "fake")
+            while True:
+                yield DepthSnapshot(((100, 5),), ((101, 5),), 1)
+                await asyncio.sleep(0.01)
+
+    async def screen(samples, interval):
+        return []
+
+    async def parts(target, binance_depth_ms=100):
+        inst = Instrument(target.symbol, Decimal("0.001"), Decimal("1"), "X", "JPY")
+        spec = {"symbol": target.symbol, "tick_size": "0.001", "lot_size": "1",
+                "base": "X", "quote": "JPY", "market": "spot"}
+        return ({target.venue: Endless(inst)}, {target.venue: spec})
+
+    Usage = namedtuple("Usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(100e9, 97e9, 3e9))
+    monkeypatch.setattr(cli, "_screen_books", screen)
+    monkeypatch.setattr(cli, "_lead_capture_parts", parts)
+    args = cli.build_parser().parse_args([
+        "autorecord", "--s3-bucket", "b", "--always", "bitbank:ada_jpy",
+        "--workdir", str(tmp_path), "--duration", "3600", "--disk-check-s", "0.05",
+    ])
+    assert await args.func(args) == 1  # stopped, not an hour later
+    assert "空き容量が 5GB を切った" in capsys.readouterr().out

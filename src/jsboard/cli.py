@@ -3180,10 +3180,33 @@ async def cmd_autorecord(args: argparse.Namespace) -> int:
         if args.slack:
             await _post_slack(text)
 
-        if runs:
-            await _asyncio.gather(*runs, return_exceptions=True)
-        else:
+        if not runs:
             await _asyncio.sleep(max(1.0, (until - datetime.now(UTC)).total_seconds()))
+            continue
+        tasks = [_asyncio.create_task(r) for r in runs]
+        low_disk = False
+        pending = set(tasks)
+        while pending:
+            # Parts that fail to upload (an expired login) stay on disk; on a
+            # laptop that is the one way this can fill the drive, so stop first.
+            import shutil
+
+            if shutil.disk_usage(workdir).free / 1e9 < args.min_free_gb:
+                low_disk = True
+                for task in tasks:
+                    task.cancel()
+                await _asyncio.gather(*tasks, return_exceptions=True)
+                break
+            _, pending = await _asyncio.wait(pending, timeout=args.disk_check_s)
+        if low_disk:
+            text = (
+                f":octagonal_sign: 空き容量が {args.min_free_gb:g}GB を切ったので録画を止めました。"
+                f"S3 に送れなかった分が {workdir} に残っています。"
+            )
+            console.print(f"[red]{text}[/red]")
+            if args.slack:
+                await _post_slack(text)
+            return 1
     return 0
 
 
@@ -6144,6 +6167,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration", type=float, default=None, help="1日の代わりにこの秒数だけ録画（試し用）"
     )
     p_auto.add_argument("--days", type=int, default=None, help="この日数で終える（既定はずっと）")
+    p_auto.add_argument(
+        "--min-free-gb", type=float, default=5.0, help="空き容量がこれを切ったら録画を止める"
+    )
+    p_auto.add_argument("--disk-check-s", type=float, default=60.0, help="空き容量を見る間隔（秒）")
     p_auto.set_defaults(func=cmd_autorecord)
 
     p_jp = sub.add_parser("jpscan", help="国内取引所で bitbank ADA と同じ形の銘柄を探す")
