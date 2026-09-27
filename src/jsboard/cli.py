@@ -3096,6 +3096,23 @@ async def _lead_capture_parts(target, binance_depth_ms: int = 100):
     return sources, specs
 
 
+def _autorecord_status(watched: list) -> str:
+    """One line per book: events per source, and parts sent or stuck on disk."""
+    from datetime import datetime
+
+    lines = [f"[{datetime.now().strftime('%H:%M')}] 録画中"]
+    for target, capture, sink in watched:
+        feeds = "  ".join(
+            f"{name}({st.status}) {st.events:,}件"
+            + (f" 切断{st.errors}回" if st.errors else "")
+            for name, st in capture.stats.items()
+        )
+        sent = sink.summary()
+        stuck = f"  [red]送信失敗 {len(sent['failed'])}個[/red]" if sent["failed"] else ""
+        lines.append(f"  {target.label}: {feeds}  S3 {len(sent['uploaded'])}個{stuck}")
+    return "\n".join(lines)
+
+
 async def cmd_autorecord(args: argparse.Namespace) -> int:
     """Record today's best-screened books, every day, without being asked.
 
@@ -3145,7 +3162,7 @@ async def cmd_autorecord(args: argparse.Namespace) -> int:
                 continue
             chosen.append(target)
 
-        runs, started = [], []
+        runs, started, watched = [], [], []
         for target in chosen:
             try:
                 sources, specs = await _lead_capture_parts(target)
@@ -3164,6 +3181,7 @@ async def cmd_autorecord(args: argparse.Namespace) -> int:
             capture = MultiCapture(sources, out, sink=sink)
             runs.append(capture.run(duration_s=(until - datetime.now(UTC)).total_seconds()))
             started.append(target)
+            watched.append((target, capture, sink))
 
         # The day's list, merged with any other recorder's, for the morning replay.
         uri = f"s3://{args.s3_bucket}/{targets_key(day)}"
@@ -3186,7 +3204,11 @@ async def cmd_autorecord(args: argparse.Namespace) -> int:
         tasks = [_asyncio.create_task(r) for r in runs]
         low_disk = False
         pending = set(tasks)
+        last_log = time.monotonic()
         while pending:
+            if args.log_every and time.monotonic() - last_log >= args.log_every:
+                last_log = time.monotonic()
+                console.print(_autorecord_status(watched))
             # Parts that fail to upload (an expired login) stay on disk; on a
             # laptop that is the one way this can fill the drive, so stop first.
             import shutil
@@ -6171,6 +6193,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-free-gb", type=float, default=5.0, help="空き容量がこれを切ったら録画を止める"
     )
     p_auto.add_argument("--disk-check-s", type=float, default=60.0, help="空き容量を見る間隔（秒）")
+    p_auto.add_argument(
+        "--log-every", type=float, default=300.0, help="録画の状況を出す間隔（秒、0で出さない）"
+    )
     p_auto.set_defaults(func=cmd_autorecord)
 
     p_jp = sub.add_parser("jpscan", help="国内取引所で bitbank ADA と同じ形の銘柄を探す")
