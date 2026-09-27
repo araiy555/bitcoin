@@ -1,0 +1,15 @@
+[Unit]
+Description=jsboard: record the fixed books plus the day's top screened candidates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+StateDirectory=jsboard
+ExecStart=/opt/jsboard/venv/bin/jsboard autorecord --always ${JSBOARD_TARGETS} --top 2 --s3-bucket ${JSBOARD_BUCKET} --workdir /var/lib/jsboard/autorecord --slack
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

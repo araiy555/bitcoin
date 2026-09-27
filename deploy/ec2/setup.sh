@@ -15,7 +15,8 @@ sudo -u jsboard /opt/jsboard/venv/bin/pip install --quiet -e '/opt/jsboard/app[s
 
 sudo install -m 755 "$here/capture.sh" /opt/jsboard/capture.sh
 sudo install -m 644 "$here/jsboard-capture@.service" "$here/jsboard-paper@.service" \
-  "$here/jsboard-daily.service" "$here/jsboard-daily.timer" /etc/systemd/system/
+  "$here/jsboard-autorecord.service" "$here/jsboard-daily.service" \
+  "$here/jsboard-daily.timer" /etc/systemd/system/
 if [ ! -f /etc/jsboard.env ]; then
   sudo install -m 600 "$here/jsboard.env.example" /etc/jsboard.env
 fi

@@ -62,6 +62,18 @@ sudo systemctl enable --now jsboard-daily.timer
 銘柄を増やすときは `jsboard-capture@bitbank:xlm_jpy` のように足して、
 `/etc/jsboard.env` の `JSBOARD_TARGETS` にも同じ銘柄を足します。
 
+## 候補の自動録画（銘柄ごとの録画の代わり）
+
+`JSBOARD_TARGETS` の銘柄を毎日録画し、さらにその日のスキャンの上位2銘柄も自動で
+録画します。1つのプログラムで全部録るので、銘柄ごとの録画よりメモリを使いません。
+毎朝の検証は、自動で選ばれた銘柄も含めて検証します。
+
+```
+sudo systemctl disable --now 'jsboard-capture@*'
+sudo systemctl enable --now jsboard-autorecord
+sudo journalctl -u jsboard-autorecord -n 20 --no-pager
+```
+
 ## 紙上トレード（本物の板・仮想の注文）
 
 毎朝の検証と同じ固定設定で、本物の板を見ながら仮想の注文を24時間出し続けます。
