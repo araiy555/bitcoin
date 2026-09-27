@@ -2773,12 +2773,15 @@ async def cmd_daily(args: argparse.Namespace) -> int:
                 f":octagonal_sign: {r.target.label} の紙上トレードを自動停止しました。"
                 f"再開: `jsboard resume --target {key} --s3-bucket {args.s3_bucket}`"
             )
-        paper_uri = f"s3://{args.s3_bucket}/{paper_key(r.target, date)}"
-        paper_total = (
-            json.loads(read_bytes(paper_uri)).get("cumulative_total")
-            if exists(paper_uri)
-            else None
-        )
+        # Summed from the days paper filed, not its running total: the paper
+        # process restarts (updates, crashes) and its in-memory total with it.
+        paper_days = []
+        for back in range(READY_DAYS):
+            day = (datetime.fromisoformat(date) - timedelta(days=back)).strftime("%Y-%m-%d")
+            uri = f"s3://{args.s3_bucket}/{paper_key(r.target, day)}"
+            if exists(uri):
+                paper_days.append(float(json.loads(read_bytes(uri)).get("pnl", 0.0)))
+        paper_total = sum(paper_days) if paper_days else None
         lines.append(
             f"• {r.target.label}\n" + readiness(key, r.short_bps, history, paper_total).text()
         )
