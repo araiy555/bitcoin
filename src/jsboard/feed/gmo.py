@@ -4,9 +4,10 @@ GMO pushes the whole book on every change (`orderbooks`), so each message is a
 :class:`DepthSnapshot`. Trades are subscribed with ``TAKER_ONLY`` so that each
 print arrives once, carrying the side that crossed the spread.
 
-The venue accepts one subscribe request per second on a connection; the second
-subscription is sent after a pause, or it is silently dropped and the
-recording has a book with no trades.
+The venue accepts one subscribe request per second, counted per IP rather
+than per connection: two books recorded from one process that subscribe at
+the same moment get ``ERR-5003 Request too many``. Every subscribe in the
+process therefore goes through one shared pacer.
 
 Leverage symbols (``XRP_JPY``) and spot symbols (``XRP``) are separate books
 with separate fees; the symbol is passed through exactly as the venue names it.
@@ -32,6 +33,29 @@ log = logging.getLogger(__name__)
 REST_URL = "https://api.coin.z.com/public/v1"
 WS_URL = "wss://api.coin.z.com/ws/public/v1"
 SUBSCRIBE_GAP_S = 1.2
+
+
+class _SubscribePacer:
+    """Spaces subscribe requests from every GMO feed in the process."""
+
+    def __init__(self, gap_s: float) -> None:
+        self.gap_s = gap_s
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._last = float("-inf")
+
+    async def send(self, ws, message: dict) -> None:
+        loop = asyncio.get_running_loop()
+        # One lock per event loop: a lock used on two loops raises.
+        lock = self._locks.setdefault(id(loop), asyncio.Lock())
+        async with lock:
+            wait = self._last + self.gap_s - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await ws.send(json.dumps(message))
+            self._last = loop.time()
+
+
+_pacer = _SubscribePacer(SUBSCRIBE_GAP_S)
 
 
 def ts_ns(text: str | None) -> int:
@@ -135,21 +159,17 @@ class GmoFeed(Feed):
                     max_queue=2**16,
                     ssl=ssl_context(),
                 ) as ws:
-                    await ws.send(
-                        json.dumps(
-                            {"command": "subscribe", "channel": "orderbooks", "symbol": self.symbol}
-                        )
+                    await _pacer.send(
+                        ws, {"command": "subscribe", "channel": "orderbooks", "symbol": self.symbol}
                     )
-                    await asyncio.sleep(SUBSCRIBE_GAP_S)
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "command": "subscribe",
-                                "channel": "trades",
-                                "symbol": self.symbol,
-                                "option": "TAKER_ONLY",
-                            }
-                        )
+                    await _pacer.send(
+                        ws,
+                        {
+                            "command": "subscribe",
+                            "channel": "trades",
+                            "symbol": self.symbol,
+                            "option": "TAKER_ONLY",
+                        },
                     )
                     live = False
                     async for raw in ws:

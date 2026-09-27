@@ -134,3 +134,31 @@ async def test_sweep_quotes_gmo_while_watching_binance(tmp_path, capsys):
     assert "XRP_JPY" in out and "2 通り" in out
     # The day's drift is kept out of one column, so skill can be read apart from luck.
     assert "10秒内計" in out
+
+
+def test_subscribes_from_two_feeds_are_spaced_apart():
+    # GMO counts subscribes per IP: two books starting together must not
+    # send within the same second, or one gets ERR-5003.
+    import asyncio
+
+    from jsboard.feed.gmo import _SubscribePacer
+
+    class Socket:
+        def __init__(self, sent):
+            self.sent = sent
+
+        async def send(self, text):
+            self.sent.append(asyncio.get_running_loop().time())
+
+    async def run():
+        pacer = _SubscribePacer(0.05)
+        sent: list[float] = []
+        a, b = Socket(sent), Socket(sent)
+        await asyncio.gather(
+            pacer.send(a, {"n": 1}), pacer.send(b, {"n": 2}), pacer.send(a, {"n": 3})
+        )
+        return sent
+
+    sent = asyncio.run(run())
+    assert len(sent) == 3
+    assert all(later - earlier >= 0.045 for earlier, later in zip(sent, sent[1:], strict=False))
