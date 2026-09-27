@@ -132,6 +132,14 @@ READY_MIN_POSITIVE = 8
 edge, no two-day losing streak among them, and paper trading ahead overall."""
 
 
+TARGETS_PREFIX = "control/targets"
+"""What was recorded each UTC day, so the morning replay checks all of it."""
+
+
+def targets_key(day: str) -> str:
+    return f"{TARGETS_PREFIX}/{day}.json"
+
+
 def halt_key(target: Target) -> str:
     return f"{HALT_PREFIX}/{target.venue}_{target.symbol}.json"
 

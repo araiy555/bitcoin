@@ -2689,7 +2689,6 @@ async def cmd_daily(args: argparse.Namespace) -> int:
     from .research.daily import (
         ALERT_AFTER_DAYS,
         FIXED_FLAGS,
-        MAKER_BPS,
         READY_DAYS,
         DayResult,
         Target,
@@ -2700,12 +2699,18 @@ async def cmd_daily(args: argparse.Namespace) -> int:
         readiness,
         size_for,
         slack_text,
+        targets_key,
     )
     from .sim.s3 import default_client, exists, read_bytes
 
     date = args.date or (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    names = [t.strip() for t in args.targets.split(",") if t.strip()]
+    # Plus whatever autorecord chose to record that day.
+    listed = f"s3://{args.s3_bucket}/{targets_key(date)}"
+    if exists(listed):
+        names += [n for n in json.loads(read_bytes(listed)).get("targets", []) if n not in names]
     try:
-        targets = [Target.parse(t.strip()) for t in args.targets.split(",") if t.strip()]
+        targets = [Target.parse(t) for t in names]
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -2722,7 +2727,7 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             size = size_for(args.order_jpy, _first_mid(path, target.venue, instrument),
                             instrument.lot_size)
             run_args = build_parser().parse_args([
-                *base, *FIXED_FLAGS, f"--maker-bps={MAKER_BPS[target.venue]}",
+                *base, *FIXED_FLAGS, f"--maker-bps={await _maker_bps_for(target)}",
                 "--size", size, "--max-position", str(Decimal(size) * 10),
             ])
             rows = await _run_combos(instrument, run_args, [], [()], path, quiet=True)
@@ -2861,7 +2866,7 @@ async def cmd_paper(args: argparse.Namespace) -> int:
 
     from .mm.papertrade import DailyTally
     from .mm.papertrade import slack_text as paper_slack_text
-    from .research.daily import FIXED_FLAGS, MAKER_BPS, Target, halt_key, paper_key, size_for
+    from .research.daily import FIXED_FLAGS, Target, halt_key, paper_key, size_for
     from .sim.s3 import default_client, exists
 
     try:
@@ -2892,7 +2897,7 @@ async def cmd_paper(args: argparse.Namespace) -> int:
     size = size_for(args.order_jpy, price, instrument.lot_size)
     run_args = build_parser().parse_args([
         "sweep", "-", "--source", target.venue, *FIXED_FLAGS,
-        f"--maker-bps={MAKER_BPS[target.venue]}",
+        f"--maker-bps={await _maker_bps_for(target)}",
         "--size", size, "--max-position", str(Decimal(size) * 10),
         "--max-drawdown", str(args.max_loss_jpy),
     ])
@@ -3022,42 +3027,178 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_jpscan(args: argparse.Namespace) -> int:
-    """Rank Japanese exchange books by the shape that paid on bitbank ADA."""
-    import asyncio as _asyncio
-    from datetime import UTC, datetime
+BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
+GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
+
+async def _get_json(session, url: str) -> dict:
     import aiohttp
+
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def _screen_books(samples: int, interval: float) -> list:
+    """Every bitbank and GMO book, fees from the venues, spreads sampled."""
+    import asyncio as _asyncio
 
     from .research.jpscan import (
         add_bitbank_tickers,
         add_gmo_tickers,
-        as_record,
         bitbank_books,
         gmo_books,
         ranked,
-        slack_text,
     )
 
-    timeout = aiohttp.ClientTimeout(total=15)
+    async with make_session() as session:
+        bb = bitbank_books(await _get_json(session, BITBANK_PAIRS_URL))
+        gmo = gmo_books(await _get_json(session, GMO_SYMBOLS_URL))
+        for n in range(samples):
+            add_bitbank_tickers(bb, await _get_json(session, "https://public.bitbank.cc/tickers"))
+            add_gmo_tickers(gmo, await _get_json(session, "https://api.coin.z.com/public/v1/ticker"))
+            if n + 1 < samples:
+                await _asyncio.sleep(interval)
+    return ranked([*bb.values(), *gmo.values()])
+
+
+async def _maker_bps_for(target) -> float:
+    """The book's own maker fee from the venue (negative is a rebate).
+
+    GMO pays 1bps on its majors and 3bps on its altcoins, so a venue-wide
+    constant undercounts SOL by two thirds. Falls back to the constant only
+    when the venue cannot be reached.
+    """
+    from .research.daily import MAKER_BPS
+    from .research.jpscan import bitbank_books, gmo_books
+
+    try:
+        async with make_session() as session:
+            if target.venue == "bitbank":
+                books = bitbank_books(await _get_json(session, BITBANK_PAIRS_URL))
+            else:
+                books = gmo_books(await _get_json(session, GMO_SYMBOLS_URL))
+        return books[target.symbol].maker_bps
+    except Exception:  # noqa: BLE001
+        return MAKER_BPS[target.venue]
+
+
+async def _lead_capture_parts(target, binance_depth_ms: int = 100):
+    """Feeds and specs to record one book with Binance's perp as its lead."""
+    instrument, feed = await _live_book(target)
+    binance = await fetch_futures_instrument(f"{instrument.base}USDT")
+    market = "spot" if target.venue == "bitbank" or "_" not in target.symbol else "leverage"
+    sources = {target.venue: feed, "binance": _binance_lead(binance, binance_depth_ms)}
+    specs = {
+        target.venue: {**_spec_dict(instrument, market), "venue": target.venue},
+        "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
+    }
+    return sources, specs
+
+
+async def cmd_autorecord(args: argparse.Namespace) -> int:
+    """Record today's best-screened books, every day, without being asked.
+
+    Each UTC day: screen every bitbank and GMO book, keep the ones named in
+    --always, add the top --top candidates, and record them all until the
+    next day, in one process. The day's list is filed in S3 so the morning
+    replay verifies exactly what was recorded. Books another recorder
+    already covers go in --exclude, or the two would interleave in one
+    folder.
+    """
+    import asyncio as _asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from .research.daily import Target, targets_key
+    from .sim.s3 import default_client, exists, read_bytes
+
+    def parse(text: str) -> list:
+        return [Target.parse(t.strip()) for t in (text or "").split(",") if t.strip()]
+
+    always = parse(args.always)
+    exclude = {f"{t.venue}:{t.symbol}" for t in parse(args.exclude)}
+    workdir = Path(args.workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    days_done = 0
+    while args.days is None or days_done < args.days:
+        days_done += 1
+        now = datetime.now(UTC)
+        day = now.strftime("%Y-%m-%d")
+        until = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if args.duration is not None:
+            until = now + timedelta(seconds=args.duration)
+
+        chosen = [t for t in always if f"{t.venue}:{t.symbol}" not in exclude]
+        try:
+            books = await _screen_books(args.samples, args.interval)
+        except Exception as exc:  # noqa: BLE001 - a failed screen still records --always
+            console.print(f"[yellow]スキャンに失敗しました: {exc}[/yellow]")
+            books = []
+        for book in books:
+            if sum(t not in always for t in chosen) >= args.top:
+                break
+            target = Target(book.venue, book.symbol)
+            if book.verdict() != "候補" or target in chosen:
+                continue
+            if f"{target.venue}:{target.symbol}" in exclude:
+                continue
+            chosen.append(target)
+
+        runs, started = [], []
+        for target in chosen:
+            try:
+                sources, specs = await _lead_capture_parts(target)
+            except Exception as exc:  # noqa: BLE001 - e.g. no Binance perp for the coin
+                console.print(f"[yellow]{target.label} は録画できません: {exc}[/yellow]")
+                continue
+            out = workdir / f"{target.venue}-{target.symbol}.jsonl"
+            meta = write_meta(out, specs)
+            sink = RotatingJsonlSink(
+                path=out,
+                target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
+                symbol=target.folder_symbol,
+                rotate_seconds=args.rotate_minutes * 60.0,
+            )
+            sink.upload_meta(meta)
+            capture = MultiCapture(sources, out, sink=sink)
+            runs.append(capture.run(duration_s=(until - datetime.now(UTC)).total_seconds()))
+            started.append(target)
+
+        # The day's list, merged with any other recorder's, for the morning replay.
+        uri = f"s3://{args.s3_bucket}/{targets_key(day)}"
+        listed = json.loads(read_bytes(uri)).get("targets", []) if exists(uri) else []
+        keys = sorted({*listed, *(f"{t.venue}:{t.symbol}" for t in started)})
+        default_client().put_object(
+            Bucket=args.s3_bucket, Key=targets_key(day),
+            Body=json.dumps({"targets": keys}).encode(),
+        )
+        text = f"*自動録画 {day}（UTC）*: " + (
+            ", ".join(t.label for t in started) if started else "録画できる銘柄がありません"
+        )
+        console.print(text)
+        if args.slack:
+            await _post_slack(text)
+
+        if runs:
+            await _asyncio.gather(*runs, return_exceptions=True)
+        else:
+            await _asyncio.sleep(max(1.0, (until - datetime.now(UTC)).total_seconds()))
+    return 0
+
+
+async def cmd_jpscan(args: argparse.Namespace) -> int:
+    """Rank Japanese exchange books by the shape that paid on bitbank ADA."""
+    from datetime import UTC, datetime
+
+    from .research.jpscan import as_record, slack_text
+
     console.print(
         f"[dim]bitbank と GMOコインの全銘柄を {args.samples} 回"
         f"（{args.interval:g}秒間隔）観測します…[/dim]"
     )
     try:
-        async with make_session() as session:
-            async def get(url: str) -> dict:
-                async with session.get(url, timeout=timeout) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-
-            bb = bitbank_books(await get("https://api.bitbank.cc/v1/spot/pairs"))
-            gmo = gmo_books(await get("https://api.coin.z.com/public/v1/symbols"))
-            for n in range(args.samples):
-                add_bitbank_tickers(bb, await get("https://public.bitbank.cc/tickers"))
-                add_gmo_tickers(gmo, await get("https://api.coin.z.com/public/v1/ticker"))
-                if n + 1 < args.samples:
-                    await _asyncio.sleep(args.interval)
+        books = await _screen_books(args.samples, args.interval)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]取得に失敗しました: {type(exc).__name__}: {exc}[/red]")
         hint = describe_tls_error(exc)
@@ -3065,7 +3206,6 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
             console.print(f"[yellow]{hint}[/yellow]")
         return 1
 
-    books = ranked([*bb.values(), *gmo.values()])
     shown = [b for b in books if b.verdict() == "候補"] if not args.all else books
 
     table = Table(box=None, header_style="bold dim", padding=(0, 1))
@@ -3126,13 +3266,7 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
         from zoneinfo import ZoneInfo
 
         taken = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
-        try:
-            async with make_session() as session, session.post(
-                url, json={"text": slack_text(books, taken)}, timeout=timeout
-            ) as resp:
-                resp.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Slack への送信に失敗しました: {type(exc).__name__}[/red]")
+        if not await _post_slack(slack_text(books, taken)):
             return 1
         console.print("  Slack に送信しました")
     return 0
@@ -5994,6 +6128,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily.add_argument("--reports-prefix", default="reports/daily", help="日次結果の置き場所")
     p_daily.add_argument("--slack", action="store_true")
     p_daily.set_defaults(func=cmd_daily)
+
+    p_auto = sub.add_parser("autorecord", help="毎日スキャンの上位を自動で録画する")
+    p_auto.add_argument("--always", default="", help="毎日録画する銘柄（例: bitbank:ada_jpy）")
+    p_auto.add_argument("--exclude", default="", help="録画しない銘柄（他で録画中のもの）")
+    p_auto.add_argument("--top", type=int, default=2, help="スキャンの上位から足す数")
+    p_auto.add_argument("--samples", type=int, default=20)
+    p_auto.add_argument("--interval", type=float, default=6.0)
+    p_auto.add_argument("--s3-bucket", required=True)
+    p_auto.add_argument("--s3-prefix", default="raw/live")
+    p_auto.add_argument("--rotate-minutes", type=float, default=5.0)
+    p_auto.add_argument("--workdir", default="/tmp/jsboard-autorecord")
+    p_auto.add_argument("--slack", action="store_true")
+    p_auto.add_argument(
+        "--duration", type=float, default=None, help="1日の代わりにこの秒数だけ録画（試し用）"
+    )
+    p_auto.add_argument("--days", type=int, default=None, help="この日数で終える（既定はずっと）")
+    p_auto.set_defaults(func=cmd_autorecord)
 
     p_jp = sub.add_parser("jpscan", help="国内取引所で bitbank ADA と同じ形の銘柄を探す")
     p_jp.add_argument("--samples", type=int, default=10, help="観測回数")
