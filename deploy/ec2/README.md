@@ -69,7 +69,7 @@ sudo systemctl enable --now jsboard-daily.timer
 毎朝の検証は、自動で選ばれた銘柄も含めて検証します。
 
 ```
-sudo systemctl disable --now 'jsboard-capture@*'
+sudo systemctl disable --now jsboard-capture@bitbank:ada_jpy jsboard-capture@bitbank:sui_jpy
 sudo systemctl enable --now jsboard-autorecord
 sudo journalctl -u jsboard-autorecord -n 20 --no-pager
 ```
