@@ -3011,7 +3011,11 @@ async def cmd_jpscan(args: argparse.Namespace) -> int:
         if not url:
             console.print("[red]--slack には環境変数 SLACK_WEBHOOK_URL が必要です。[/red]")
             return 1
-        taken = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+        # In Japan time: the runner's clock is UTC, and "02:26" on a Slack
+        # message read at 11:26 looks like the scan ran in the middle of the night.
+        from zoneinfo import ZoneInfo
+
+        taken = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
         try:
             async with make_session() as session, session.post(
                 url, json={"text": slack_text(books, taken)}, timeout=timeout
