@@ -78,9 +78,12 @@ class DayResult:
     short_bps: float = math.nan
     after_fees_bps: float = math.nan
     note: str = ""
+    trial: dict | None = None
+    """The same day under the book's trial settings, when it has any."""
 
     def record(self) -> dict:
         return {
+            **({"trial": self.trial} if self.trial else {}),
             "target": f"{self.target.venue}:{self.target.symbol}",
             "fills": self.fills,
             "short_bps": None if math.isnan(self.short_bps) else round(self.short_bps, 3),
@@ -117,6 +120,15 @@ def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
             f"• {r.target.label}: 10秒内計 {r.short_bps:+.2f}bps  "
             f"手数料後 {r.after_fees_bps:+.2f}bps  約定 {r.fills:,}{flag}"
         )
+        if r.trial:
+            t = r.trial
+            if t.get("short_bps") is None:
+                lines.append(f"    試験中（{t['settings']}）: {t.get('note') or '結果なし'}")
+            else:
+                lines.append(
+                    f"    試験中（{t['settings']}）: 10秒内計 {t['short_bps']:+.2f}bps  "
+                    f"手数料後 {t['after_fees_bps']:+.2f}bps  約定 {t['fills']:,}"
+                )
     lines.append("_10秒内計 = スプレッド + 10秒以内の在庫損益 + 手数料（その日の値動きの運を除いた実力）。_")
     return "\n".join(lines)
 
@@ -204,3 +216,66 @@ def readiness(
         a is not None and b is not None and a < 0 and b < 0 for a, b in zip(edges, edges[1:], strict=False)
     )
     return Readiness(len(known), sum(e > 0 for e in known), streak, paper_total)
+
+
+SETTINGS_PREFIX = "control/settings"
+"""A trial change to one book's settings, applied by paper within a minute
+and replayed beside the fixed settings each morning. Deleting it reverts."""
+
+TUNABLE = {
+    "inventory_skew_bps": ("--inventory-skew-bps", "在庫の片寄せ", "bps"),
+}
+"""Settings a trial may change: name → (flag, label, unit)."""
+
+TRIAL_REVERT_DAYS = 2
+"""Days in a row a trial may trail the fixed settings before it is removed."""
+
+
+def settings_key(target: Target) -> str:
+    return f"{SETTINGS_PREFIX}/{target.venue}_{target.symbol}.json"
+
+
+def parse_setting(text: str) -> tuple[str, float]:
+    name, sep, value = text.partition("=")
+    name = name.strip().replace("-", "_")
+    if not sep or name not in TUNABLE:
+        known = ", ".join(TUNABLE)
+        raise ValueError(f"{text}: 変えられる設定は {known} です（例: inventory_skew_bps=20）")
+    return name, float(value)
+
+
+def settings_flags(settings: dict) -> list[str]:
+    flags: list[str] = []
+    for name, value in sorted(settings.items()):
+        if name in TUNABLE:
+            flags += [TUNABLE[name][0], f"{value:g}"]
+    return flags
+
+
+def describe_settings(settings: dict) -> str:
+    parts = [
+        f"{TUNABLE[name][1]} {value:g}{TUNABLE[name][2]}"
+        for name, value in sorted(settings.items())
+        if name in TUNABLE
+    ]
+    return "、".join(parts) if parts else "元の設定"
+
+
+def trial_trailing_days(key: str, today: dict | None, history: list[dict]) -> int:
+    """Days in a row, ending today, the trial finished behind the fixed settings."""
+
+    def behind(row: dict | None) -> bool:
+        trial = (row or {}).get("trial")
+        if not trial or trial.get("after_fees_bps") is None or row.get("after_fees_bps") is None:
+            return False
+        return trial["after_fees_bps"] < row["after_fees_bps"]
+
+    if not behind(today):
+        return 0
+    days = 1
+    for day in history:  # newest first
+        row = next((r for r in day.get("results", []) if r.get("target") == key), None)
+        if not behind(row):
+            break
+        days += 1
+    return days

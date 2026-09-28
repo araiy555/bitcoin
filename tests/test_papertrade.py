@@ -113,3 +113,47 @@ async def test_a_halt_flag_keeps_the_maker_from_quoting(monkeypatch, capsys):
     assert "停止フラグ" in out
     assert "約定 0" in out  # never quoted, so never filled
     assert any("停止中" in p for p in posted)
+
+
+@pytest.mark.asyncio
+async def test_a_trial_setting_is_applied_and_announced(monkeypatch, capsys):
+    import io
+    import json
+
+    import jsboard.cli as cli
+    import jsboard.sim.s3 as s3
+
+    objects = {"control/settings/bitbank_ada_jpy.json":
+               json.dumps({"settings": {"inventory_skew_bps": 20}}).encode()}
+
+    class Bucket:
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+    async def live_book(target):
+        return INST, Book(INST)
+
+    async def futures(symbol):
+        return LEAD
+
+    posted = []
+
+    async def post(text):
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_futures_instrument", futures)
+    monkeypatch.setattr(cli, "_binance_lead", lambda inst, ms: Lead(inst))
+    monkeypatch.setattr(cli, "_post_slack", post)
+    args = cli.build_parser().parse_args(
+        ["paper", "--log-every", "0", "--slack", "--s3-bucket", "b"]
+    )
+    await args.func(args)
+    assert "試験中: 在庫の片寄せ 20bps" in capsys.readouterr().out
+    assert any("試験中" in p for p in posted)

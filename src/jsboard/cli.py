@@ -2691,16 +2691,21 @@ async def cmd_daily(args: argparse.Namespace) -> int:
         ALERT_AFTER_DAYS,
         FIXED_FLAGS,
         READY_DAYS,
+        TRIAL_REVERT_DAYS,
         DayResult,
         Target,
         day_folder,
+        describe_settings,
         halt_key,
         losing_streak,
         paper_key,
         readiness,
+        settings_flags,
+        settings_key,
         size_for,
         slack_text,
         targets_key,
+        trial_trailing_days,
     )
     from .sim.s3 import default_client, exists, read_bytes
 
@@ -2727,10 +2732,11 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             instrument = _instrument_for_recording(path, build_parser().parse_args(base))
             size = size_for(args.order_jpy, _first_mid(path, target.venue, instrument),
                             instrument.lot_size)
-            run_args = build_parser().parse_args([
+            fixed = [
                 *base, *FIXED_FLAGS, f"--maker-bps={await _maker_bps_for(target)}",
                 "--size", size, "--max-position", str(Decimal(size) * 10),
-            ])
+            ]
+            run_args = build_parser().parse_args(fixed)
             rows = await _run_combos(instrument, run_args, [], [()], path, quiet=True)
         except Exception as exc:  # noqa: BLE001 - one bad book must not hide the others
             results.append(DayResult(target, note=f"検証に失敗: {type(exc).__name__}: {exc}"))
@@ -2739,14 +2745,34 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             results.append(DayResult(target, note="注文を出せる設定になりませんでした"))
             continue
         row = rows[0]
-        results.append(
-            DayResult(
-                target,
-                fills=row["fills"],
-                short_bps=row["short_bps"],
-                after_fees_bps=row["attributed_bps"],
-            )
+        result = DayResult(
+            target,
+            fills=row["fills"],
+            short_bps=row["short_bps"],
+            after_fees_bps=row["attributed_bps"],
         )
+        # A trial change is replayed beside the fixed settings, never in
+        # their place: the fixed row is what the halt and go-live checks read.
+        settings_uri = f"s3://{args.s3_bucket}/{settings_key(target)}"
+        if exists(settings_uri):
+            settings = json.loads(read_bytes(settings_uri)).get("settings", {})
+            trial = {"settings": describe_settings(settings), "values": settings}
+            try:
+                trial_args = build_parser().parse_args([*fixed, *settings_flags(settings)])
+                trial_rows = await _run_combos(
+                    instrument, trial_args, [], [()], path, quiet=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                trial_rows, trial["note"] = [], f"検証に失敗: {type(exc).__name__}: {exc}"
+            if trial_rows:
+                t = trial_rows[0]
+                trial.update(
+                    fills=t["fills"],
+                    short_bps=round(t["short_bps"], 3),
+                    after_fees_bps=round(t["attributed_bps"], 3),
+                )
+            result.trial = trial
+        results.append(result)
 
     reports = f"s3://{args.s3_bucket}/{args.reports_prefix.strip('/')}"
     history = []
@@ -2778,6 +2804,14 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             lines.append(
                 f":octagonal_sign: {r.target.label} の紙上トレードを自動停止しました。"
                 f"再開: `jsboard resume --target {key} --s3-bucket {args.s3_bucket}`"
+            )
+        # A trial that keeps finishing behind the fixed settings is removed,
+        # which puts paper back on the fixed settings within a minute.
+        if r.trial and trial_trailing_days(key, r.record(), history) >= TRIAL_REVERT_DAYS:
+            client.delete_object(Bucket=args.s3_bucket, Key=settings_key(r.target))
+            lines.append(
+                f":leftwards_arrow_with_hook: {r.target.label} の試験（{r.trial['settings']}）は"
+                f"{TRIAL_REVERT_DAYS}日続けて元の設定に負けたので、元に戻しました。"
             )
         # Summed from the days paper filed, not its running total: the paper
         # process restarts (updates, crashes) and its in-memory total with it.
@@ -2867,8 +2901,17 @@ async def cmd_paper(args: argparse.Namespace) -> int:
 
     from .mm.papertrade import DailyTally
     from .mm.papertrade import slack_text as paper_slack_text
-    from .research.daily import FIXED_FLAGS, Target, halt_key, paper_key, size_for
-    from .sim.s3 import default_client, exists
+    from .research.daily import (
+        FIXED_FLAGS,
+        TUNABLE,
+        Target,
+        describe_settings,
+        halt_key,
+        paper_key,
+        settings_key,
+        size_for,
+    )
+    from .sim.s3 import default_client, exists, read_bytes
 
     try:
         target = Target.parse(args.target)
@@ -2933,8 +2976,37 @@ async def cmd_paper(args: argparse.Namespace) -> int:
     last_log = time.monotonic()
     reason = "feed ended"
     halt_uri = f"s3://{args.s3_bucket}/{halt_key(target)}" if args.s3_bucket else None
+    settings_uri = f"s3://{args.s3_bucket}/{settings_key(target)}" if args.s3_bucket else None
     halted = False
     last_halt_check = -math.inf
+    # The fixed settings, so deleting a trial puts every value back.
+    fixed_values = {name: getattr(mm.quoter.config, name) for name in TUNABLE}
+    trial: dict = {}
+
+    async def check_settings() -> None:
+        """Apply a trial change, or drop it, without restarting."""
+        nonlocal trial
+        try:
+            now = (
+                json.loads(read_bytes(settings_uri)).get("settings", {})
+                if exists(settings_uri) else {}
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad file must not stop trading
+            console.print(f"[yellow]設定を読めません: {exc}[/yellow]")
+            return
+        now = {k: float(v) for k, v in now.items() if k in TUNABLE}
+        if now == trial:
+            return
+        for name, value in fixed_values.items():
+            setattr(mm.quoter.config, name, now.get(name, value))
+        trial = now
+        text = (
+            f"紙上トレード {label} の設定を試験中: {describe_settings(now)}"
+            if now else f"紙上トレード {label} を元の設定に戻しました"
+        )
+        console.print(f"[cyan]{text}[/cyan]")
+        if args.slack:
+            await _post_slack(f":wrench: {text}")
 
     async def check_halt() -> None:
         """Honour the flag the morning check sets when the book stops paying."""
@@ -2942,6 +3014,7 @@ async def cmd_paper(args: argparse.Namespace) -> int:
         if halt_uri is None or time.monotonic() - last_halt_check < 60:
             return
         last_halt_check = time.monotonic()
+        await check_settings()
         now_halted = exists(halt_uri)
         if now_halted and not halted:
             mm.flatten()
@@ -3025,6 +3098,49 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     target = Target.parse(args.target)
     default_client().delete_object(Bucket=args.s3_bucket, Key=halt_key(target))
     console.print(f"{target.label} の停止フラグを消しました（1分以内に再開します）")
+    return 0
+
+
+async def cmd_tune(args: argparse.Namespace) -> int:
+    """Try one setting change on a book, or put it back.
+
+    Paper picks the change up within a minute, and the morning check replays
+    the day under both the fixed and the trial settings. `--reset` (or two
+    days of the trial finishing behind) returns the book to the fixed ones.
+    """
+    from datetime import UTC, datetime
+
+    from .research.daily import Target, describe_settings, parse_setting, settings_key
+    from .sim.s3 import default_client, exists, read_bytes
+
+    try:
+        target = Target.parse(args.target)
+        changes = dict(parse_setting(t) for t in args.set or [])
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    key = settings_key(target)
+    uri = f"s3://{args.s3_bucket}/{key}"
+    current = json.loads(read_bytes(uri)).get("settings", {}) if exists(uri) else {}
+
+    if args.reset:
+        default_client().delete_object(Bucket=args.s3_bucket, Key=key)
+        console.print(f"{target.label} を元の設定に戻しました（紙上トレードは1分以内に戻ります）")
+        return 0
+    if not changes:
+        console.print(f"{target.label}: {describe_settings(current)}")
+        return 0
+    settings = {**current, **changes}
+    default_client().put_object(
+        Bucket=args.s3_bucket,
+        Key=key,
+        Body=json.dumps(
+            {"settings": settings, "since": datetime.now(UTC).isoformat()}, ensure_ascii=False
+        ).encode(),
+    )
+    console.print(
+        f"{target.label} で試験を始めます: {describe_settings(settings)}"
+        f"（紙上トレードは1分以内に切り替わります。戻すときは --reset）"
+    )
     return 0
 
 
@@ -6166,6 +6282,15 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "halt":
             p_ctl.add_argument("--reason", default="手動で停止")
         p_ctl.set_defaults(func=func)
+
+    p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")
+    p_tune.add_argument("--target", required=True, help="取引所:銘柄")
+    p_tune.add_argument("--s3-bucket", required=True)
+    p_tune.add_argument(
+        "--set", action="append", help="name=値（例: inventory_skew_bps=20）。繰り返し指定可"
+    )
+    p_tune.add_argument("--reset", action="store_true", help="元の設定に戻す")
+    p_tune.set_defaults(func=cmd_tune)
 
     p_daily = sub.add_parser("daily", help="前日の録画を固定設定で検証し、Slackに送る")
     p_daily.add_argument(

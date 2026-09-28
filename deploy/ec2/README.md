@@ -102,6 +102,21 @@ t2.micro はメモリが 1GB しかないので、紙上トレードはまず1�
 毎朝の Slack には、本番に進める条件の進み具合も出ます。直近10日の検証のうち8日以上で
 実力がプラス、2日連続マイナスが一度もない、紙上トレードの合計がプラス、の3つです。
 
+### 設定の変更を試す（すぐ戻せる）
+
+改良した設定は、元の設定を残したまま1銘柄だけで試せます。Mac からでも実行できます。
+
+```
+jsboard tune --target bitbank:ada_jpy --s3-bucket jsboard-capture --set inventory_skew_bps=20   # 試す
+jsboard tune --target bitbank:ada_jpy --s3-bucket jsboard-capture                               # 今の状態
+jsboard tune --target bitbank:ada_jpy --s3-bucket jsboard-capture --reset                       # 元に戻す
+```
+
+- 紙上トレードは1分以内に切り替わり、Slack に知らせます。再起動は要りません。
+- 毎朝の検証は、元の設定と試験中の設定の両方で前日を再生し、2行並べて送ります。
+  自動停止と本番の条件は、元の設定の結果で判定します。
+- 試験中の設定が **2日続けて元の設定に負けたら、自動で元に戻します**（Slack に通知）。
+
 ## 確認
 
 ```

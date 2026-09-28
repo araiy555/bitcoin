@@ -82,6 +82,10 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
             ("\n".join(json.dumps(r) for r in rows) + "\n").encode()
         ),
         target.meta_key("ADA_JPY"): json.dumps({"sources": {"bitbank": bb, "binance": bn}}).encode(),
+        # A trial is replayed beside the fixed settings, not instead of them.
+        "control/settings/bitbank_ada_jpy.json": json.dumps(
+            {"settings": {"inventory_skew_bps": 20}}
+        ).encode(),
     }
 
     class Bucket:
@@ -99,6 +103,9 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
         def put_object(self, Bucket, Key, Body):  # noqa: N803
             objects[Key] = Body
 
+        def delete_object(self, Bucket, Key):  # noqa: N803
+            objects.pop(Key, None)
+
     monkeypatch.setattr(s3, "default_client", Bucket)
     args = build_parser().parse_args(["daily", "--s3-bucket", "b", "--date", "2026-09-26"])
     assert await args.func(args) == 0
@@ -109,6 +116,9 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
     assert row["target"] == "bitbank:ada_jpy"
     assert row["note"] == "" and row["fills"] > 0, row
     assert row["short_bps"] is not None
+    assert row["trial"]["settings"] == "在庫の片寄せ 20bps"
+    assert row["trial"]["fills"] > 0
+    assert "試験中（在庫の片寄せ 20bps）" in out
 
 
 def daily_history(*edges):
@@ -173,3 +183,46 @@ def test_halt_and_resume_set_and_clear_the_flag(monkeypatch):
     assert "control/halt/bitbank_ada_jpy.json" in bucket.objects
     assert run(["resume", "--target", "bitbank:ada_jpy", "--s3-bucket", "b"]) == 0
     assert bucket.objects == {}
+
+
+def test_a_trial_that_trails_two_days_is_due_for_removal():
+    from jsboard.research.daily import trial_trailing_days
+
+    def day(fixed, trial):
+        return {"target": "bitbank:ada_jpy", "after_fees_bps": fixed,
+                "trial": {"after_fees_bps": trial}}
+
+    key = "bitbank:ada_jpy"
+    yesterday = [{"results": [day(1.0, 0.5)]}]
+    assert trial_trailing_days(key, day(1.8, 1.2), yesterday) == 2
+    assert trial_trailing_days(key, day(1.0, 1.5), yesterday) == 0  # ahead today
+    assert trial_trailing_days(key, day(1.8, 1.2), [{"results": [day(1.0, 2.0)]}]) == 1
+    assert trial_trailing_days(key, {"target": key, "after_fees_bps": 1.0}, yesterday) == 0
+
+
+def test_tune_starts_shows_and_resets_a_trial(monkeypatch, capsys):
+    import asyncio
+    import io
+
+    import jsboard.sim.s3 as s3
+    from jsboard.cli import build_parser
+
+    bucket = FlagBucket()
+    bucket.get_object = lambda Bucket, Key: {"Body": io.BytesIO(bucket.objects[Key])}  # noqa: N803
+    monkeypatch.setattr(s3, "default_client", lambda: bucket)
+
+    def run(*argv):
+        args = build_parser().parse_args(
+            ["tune", "--target", "bitbank:ada_jpy", "--s3-bucket", "b", *argv]
+        )
+        return asyncio.run(args.func(args))
+
+    assert run("--set", "inventory_skew_bps=20") == 0
+    stored = json.loads(bucket.objects["control/settings/bitbank_ada_jpy.json"])
+    assert stored["settings"] == {"inventory_skew_bps": 20.0}
+    assert run() == 0
+    assert "在庫の片寄せ 20bps" in capsys.readouterr().out
+    assert run("--reset") == 0
+    assert bucket.objects == {}
+    with pytest.raises(Exception, match="変えられる設定"):
+        run("--set", "gamma=3")
