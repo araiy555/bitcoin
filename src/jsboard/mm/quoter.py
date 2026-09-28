@@ -79,6 +79,15 @@ class QuoterConfig:
     inventory_skew_ticks: float = 1.0
     """Floor on inventory skew, in ticks, at a full position."""
 
+    inventory_skew_bps: float = 0.0
+    """Extra inventory skew at a full position, in bps of mid.
+
+    The tick floor above is a fraction of a basis point on a fine-tick book
+    (ADA/JPY: one tick is 0.25bps), so a few orders of inventory barely moved
+    the quotes and positions sat until the age-based unwind cleared them.
+    This term scales with price instead of ticks, so the same setting leans
+    as hard on every book."""
+
     vol_multiplier: float = 0.05
     """Half-spread widening per tick of realised volatility.
 
@@ -209,8 +218,13 @@ class Quoter:
             return QuoteSet(reason="book is not two-sided")
 
         sigma = max(cfg.vol_floor_ticks, sigma_ticks)
+        mid_ticks = (best_bid + best_ask) / 2.0
         reservation = self.reservation_price(fair_value, inventory_lots, sigma)
-        half = self.half_spread(sigma, mid_ticks=(best_bid + best_ask) / 2.0)
+        if cfg.inventory_skew_bps:
+            q = inventory_lots / max(1, cfg.max_position_lots)
+            lean = q * cfg.inventory_skew_bps * mid_ticks / 1e4
+            reservation -= max(-cfg.max_skew_ticks, min(cfg.max_skew_ticks, lean))
+        half = self.half_spread(sigma, mid_ticks=mid_ticks)
 
         buy_capacity, sell_capacity = self._capacity(inventory_lots)
         bids: list[Quote] = []

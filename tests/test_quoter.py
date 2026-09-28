@@ -252,3 +252,27 @@ class TestMaxDistance:
         # Price improvement puts us inside the touch; the cap only pulls in.
         qs = self.quote(max_distance_ticks=0, min_half_spread_ticks=0, liquidity_premium_ticks=0.0)
         assert max(q.price for q in qs.bids) >= 1000
+
+
+def test_inventory_skew_bps_leans_quotes_by_price_not_ticks():
+    # ADA/JPY: 40 JPY at a 0.001 tick is 40,000 ticks, one tick 0.25bps.
+    from jsboard.mm.quoter import Quoter, QuoterConfig
+
+    def quotes(skew_bps, inventory):
+        cfg = QuoterConfig(
+            base_size_lots=100, max_position_lots=1000, levels=1,
+            inventory_skew_bps=skew_bps, vol_floor_ticks=0.5,
+        )
+        return Quoter(cfg).quote(
+            fair_value=40_000.0, sigma_ticks=0.0, inventory_lots=inventory,
+            best_bid=39_990, best_ask=40_010,
+        )
+
+    flat = quotes(40.0, 0)
+    long = quotes(40.0, 500)  # half the limit: lean 20bps = 80 ticks down
+    plain = quotes(0.0, 500)
+    assert flat.asks[0].price == quotes(0.0, 0).asks[0].price
+    tick_floor = flat.reservation - plain.reservation
+    assert flat.reservation - long.reservation == pytest.approx(80.0 + tick_floor)
+    assert long.asks[0].price < plain.asks[0].price  # the selling side steps forward
+    assert long.bids[0].price < plain.bids[0].price  # and the buying side backs off

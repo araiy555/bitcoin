@@ -308,6 +308,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             # struck 2,314 times in a busy hour and never once in a quiet one.
             # The volatility term is what adapts, so it has to be reachable.
             vol_multiplier=getattr(args, "vol_multiplier", 0.05),
+            inventory_skew_bps=getattr(args, "inventory_skew_bps", 0.0),
             max_distance_ticks=getattr(args, "max_distance", None),
             # Quote at least wide enough to cover what the venue charges us.
             min_edge_bps=args.min_edge_bps if args.min_edge_bps is not None else args.maker_bps,
@@ -5612,6 +5613,10 @@ def add_common(p: argparse.ArgumentParser) -> None:
 
     mm = p.add_argument_group("market maker")
     mm.add_argument("--gamma", type=float, default=0.6, help="risk aversion")
+    mm.add_argument(
+        "--inventory-skew-bps", type=float, default=0.0,
+        help="在庫上限まで持ったときに注文をずらす幅(bps)。在庫を減らす側が前に出る",
+    )
     mm.add_argument("--kappa", type=float, default=1.4, help="order arrival intensity")
     mm.add_argument("--levels", type=int, default=3, help="ladder depth per side")
     mm.add_argument("--level-step", type=int, default=2, help="ticks between levels")
