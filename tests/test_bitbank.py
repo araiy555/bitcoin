@@ -6,6 +6,8 @@ would put back levels the venue had already cleared.
 
 from decimal import Decimal
 
+import pytest
+
 from jsboard.core.types import Side
 from jsboard.feed.base import DepthDelta, DepthSnapshot, TradeTick
 from jsboard.feed.bitbank import BitbankFeed, instrument_from_pair
@@ -77,3 +79,45 @@ class TestFrames:
         assert BitbankFeed.decode_frame("2")[0] == "ping"
         kind, body = BitbankFeed.decode_frame('42["message",{"room_name":"r"}]')
         assert kind == "message" and body == {"room_name": "r"}
+
+
+@pytest.mark.asyncio
+async def test_a_silent_socket_is_dropped_and_reconnected(monkeypatch):
+    # A connection that dies without closing sends nothing, forever. Paper
+    # trading waited on one for a night with no log and no day rollover.
+    import asyncio
+
+    import jsboard.feed.bitbank as bitbank
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import FeedStatus
+
+    connects = []
+
+    class Silent:
+        async def __aenter__(self):
+            connects.append(1)
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def recv(self):
+            await asyncio.sleep(3600)
+
+        async def send(self, text):
+            pass
+
+    monkeypatch.setattr(bitbank.websockets, "connect", lambda *a, **k: Silent())
+    inst = Instrument("ada_jpy", Decimal("0.001"), Decimal("0.0001"), "ADA", "JPY")
+    feed = bitbank.BitbankFeed(inst, stall_s=0.05, max_reconnect_delay=0.01)
+    seen = []
+
+    async def watch():
+        async for event in feed.stream():
+            if isinstance(event, FeedStatus):
+                seen.append(event.state)
+            if seen.count("connecting") >= 2:
+                return
+
+    await asyncio.wait_for(watch(), timeout=5)
+    assert seen == ["connecting", "disconnected", "connecting"] and connects == [1]

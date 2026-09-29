@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 
 PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 WS_URL = "wss://stream.bitbank.cc/socket.io/?EIO=4&transport=websocket"
+STALL_S = 60.0
+"""The server pings every 25 seconds, so a minute with no frame at all is a
+dead socket rather than a quiet book. Without this limit a connection that
+dies without closing leaves the stream waiting forever, and paper trading
+with it: no log, no day rollover, no halt check."""
 
 
 def instrument_from_pair(info: dict) -> Instrument:
@@ -61,10 +66,17 @@ async def fetch_instrument(pair: str) -> Instrument:
 class BitbankFeed(Feed):
     """Live bitbank book (whole + diffs) and taker trades for one pair."""
 
-    def __init__(self, instrument: Instrument, *, max_reconnect_delay: float = 30.0) -> None:
+    def __init__(
+        self,
+        instrument: Instrument,
+        *,
+        max_reconnect_delay: float = 30.0,
+        stall_s: float = STALL_S,
+    ) -> None:
         super().__init__(instrument)
         self.pair = instrument.symbol
         self.max_reconnect_delay = max_reconnect_delay
+        self.stall_s = stall_s
         self._whole_seq = -1
 
     @property
@@ -153,7 +165,13 @@ class BitbankFeed(Feed):
                     WS_URL, ping_interval=None, max_queue=2**16, ssl=ssl_context()
                 ) as ws:
                     live = False
-                    async for raw in ws:
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=self.stall_s)
+                        except TimeoutError:
+                            raise ConnectionError(
+                                f"no data for {self.stall_s:.0f}s"
+                            ) from None
                         kind, body = self.decode_frame(raw)
                         if kind == "open":
                             await ws.send("40")
