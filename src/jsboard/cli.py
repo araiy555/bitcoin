@@ -2750,6 +2750,7 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             fills=row["fills"],
             short_bps=row["short_bps"],
             after_fees_bps=row["attributed_bps"],
+            pnl=row["total"],
         )
         # A trial change is replayed beside the fixed settings, never in
         # their place: the fixed row is what the halt and go-live checks read.
@@ -2770,6 +2771,7 @@ async def cmd_daily(args: argparse.Namespace) -> int:
                     fills=t["fills"],
                     short_bps=round(t["short_bps"], 3),
                     after_fees_bps=round(t["attributed_bps"], 3),
+                    pnl=round(t["total"]),
                 )
             result.trial = trial
         results.append(result)

@@ -110,7 +110,7 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
     args = build_parser().parse_args(["daily", "--s3-bucket", "b", "--date", "2026-09-26"])
     assert await args.func(args) == 0
     out = capsys.readouterr().out
-    assert "bitbank ada_jpy: 10秒内計" in out
+    assert "bitbank ada_jpy: *損益" in out
     report = json.loads(objects["reports/daily/2026-09-26.json"])
     [row] = report["results"]
     assert row["target"] == "bitbank:ada_jpy"
@@ -118,7 +118,8 @@ async def test_the_morning_run_replays_a_day_and_files_the_report(monkeypatch, c
     assert row["short_bps"] is not None
     assert row["trial"]["settings"] == "在庫の片寄せ 20bps"
     assert row["trial"]["fills"] > 0
-    assert "試験中（在庫の片寄せ 20bps）" in out
+    assert "試験中（在庫の片寄せ 20bps）: *損益" in out
+    assert row["pnl"] is not None and f"損益 {row['pnl']:+,}円" in out
 
 
 def daily_history(*edges):

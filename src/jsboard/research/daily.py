@@ -77,6 +77,8 @@ class DayResult:
     fills: int = 0
     short_bps: float = math.nan
     after_fees_bps: float = math.nan
+    pnl: float = math.nan
+    """The day's profit in the quote currency (yen), fees and inventory included."""
     note: str = ""
     trial: dict | None = None
     """The same day under the book's trial settings, when it has any."""
@@ -90,6 +92,7 @@ class DayResult:
             "after_fees_bps": (
                 None if math.isnan(self.after_fees_bps) else round(self.after_fees_bps, 3)
             ),
+            "pnl": None if math.isnan(self.pnl) else round(self.pnl),
             "note": self.note,
         }
 
@@ -107,6 +110,10 @@ def losing_streak(key: str, today: float, history: list[dict]) -> int:
     return streak
 
 
+def _yen(value: float) -> str:
+    return "損益 —" if math.isnan(value) else f"*損益 {value:+,.0f}円*"
+
+
 def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
     lines = [f"*日次検証 {date}（UTC の1日分、設定は固定）*"]
     for r in results:
@@ -117,7 +124,7 @@ def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
         streak = losing_streak(key, r.short_bps, history)
         flag = f"  :warning: {streak}日連続マイナス" if streak >= ALERT_AFTER_DAYS else ""
         lines.append(
-            f"• {r.target.label}: 10秒内計 {r.short_bps:+.2f}bps  "
+            f"• {r.target.label}: {_yen(r.pnl)}  10秒内計 {r.short_bps:+.2f}bps  "
             f"手数料後 {r.after_fees_bps:+.2f}bps  約定 {r.fills:,}{flag}"
         )
         if r.trial:
@@ -125,11 +132,16 @@ def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
             if t.get("short_bps") is None:
                 lines.append(f"    試験中（{t['settings']}）: {t.get('note') or '結果なし'}")
             else:
+                pnl = t.get("pnl")
                 lines.append(
-                    f"    試験中（{t['settings']}）: 10秒内計 {t['short_bps']:+.2f}bps  "
+                    f"    試験中（{t['settings']}）: "
+                    f"{_yen(math.nan if pnl is None else pnl)}  10秒内計 {t['short_bps']:+.2f}bps  "
                     f"手数料後 {t['after_fees_bps']:+.2f}bps  約定 {t['fills']:,}"
                 )
-    lines.append("_10秒内計 = スプレッド + 10秒以内の在庫損益 + 手数料（その日の値動きの運を除いた実力）。_")
+    lines.append(
+        "_損益 = 1回約1万円で1日出した場合の円の損益（リベートと在庫の値動き込み）。"
+        "10秒内計 = スプレッド + 10秒以内の在庫損益 + 手数料（その日の値動きの運を除いた実力）。_"
+    )
     return "\n".join(lines)
 
 
