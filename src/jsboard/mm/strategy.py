@@ -154,10 +154,12 @@ class MarketMaker:
         # against the post-jump mid would credit us the adverse move it cost.
         mid = self.market.mid
         self.market.apply(event)
-        ts = getattr(event, "ts_ns", 0) or 0
-        if ts:
-            self.stats.first_event_ns = self.stats.first_event_ns or ts
-            self.stats.last_event_ns = max(self.stats.last_event_ns, ts)
+        # Market data only: a replay announces itself with a status event
+        # stamped by the wall clock, days after the data it then plays.
+        if isinstance(event, (TradeTick, DepthDelta, DepthSnapshot)) and event.ts_ns:
+            first = self.stats.first_event_ns
+            self.stats.first_event_ns = min(first, event.ts_ns) if first else event.ts_ns
+            self.stats.last_event_ns = max(self.stats.last_event_ns, event.ts_ns)
 
         fills: list[Fill] = []
         if isinstance(event, TradeTick):

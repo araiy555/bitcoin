@@ -304,3 +304,19 @@ def _churn(tolerance: int) -> int:
 
 def test_a_price_tolerance_stops_one_tick_wobbles_from_moving_orders():
     assert _churn(2) < _churn(0) / 3
+
+
+def test_the_change_rate_is_measured_on_market_time_not_the_replay_banner():
+    from jsboard.cli import build_maker, build_parser
+
+    args = build_parser().parse_args([
+        "sweep", "-", "--source", "bitbank", "--maker-bps=-2", "--size", "100",
+        "--max-position", "1000",
+    ])
+    mm = build_maker(INST, args)
+    mm.on_event(FeedStatus("connecting", "replay"))  # stamped now, days later
+    day = 1_790_380_800_000_000_000
+    for i in range(3):
+        mm.on_event(DepthSnapshot(((37_190, 9_000_000),), ((37_210, 9_000_000),), i,
+                                  day + i * 60_000_000_000))
+    assert (mm.stats.last_event_ns - mm.stats.first_event_ns) / 1e9 == 120.0
