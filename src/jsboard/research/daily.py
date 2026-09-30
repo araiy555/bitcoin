@@ -168,6 +168,11 @@ def halt_key(target: Target) -> str:
     return f"{HALT_PREFIX}/{target.venue}_{target.symbol}.json"
 
 
+def live_halt_key(target: Target) -> str:
+    """Set when live trading stops on a loss; only a person clears it."""
+    return f"{HALT_PREFIX}/live_{target.venue}_{target.symbol}.json"
+
+
 def paper_key(target: Target, day: str) -> str:
     return f"{PAPER_PREFIX}/{day}/{target.venue}_{target.symbol}.json"
 

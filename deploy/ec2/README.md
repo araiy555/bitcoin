@@ -117,6 +117,32 @@ jsboard tune --target bitbank:ada_jpy --s3-bucket jsboard-capture --reset       
   自動停止と本番の条件は、元の設定の結果で判定します。
 - 試験中の設定が **2日続けて元の設定に負けたら、自動で元に戻します**（Slack に通知）。
 
+## 本番の注文（jsboard trade）
+
+紙上トレードと同じ戦略・同じ設定で、bitbank に本当の注文を出します。
+**`--live` を付けない限り練習モード**で、注文は一切出しません（出したふりをして、
+注文と取消しの流れと守りの動きだけを確かめます）。
+
+```
+# 練習（前面で数分動かして Ctrl+C。止めると「注文はすべて取り消しました」と出る）
+sudo -u jsboard /opt/jsboard/venv/bin/jsboard trade --log-every 60
+# 常駐させる（練習のまま）
+sudo systemctl enable --now jsboard-trade@bitbank:ada_jpy
+sudo journalctl -u 'jsboard-trade@*' -n 20 --no-pager
+```
+
+本番にするときは `/etc/jsboard.env` の `JSBOARD_TRADE_FLAGS` に `--live` を足して
+`sudo systemctl restart 'jsboard-trade@*'` します。
+
+守り:
+- 損失が `--max-loss-jpy`（既定 2,000円）に達したら全部取り消して止まり、停止フラグを残す。
+  再開は確認してから `jsboard resume --target bitbank:ada_jpy --s3-bucket jsboard-capture --live`
+  のあと、サービスを起動し直す。
+- 板のデータが5秒止まる、先行市場が60秒で1.5%以上動く、bitbank への呼び出しが5回続けて
+  失敗する、のどれかで全部取り消す（前の2つは収まれば再開、最後は停止）。
+- 毎朝の検証の自動停止フラグにも従う。起動時と終了時（systemctl stop を含む）に、
+  この銘柄の注文を全部取り消す。この銘柄の注文は、動いている間はプログラムが全部管理する。
+
 ## 確認
 
 ```

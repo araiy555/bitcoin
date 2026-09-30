@@ -50,7 +50,11 @@ def load_keys(env_file: str | None = None) -> tuple[str, str] | None:
     """The key pair from the environment, else from KEY=VALUE lines in a file."""
     values = {k: os.environ.get(k, "") for k in KEY_VARS}
     if env_file and not all(values.values()):
-        for line in Path(env_file).read_text().splitlines():
+        try:
+            text = Path(env_file).read_text()
+        except OSError:
+            text = ""
+        for line in text.splitlines():
             name, sep, value = line.strip().partition("=")
             if sep and name in KEY_VARS and not values[name]:
                 values[name] = value.strip().strip('"').strip("'")
@@ -123,6 +127,19 @@ class BitbankPrivate:
             "GET", "/v1/user/spot/order", params={"pair": pair, "order_id": order_id}
         )
         return str(data["status"])
+
+    async def onhand(self) -> dict[str, Decimal]:
+        """Total held per asset, including what resting orders have locked."""
+        data = await self._call("GET", "/v1/user/assets")
+        return {a["asset"]: Decimal(str(a.get("onhand_amount", "0"))) for a in data["assets"]}
+
+    async def trade_history(self, pair: str, since_ms: int) -> list[dict]:
+        """Our executions on `pair` since `since_ms`, oldest first."""
+        data = await self._call(
+            "GET", "/v1/user/spot/trade_history",
+            params={"pair": pair, "since": since_ms, "order": "asc", "count": 1000},
+        )
+        return list(data.get("trades", []))
 
     async def active_orders(self, pair: str) -> list[int]:
         data = await self._call("GET", "/v1/user/spot/active_orders", params={"pair": pair})

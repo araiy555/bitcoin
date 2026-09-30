@@ -3073,6 +3073,204 @@ async def cmd_paper(args: argparse.Namespace) -> int:
     return 1
 
 
+async def cmd_trade(args: argparse.Namespace) -> int:
+    """Quote a bitbank book with real orders — or, without --live, pretend to.
+
+    The maker, settings and lead gate are the paper run's; only the venue
+    differs. Without --live every order goes to a stand-in that accepts and
+    never fills, so the order flow and the guards can be watched on the live
+    feed first. A loss past --max-loss-jpy stops the run and leaves a flag
+    that only `jsboard resume --live` clears; every exit cancels every order.
+    """
+    import asyncio as _asyncio
+
+    from .live.bitbank import BitbankPrivate, load_keys
+    from .live.runner import (
+        Breaker,
+        DryRunApi,
+        Health,
+        RequestBudget,
+        cancel_everything,
+        run_executor,
+        run_fill_poller,
+        run_watchdog,
+    )
+    from .live.venue import LiveVenue
+    from .research.daily import FIXED_FLAGS, Target, halt_key, live_halt_key, size_for
+    from .sim.s3 import default_client, exists
+
+    try:
+        target = Target.parse(args.target)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if target.venue != "bitbank":
+        raise ConfigError("本番の注文は今のところ bitbank だけです。")
+    label = f"{target.venue} {target.symbol}"
+    mode = "本番" if args.live else "練習（注文は出しません）"
+
+    async def say(text: str) -> None:
+        console.print(text)
+        if args.slack:
+            await _post_slack(text)
+
+    flags = [halt_key(target), live_halt_key(target)] if args.s3_bucket else []
+
+    def halted_by_flag() -> str:
+        for key in flags:
+            if exists(f"s3://{args.s3_bucket}/{key}"):
+                return key
+        return ""
+
+    if flag := halted_by_flag():
+        console.print(f"[yellow]停止フラグ {flag} があるので始めません。[/yellow]")
+        return 0
+
+    instrument, feed = await _live_book(target)
+    lead_inst = await fetch_futures_instrument(
+        (args.lead_symbol or f"{instrument.base}USDT").upper()
+    )
+    stream = feed.stream()
+    buffered, price = [], None
+    async for event in stream:
+        buffered.append(event)
+        if isinstance(event, DepthSnapshot) and event.bids and event.asks:
+            price = (event.bids[0][0] + event.asks[0][0]) / 2 * float(instrument.tick_size)
+            break
+    if price is None:
+        console.print("[red]板を受け取れませんでした。[/red]")
+        return 1
+
+    if args.live:
+        keys = load_keys(args.env_file)
+        if keys is None:
+            console.print("[red]API キーが見つかりません（/etc/jsboard.env）。[/red]")
+            return 1
+        session = make_session()
+        api = BitbankPrivate(*keys, session=session)
+        held = await api.onhand()
+        quote_bal = held.get(instrument.quote.lower(), Decimal(0))
+        base_bal = held.get(instrument.base.lower(), Decimal(0))
+    else:
+        session, api = None, DryRunApi()
+        quote_bal = Decimal(str(args.dry_jpy)) / 2
+        base_bal = (Decimal(str(args.dry_jpy)) / 2 / Decimal(str(price))).quantize(
+            instrument.lot_size
+        )
+
+    size = size_for(args.order_jpy, price, instrument.lot_size)
+    run_args = build_parser().parse_args([
+        "sweep", "-", "--source", target.venue, *FIXED_FLAGS,
+        f"--maker-bps={await _maker_bps_for(target)}",
+        "--size", size, "--max-position", str(Decimal(size) * args.max_orders),
+        "--max-drawdown", str(args.max_loss_jpy),
+    ])
+    mm = build_maker(instrument, run_args)
+    venue = LiveVenue(instrument, quote_balance=quote_bal, base_balance=base_bal)
+    mm.venue = venue
+    lead_view = MarketView(instrument=lead_inst, depth=20)
+    lead_view.clock = mm.market.clock
+    mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
+
+    health, budget = Health(), RequestBudget(args.max_requests_per_s)
+    breaker = Breaker(move_pct=args.breaker_pct)
+    last_event = [time.monotonic()]
+    notes: list[str] = []
+
+    if args.live:
+        stale = await cancel_everything(api, target.symbol, venue)
+        venue.blocked = ""
+        if stale:
+            await say(f":warning: 始める前の注文を取り消せませんでした: {stale}")
+            return 1
+
+    async def pump_lead() -> None:
+        async for event in _binance_lead(lead_inst, 100).stream():
+            lead_view.apply(event)
+
+    async def events():
+        for event in buffered:
+            yield event
+        async for event in stream:
+            yield event
+
+    tasks = [
+        _asyncio.create_task(pump_lead()),
+        _asyncio.create_task(run_executor(venue, api, target.symbol, health, budget)),
+        _asyncio.create_task(run_fill_poller(venue, api, target.symbol, health)),
+        _asyncio.create_task(run_watchdog(
+            venue, health, lambda: last_event[0], lambda: lead_view.mid, breaker,
+            notes.append, stale_s=args.stale_s,
+        )),
+    ]
+    await say(
+        f":rocket: {label} を{mode}で開始  1回 {size} {instrument.base}（約 {args.order_jpy:,.0f} 円）"
+        f"  在庫上限 {args.max_orders} 回分  損失上限 {args.max_loss_jpy:,.0f} 円\n"
+        f"  残高 {instrument.quote} {quote_bal:,.0f}  {instrument.base} {base_bal:,}"
+    )
+
+    reason, code = "板のデータが終わりました", 1
+    last_log, last_flag_check = time.monotonic(), time.monotonic()
+    # systemd stops a service with SIGTERM, which by default kills Python
+    # on the spot and would leave every order resting. Turn it into a
+    # cancellation so the cleanup below runs.
+    import signal
+
+    with contextlib.suppress(NotImplementedError, RuntimeError):
+        _asyncio.get_running_loop().add_signal_handler(
+            signal.SIGTERM, _asyncio.current_task().cancel
+        )
+    try:
+        async for event in events():
+            last_event[0] = time.monotonic()
+            mm.on_event(event)
+            if not venue.blocked:
+                mm.requote()
+            venue.forget_done()
+            while notes:
+                await say(f":zap: {label}: {notes.pop(0)}")
+            if health.fatal:
+                reason = health.fatal
+                break
+            if mm.risk.halted:
+                reason, code = f"損失上限: {mm.risk.halt_reason}", 0
+                if args.s3_bucket:
+                    default_client().put_object(
+                        Bucket=args.s3_bucket, Key=live_halt_key(target),
+                        Body=json.dumps({"reason": reason}, ensure_ascii=False).encode(),
+                    )
+                break
+            now = time.monotonic()
+            if flags and now - last_flag_check >= 60:
+                last_flag_check = now
+                if flag := halted_by_flag():
+                    reason, code = f"停止フラグ {flag}", 0
+                    break
+            if now - last_log >= args.log_every:
+                last_log = now
+                s = mm.summary()
+                console.print(
+                    f"  損益 {s['total']:+,.0f} {instrument.quote}  約定 {int(s['fills']):,}"
+                    f"  在庫 {s['position']:+,.4g} {instrument.base}  注文中 {len(venue.open_orders())}"
+                    f"  送信待ち {len(venue.intents)}  {venue.blocked or mm.stats.last_decision}"
+                )
+    except _asyncio.CancelledError:
+        reason, code = "停止の指示（systemctl stop / Ctrl+C）", 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        stuck = await cancel_everything(api, target.symbol, venue)
+        if session is not None:
+            await session.close()
+    s = mm.summary()
+    await say(
+        f":octagonal_sign: {label}（{mode}）を止めました: {reason}\n"
+        f"  損益 {s['total']:+,.0f} {instrument.quote}  約定 {int(s['fills']):,}"
+        + (f"\n  :rotating_light: 取り消せなかった注文 {stuck}。bitbank の画面で取り消してください。"
+           if stuck else "\n  注文はすべて取り消しました。")
+    )
+    return code
+
+
 async def cmd_halt(args: argparse.Namespace) -> int:
     """Stop quoting one book until `resume`; the paper loop checks every minute."""
     from datetime import UTC, datetime
@@ -3094,10 +3292,14 @@ async def cmd_halt(args: argparse.Namespace) -> int:
 
 async def cmd_resume(args: argparse.Namespace) -> int:
     """Remove a book's halt flag, set by hand or by the morning check."""
-    from .research.daily import Target, halt_key
+    from .research.daily import Target, halt_key, live_halt_key
     from .sim.s3 import default_client
 
     target = Target.parse(args.target)
+    if getattr(args, "live", False):
+        default_client().delete_object(Bucket=args.s3_bucket, Key=live_halt_key(target))
+        console.print(f"{target.label} の本番の停止フラグを消しました（jsboard trade を手で起動し直してください）")
+        return 0
     default_client().delete_object(Bucket=args.s3_bucket, Key=halt_key(target))
     console.print(f"{target.label} の停止フラグを消しました（1分以内に再開します）")
     return 0
@@ -6368,7 +6570,29 @@ def build_parser() -> argparse.ArgumentParser:
         p_ctl.add_argument("--s3-bucket", required=True)
         if name == "halt":
             p_ctl.add_argument("--reason", default="手動で停止")
+        else:
+            p_ctl.add_argument("--live", action="store_true", help="本番の損失上限の停止を解除する")
         p_ctl.set_defaults(func=func)
+
+    p_trade = sub.add_parser("trade", help="bitbank で本番の注文を出す（--live なしは練習）")
+    p_trade.add_argument("--target", default="bitbank:ada_jpy", help="取引所:銘柄")
+    p_trade.add_argument("--lead-symbol", default=None)
+    p_trade.add_argument("--order-jpy", type=float, default=5_000.0, help="1回の注文金額（円）")
+    p_trade.add_argument("--max-orders", type=int, default=5, help="在庫上限（1回の注文の何倍）")
+    p_trade.add_argument("--max-loss-jpy", type=float, default=2_000.0, help="この損失で止める（円）")
+    p_trade.add_argument("--breaker-pct", type=float, default=1.5,
+                        help="先行市場が60秒でこれだけ動いたら5分止める（%%）")
+    p_trade.add_argument("--stale-s", type=float, default=5.0, help="板がこの秒数止まったら全取消し")
+    p_trade.add_argument("--max-requests-per-s", type=float, default=4.0,
+                        help="1秒あたりの注文・取消しの上限")
+    p_trade.add_argument("--dry-jpy", type=float, default=50_000.0,
+                        help="練習のときの仮の元手（半分を円、半分をコインとみなす）")
+    p_trade.add_argument("--env-file", default="/etc/jsboard.env")
+    p_trade.add_argument("--log-every", type=float, default=300.0)
+    p_trade.add_argument("--slack", action="store_true")
+    p_trade.add_argument("--s3-bucket", default=None, help="停止フラグを見るバケット")
+    p_trade.add_argument("--live", action="store_true", help="本当に注文を出す")
+    p_trade.set_defaults(func=cmd_trade)
 
     p_probe = sub.add_parser("bbprobe", help="bitbank の注文と取消しの速さを測る（約定しない注文で）")
     p_probe.add_argument("--pair", default="ada_jpy")

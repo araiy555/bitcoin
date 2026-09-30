@@ -1,0 +1,19 @@
+[Unit]
+Description=jsboard: quote %i with real orders (practice unless JSBOARD_TRADE_FLAGS has --live)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+# Practice by default: add --live to JSBOARD_TRADE_FLAGS in /etc/jsboard.env to send orders.
+ExecStart=/opt/jsboard/venv/bin/jsboard trade --target %i --slack --s3-bucket ${JSBOARD_BUCKET} $JSBOARD_TRADE_FLAGS
+# A loss halt exits 0 and leaves a flag; only a crash restarts, and the
+# restart refuses to start while that flag is there.
+Restart=on-failure
+RestartSec=30
+# Time to cancel every order before systemd gives up on a stop.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
