@@ -364,7 +364,7 @@ class MarketMaker:
         # for each resting order with no exact match, nearest first.
         tol = self.config.price_tolerance_ticks
         if tol > 0:
-            for key, order in list(live.items()):
+            for key in list(live):
                 if key in wanted:
                     continue
                 near = [
