@@ -1,6 +1,7 @@
 """Real orders behind the maker: venue bookkeeping, executor, fills, guards."""
 
 import asyncio
+import time
 from decimal import Decimal
 
 import pytest
@@ -265,3 +266,41 @@ async def test_stopping_the_service_still_cancels_everything(monkeypatch):
     run.cancel()  # what SIGTERM becomes
     assert await run == 0
     assert "停止の指示" in posted[-1] and "注文はすべて取り消しました" in posted[-1]
+
+
+@pytest.mark.asyncio
+async def test_queued_cancels_go_out_as_one_request():
+    v, api, health = venue(), DryRunApi(), Health()
+    orders = [v.place(bid(37_000 - i, 10_000), 0, best_opposite=37_010) for i in range(3)]
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    sent_before = api.cancels_sent
+    v.cancel_all()
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    assert all(o.state == DONE for o in orders) and api.open == set()
+    assert api.cancels_sent - sent_before == 1
+
+
+def _churn(tolerance: int) -> int:
+    from jsboard.cli import build_maker, build_parser
+    from jsboard.research.daily import FIXED_FLAGS
+
+    args = build_parser().parse_args([
+        "sweep", "-", "--source", "bitbank", *FIXED_FLAGS, "--maker-bps=-2",
+        "--size", "100", "--max-position", "1000",
+        "--price-tolerance-ticks", str(tolerance), "--requote-ms", "0",
+    ])
+    mm = build_maker(INST, args)
+    mm.on_event(FeedStatus("live", "fake"))
+    for i in range(40):
+        mid = 37_200 + (i % 2)  # the book wobbles by one tick
+        mm.on_event(DepthSnapshot(tuple((mid - 20 - j, 9_000_000) for j in range(5)),
+                                  tuple((mid + 20 + j, 9_000_000) for j in range(5)), i,
+                                  time.time_ns()))
+        mm.requote(force=True)
+    return mm.stats.orders_placed + mm.stats.orders_cancelled
+
+
+def test_a_price_tolerance_stops_one_tick_wobbles_from_moving_orders():
+    assert _churn(2) < _churn(0) / 3

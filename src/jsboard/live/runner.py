@@ -57,6 +57,13 @@ class DryRunApi:
             raise BitbankError(NOT_FOUND, "dry-run cancel")
         self.open.discard(order_id)
 
+    async def cancel_many(self, pair, order_ids) -> None:
+        self.cancels_sent += 1
+        missing = [i for i in order_ids if i not in self.open]
+        if missing:
+            raise BitbankError(NOT_FOUND, "dry-run cancel_orders")
+        self.open.difference_update(order_ids)
+
     async def status(self, pair, order_id) -> str:
         return "UNFILLED" if order_id in self.open else "CANCELED_UNFILLED"
 
@@ -134,6 +141,8 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
     if order.exchange_id is None:
         order.state = DONE
         return True
+    if order.cancel_tries == 0 and await _cancel_batch(venue, api, pair, order, health):
+        return True
     try:
         await api.cancel(pair, order.exchange_id)
         order.state = DONE
@@ -157,6 +166,43 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
                 return True
         venue.intents.append(("cancel", order_id))
         health.error(exc)
+    return True
+
+
+BATCH_MAX = 30
+
+
+async def _cancel_batch(venue: LiveVenue, api, pair: str, first, health: Health) -> bool:
+    """Cancel `first` together with every other first-try cancel queued.
+
+    True when the batch went through. On any error the orders go back to
+    the one-at-a-time path, which knows how to wait for an order that has
+    not reached the book yet.
+    """
+    batch = [first]
+    rest = deque()
+    while venue.intents:
+        kind, order_id = venue.intents.popleft()
+        order = venue.orders.get(order_id)
+        if (kind == "cancel" and len(batch) < BATCH_MAX and order is not None
+                and order.state != DONE and order.exchange_id is not None
+                and order.cancel_tries == 0 and order not in batch):
+            batch.append(order)
+        else:
+            rest.append((kind, order_id))
+    venue.intents.extendleft(reversed(rest))
+    if len(batch) == 1:
+        return False
+    try:
+        await api.cancel_many(pair, [o.exchange_id for o in batch])
+    except BitbankError:
+        for order in batch:
+            order.cancel_tries = 1  # retry singly
+        venue.intents.extendleft(("cancel", o.order_id) for o in reversed(batch[1:]))
+        return False
+    for order in batch:
+        order.state = DONE
+    health.ok()
     return True
 
 

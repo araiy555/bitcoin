@@ -39,6 +39,15 @@ class StrategyConfig:
     max_orders_per_cycle: int = 12
     """Backstop against a pathological cycle flooding the venue."""
 
+    price_tolerance_ticks: int = 0
+    """Keep a resting order whose price is within this many ticks of the
+    desired one instead of moving it. Zero moves on every tick.
+
+    A live venue caps order changes per second; on a fine-tick book the
+    desired price wobbles by a tick several times a second, so moving on
+    every tick queues more changes than the venue accepts and the orders
+    that do go out are already stale."""
+
     max_inventory_age_s: float = 0.0
     """Once a same-signed position has been held this long, stop adding to it
     and put the reducing quote one tick inside the touch. Zero disables it.
@@ -60,6 +69,8 @@ class StrategyStats:
     fills: int = 0
     last_decision: str = ""
     last_requote_ns: int = 0
+    first_event_ns: int = 0
+    last_event_ns: int = 0
 
     # Where our quotes actually landed relative to the touch, in ticks:
     # negative improves on the best price, 0 joins it, positive rests behind
@@ -143,6 +154,10 @@ class MarketMaker:
         # against the post-jump mid would credit us the adverse move it cost.
         mid = self.market.mid
         self.market.apply(event)
+        ts = getattr(event, "ts_ns", 0) or 0
+        if ts:
+            self.stats.first_event_ns = self.stats.first_event_ns or ts
+            self.stats.last_event_ns = max(self.stats.last_event_ns, ts)
 
         fills: list[Fill] = []
         if isinstance(event, TradeTick):
@@ -344,6 +359,21 @@ class MarketMaker:
         live = {(int(o.side), o.price): o for o in self.venue.open_orders()}
         wanted = {q.key(): q for q in desired.all()}
         placed = 0
+
+        # Close enough counts as the same order: claim a nearby wanted quote
+        # for each resting order with no exact match, nearest first.
+        tol = self.config.price_tolerance_ticks
+        if tol > 0:
+            for key, order in list(live.items()):
+                if key in wanted:
+                    continue
+                near = [
+                    k for k in wanted
+                    if k[0] == key[0] and abs(k[1] - key[1]) <= tol and k not in live
+                ]
+                if near:
+                    nearest = min(near, key=lambda k: abs(k[1] - key[1]))
+                    wanted[key] = wanted.pop(nearest)
 
         for key, order in list(live.items()):
             quote = wanted.get(key)

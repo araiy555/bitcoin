@@ -365,6 +365,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
         config=StrategyConfig(
             requote_interval_ms=args.requote_ms,
             max_inventory_age_s=getattr(args, "max_inventory_age_s", 0.0),
+            price_tolerance_ticks=getattr(args, "price_tolerance_ticks", 0),
         ),
     )
 
@@ -1156,6 +1157,14 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
         "lead_pct": tox.get("lead_share", 0.0) * 100.0,
         "unwind_pct": tox.get("unwind_share", 0.0) * 100.0,
+        # Order changes per second of recording: what a live venue would
+        # have to accept. Above its limit the changes queue and go stale.
+        "req_per_s": (
+            (mm.stats.orders_placed + mm.stats.orders_cancelled)
+            / ((mm.stats.last_event_ns - mm.stats.first_event_ns) / 1e9)
+            if mm.stats.last_event_ns > mm.stats.first_event_ns
+            else math.nan
+        ),
         **{
             f"age_{i}": value
             for i, (_, _, value) in enumerate(mm.attribution.age_buckets(matched))
@@ -1295,6 +1304,7 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("毒性全取消%", "tox_pull_pct", "{:.0f}"),
         ("先行引%", "lead_pct", "{:.0f}"),
         ("手仕舞%", "unwind_pct", "{:.0f}"),
+        ("送信/秒", "req_per_s", "{:.1f}"),
     ]
 
     def cell(row: dict, key: str, fmt: str) -> str:
@@ -6053,6 +6063,10 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="half-spread floor in bps (defaults to the maker fee)",
     )
     mm.add_argument("--requote-ms", type=float, default=250.0)
+    mm.add_argument(
+        "--price-tolerance-ticks", type=int, default=0,
+        help="注文の値段がこのティック数以内のずれなら出し直さない（本番の送信数を減らす）",
+    )
     mm.add_argument(
         "--max-inventory-age-s",
         type=float,
