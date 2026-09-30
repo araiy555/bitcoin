@@ -3198,6 +3198,12 @@ async def cmd_bbprobe(args: argparse.Namespace) -> int:
             f"  残高: {quote.upper()} {balances.get(quote, 0):,}  "
             f"{base.upper()} {balances.get(base, 0):,}  （残高の読み取り {read_ms:.0f}ms）"
         )
+        resting = await api.active_orders(args.pair)
+        if resting:
+            console.print(
+                f"  [yellow]{args.pair} の注文中: {len(resting)} 件（番号 {resting}）。"
+                f"前回の測定の残りなら、bitbank の画面で取り消してください。[/yellow]"
+            )
 
         amount = Decimal(args.amount) if args.amount else Decimal(
             str(info.get("unit_amount") or instrument.lot_size)
@@ -3215,7 +3221,7 @@ async def cmd_bbprobe(args: argparse.Namespace) -> int:
             return 1
         try:
             result = await probe(api, args.pair, price, amount, args.rounds)
-        except BitbankError as exc:
+        except (BitbankError, RuntimeError) as exc:
             console.print(f"[red]{exc}[/red]")
             console.print(
                 "[red]注文が残っていないか、bitbank の画面で必ず確認してください。[/red]"

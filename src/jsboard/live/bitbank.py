@@ -21,11 +21,16 @@ import time
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
+from urllib.parse import urlencode
 
 API_URL = "https://api.bitbank.cc"
 PUBLIC_URL = "https://public.bitbank.cc"
 ERRORS_URL = "https://github.com/bitbankinc/bitbank-api-docs/blob/master/errors.md"
 KEY_VARS = ("BITBANK_API_KEY", "BITBANK_API_SECRET")
+NOT_FOUND = 50009
+"""What bitbank answers for an order it has not finished accepting: an order
+cancelled the instant its POST returns can still be on its way to the book."""
+DONE = ("CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED")
 
 
 class BitbankError(RuntimeError):
@@ -83,8 +88,11 @@ class BitbankPrivate:
         ) as resp:
             return await resp.json(content_type=None)
 
-    async def _call(self, method: str, path: str, payload: dict | None = None) -> dict:
+    async def _call(
+        self, method: str, path: str, payload: dict | None = None, params: dict | None = None
+    ) -> dict:
         if method == "GET":
+            path = path + ("?" + urlencode(params) if params else "")
             reply = await self._send("GET", API_URL + path, self._headers(path), None)
         else:
             body = json.dumps(payload or {}, separators=(",", ":"))
@@ -110,10 +118,59 @@ class BitbankPrivate:
             "POST", "/v1/user/spot/cancel_order", {"pair": pair, "order_id": order_id}
         )
 
+    async def status(self, pair: str, order_id: int) -> str:
+        data = await self._call(
+            "GET", "/v1/user/spot/order", params={"pair": pair, "order_id": order_id}
+        )
+        return str(data["status"])
+
+    async def active_orders(self, pair: str) -> list[int]:
+        data = await self._call("GET", "/v1/user/spot/active_orders", params={"pair": pair})
+        return [int(o["order_id"]) for o in data.get("orders", [])]
+
+
+async def wait_live(api, pair: str, order_id: int, timeout_s: float = 5.0) -> bool:
+    """Poll until the order rests on the book (or is already done)."""
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        try:
+            state = await api.status(pair, order_id)
+        except BitbankError as exc:
+            if exc.code != NOT_FOUND:
+                raise
+        else:
+            if state in ("UNFILLED", "PARTIALLY_FILLED", *DONE):
+                return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def cancel_until_gone(api, pair: str, order_id: int, timeout_s: float = 5.0) -> None:
+    """Cancel, retrying while bitbank still says it has no such order."""
+    deadline = time.perf_counter() + timeout_s
+    delay = 0.05
+    while True:
+        try:
+            await api.cancel(pair, order_id)
+            return
+        except BitbankError as exc:
+            if exc.code != NOT_FOUND:
+                try:
+                    if await api.status(pair, order_id) in DONE:
+                        return
+                except BitbankError:
+                    pass
+                raise
+            if time.perf_counter() > deadline:
+                raise
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 0.5)
+
 
 @dataclass(frozen=True)
 class ProbeResult:
     order_ms: list[float]
+    live_ms: list[float]
     cancel_ms: list[float]
 
     @staticmethod
@@ -134,8 +191,9 @@ class ProbeResult:
 
     def text(self) -> str:
         return (
-            f"  注文 {self._describe(self.order_ms)}\n"
-            f"  取消 {self._describe(self.cancel_ms)}\n"
+            f"  注文の返事 {self._describe(self.order_ms)}\n"
+            f"  板に載るまで {self._describe(self.live_ms)}\n"
+            f"  取消し     {self._describe(self.cancel_ms)}\n"
             f"  → {self.verdict()}"
         )
 
@@ -146,31 +204,46 @@ def far_bid(best_bid: Decimal, tick: Decimal, below: Decimal = Decimal("0.1")) -
 
 
 async def probe(
-    api: BitbankPrivate,
+    api,
     pair: str,
     price: Decimal,
     amount: Decimal,
     rounds: int,
     pause_s: float = 1.0,
 ) -> ProbeResult:
-    """Place and cancel `rounds` unfillable orders, timing each call."""
+    """Place and cancel `rounds` unfillable orders, timing each step.
+
+    Every order placed is tracked, and a last sweep of the open orders
+    cancels any of them still resting, whatever went wrong on the way.
+    """
     order_ms: list[float] = []
+    live_ms: list[float] = []
     cancel_ms: list[float] = []
-    for i in range(rounds):
-        order_id = None
-        try:
+    placed: list[int] = []
+    try:
+        for i in range(rounds):
             t0 = time.perf_counter()
             order_id = await api.order(pair, "buy", price, amount)
+            placed.append(order_id)
             t1 = time.perf_counter()
-            await api.cancel(pair, order_id)
+            if await wait_live(api, pair, order_id):
+                live_ms.append((time.perf_counter() - t0) * 1000)
             t2 = time.perf_counter()
-            order_id = None
+            await cancel_until_gone(api, pair, order_id)
+            t3 = time.perf_counter()
             order_ms.append((t1 - t0) * 1000)
-            cancel_ms.append((t2 - t1) * 1000)
-        finally:
-            if order_id is not None:
-                # A failed cancel would leave a real order resting: try again.
-                await api.cancel(pair, order_id)
-        if i + 1 < rounds:
-            await asyncio.sleep(pause_s)
-    return ProbeResult(order_ms, cancel_ms)
+            cancel_ms.append((t3 - t2) * 1000)
+            if i + 1 < rounds:
+                await asyncio.sleep(pause_s)
+    finally:
+        stuck = []
+        for order_id in sorted(set(placed) & set(await api.active_orders(pair))):
+            try:
+                await cancel_until_gone(api, pair, order_id)
+            except BitbankError:
+                stuck.append(order_id)
+        if stuck:
+            raise RuntimeError(
+                f"取り消せなかった注文があります: {stuck}。bitbank の画面で取り消してください。"
+            )
+    return ProbeResult(order_ms, live_ms, cancel_ms)

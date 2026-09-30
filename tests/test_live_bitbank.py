@@ -77,37 +77,77 @@ async def test_an_error_reply_raises_with_its_code():
         await api.assets()
 
 
+class Venue:
+    """Accepts an order a few polls after the POST returns, as bitbank did."""
+
+    def __init__(self, accept_after=2, cancel_error=None):
+        self.accept_after = accept_after
+        self.cancel_error = cancel_error
+        self.polls = {}
+        self.open = set()
+        self.next_id = 100
+
+    async def order(self, pair, side, price, amount):
+        self.next_id += 1
+        self.polls[self.next_id] = 0
+        return self.next_id
+
+    def _accepted(self, order_id):
+        self.polls[order_id] += 1
+        if self.polls[order_id] >= self.accept_after:
+            self.open.add(order_id)
+            return True
+        return False
+
+    async def status(self, pair, order_id):
+        if order_id not in self.open and not self._accepted(order_id):
+            raise BitbankError(50009, "/v1/user/spot/order")
+        return "UNFILLED"
+
+    async def cancel(self, pair, order_id):
+        if self.cancel_error:
+            raise BitbankError(self.cancel_error, "/v1/user/spot/cancel_order")
+        if order_id not in self.open and not self._accepted(order_id):
+            raise BitbankError(50009, "/v1/user/spot/cancel_order")
+        self.open.discard(order_id)
+
+    async def active_orders(self, pair):
+        return sorted(self.open) + [7]  # 7: someone else's order, never touched
+
+
 @pytest.mark.asyncio
-async def test_the_probe_times_each_round_and_always_cancels():
-    class Fake:
-        def __init__(self):
-            self.open = set()
-            self.fail_next_cancel = True
+async def test_the_probe_waits_for_the_book_then_cancels_every_order():
+    venue = Venue(accept_after=3)
+    result = await probe(venue, "ada_jpy", Decimal("30"), Decimal("1"), rounds=3, pause_s=0)
+    assert len(result.order_ms) == len(result.live_ms) == len(result.cancel_ms) == 3
+    assert venue.open == set()
 
-        async def order(self, pair, side, price, amount):
-            self.open.add(len(self.open) + 1)
-            return max(self.open)
 
-        async def cancel(self, pair, order_id):
-            if self.fail_next_cancel:
-                self.fail_next_cancel = False
-                raise BitbankError(50009, "/v1/user/spot/cancel_order")
-            self.open.discard(order_id)
+@pytest.mark.asyncio
+async def test_a_cancel_sent_before_the_order_lands_is_retried():
+    from jsboard.live.bitbank import cancel_until_gone
 
-    api = Fake()
-    with pytest.raises(BitbankError):
-        await probe(api, "ada_jpy", Decimal("30"), Decimal("1"), rounds=3, pause_s=0)
-    assert api.open == set()  # the failed cancel was retried, nothing left resting
+    venue = Venue(accept_after=4)
+    order_id = await venue.order("ada_jpy", "buy", Decimal("30"), Decimal("1"))
+    await cancel_until_gone(venue, "ada_jpy", order_id)
+    assert venue.open == set() and venue.polls[order_id] == 4
 
-    result = await probe(api, "ada_jpy", Decimal("30"), Decimal("1"), rounds=3, pause_s=0)
-    assert len(result.order_ms) == len(result.cancel_ms) == 3
-    assert api.open == set()
+
+@pytest.mark.asyncio
+async def test_orders_left_by_an_error_are_swept_at_the_end():
+    venue = Venue(accept_after=1, cancel_error=50010)
+    with pytest.raises(RuntimeError, match="取り消せなかった注文"):
+        await probe(venue, "ada_jpy", Decimal("30"), Decimal("1"), rounds=2, pause_s=0)
+    venue.cancel_error = None
+    # The sweep ran while cancels were failing; a later run's sweep clears it.
+    await probe(venue, "ada_jpy", Decimal("30"), Decimal("1"), rounds=1, pause_s=0)
+    assert 101 in venue.open  # placed by the first run, not this one: left alone
 
 
 def test_the_verdict_follows_the_replay_thresholds():
-    assert "ほぼ落ちない" in ProbeResult([80.0], [120.0, 150.0, 900.0]).verdict()
-    assert "半分" in ProbeResult([80.0], [600.0]).verdict()
-    assert "見送り" in ProbeResult([80.0], [1500.0]).verdict()
+    assert "ほぼ落ちない" in ProbeResult([80.0], [90.0], [120.0, 150.0, 900.0]).verdict()
+    assert "半分" in ProbeResult([80.0], [90.0], [600.0]).verdict()
+    assert "見送り" in ProbeResult([80.0], [90.0], [1500.0]).verdict()
 
 
 @pytest.mark.asyncio
@@ -130,6 +170,8 @@ async def test_without_yes_nothing_is_ordered(monkeypatch, capsys, tmp_path):
 
     async def send(self, method, url, headers, body):
         sent.append(url)
+        if "active_orders" in url:
+            return {"success": 1, "data": {"orders": []}}
         return {"success": 1, "data": {"assets": [{"asset": "jpy", "free_amount": "500"}]}}
 
     monkeypatch.setattr(cli, "_get_json", get_json)
@@ -138,4 +180,5 @@ async def test_without_yes_nothing_is_ordered(monkeypatch, capsys, tmp_path):
     assert await args.func(args) == 0
     out = capsys.readouterr().out
     assert "33.493" in out and "まだ注文は出していません" in out
-    assert sent == ["https://api.bitbank.cc/v1/user/assets"]
+    assert sent == ["https://api.bitbank.cc/v1/user/assets",
+                    "https://api.bitbank.cc/v1/user/spot/active_orders?pair=ada_jpy"]
