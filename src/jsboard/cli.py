@@ -3146,6 +3146,85 @@ async def cmd_tune(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_bbprobe(args: argparse.Namespace) -> int:
+    """Time bitbank's order and cancel round trips with orders that cannot fill.
+
+    Without --yes it only reads the balance. With --yes it places post-only
+    buys 10% under the best bid, the smallest size the pair allows, and
+    cancels each at once.
+    """
+    from decimal import Decimal
+
+    from .feed.bitbank import PAIRS_URL, instrument_from_pair
+    from .live.bitbank import (
+        PUBLIC_URL,
+        BitbankError,
+        BitbankPrivate,
+        far_bid,
+        load_keys,
+        probe,
+    )
+
+    keys = load_keys(args.env_file)
+    if keys is None:
+        console.print(
+            "[red]API キーが見つかりません。[/red] /etc/jsboard.env に\n"
+            "  BITBANK_API_KEY=…\n  BITBANK_API_SECRET=…\n"
+            "の2行を書いて、sudo を付けて実行してください（キーはチャットに貼らないこと）。"
+        )
+        return 1
+    async with make_session() as session:
+        pairs = await _get_json(session, PAIRS_URL)
+        info = next((p for p in pairs["data"]["pairs"] if p["name"] == args.pair), None)
+        if info is None:
+            console.print(f"[red]{args.pair} という銘柄はありません。[/red]")
+            return 1
+        instrument = instrument_from_pair(info)
+        ticker = await _get_json(session, f"{PUBLIC_URL}/{args.pair}/ticker")
+        best_bid = Decimal(str(ticker["data"]["buy"]))
+
+        api = BitbankPrivate(*keys, session=session)
+        try:
+            t0 = time.perf_counter()
+            balances = await api.assets()
+            read_ms = (time.perf_counter() - t0) * 1000
+        except BitbankError as exc:
+            console.print(f"[red]{exc}[/red]")
+            console.print("キー、権限（参照・取引）、IP 制限を確認してください。")
+            return 1
+        quote = instrument.quote.lower()
+        base = instrument.base.lower()
+        console.print(
+            f"  残高: {quote.upper()} {balances.get(quote, 0):,}  "
+            f"{base.upper()} {balances.get(base, 0):,}  （残高の読み取り {read_ms:.0f}ms）"
+        )
+
+        amount = Decimal(args.amount) if args.amount else Decimal(
+            str(info.get("unit_amount") or instrument.lot_size)
+        )
+        price = far_bid(best_bid, instrument.tick_size)
+        console.print(
+            f"  注文: 買い {amount} {base.upper()} @ {price}（今の買い気配 {best_bid} の10%下、"
+            f"約定しない値段）を {args.rounds} 回出して、すぐ取り消します"
+        )
+        if not args.yes:
+            console.print("  [yellow]まだ注文は出していません。測るときは --yes を付けて実行してください。[/yellow]")
+            return 0
+        if balances.get(quote, Decimal(0)) < price * amount:
+            console.print(f"[red]{quote.upper()} の残高が足りません（{price * amount} 必要）。[/red]")
+            return 1
+        try:
+            result = await probe(api, args.pair, price, amount, args.rounds)
+        except BitbankError as exc:
+            console.print(f"[red]{exc}[/red]")
+            console.print(
+                "[red]注文が残っていないか、bitbank の画面で必ず確認してください。[/red]"
+            )
+            return 1
+    console.print(result.text())
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -6284,6 +6363,14 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "halt":
             p_ctl.add_argument("--reason", default="手動で停止")
         p_ctl.set_defaults(func=func)
+
+    p_probe = sub.add_parser("bbprobe", help="bitbank の注文と取消しの速さを測る（約定しない注文で）")
+    p_probe.add_argument("--pair", default="ada_jpy")
+    p_probe.add_argument("--rounds", type=int, default=5, help="注文と取消しの回数")
+    p_probe.add_argument("--amount", default=None, help="注文量（既定は銘柄の最小単位）")
+    p_probe.add_argument("--env-file", default="/etc/jsboard.env", help="キーを読むファイル")
+    p_probe.add_argument("--yes", action="store_true", help="実際に注文を出して測る")
+    p_probe.set_defaults(func=cmd_bbprobe)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")
     p_tune.add_argument("--target", required=True, help="取引所:銘柄")
