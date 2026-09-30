@@ -3173,6 +3173,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         f"--maker-bps={await _maker_bps_for(target)}",
         "--size", size, "--max-position", str(Decimal(size) * args.max_orders),
         "--max-drawdown", str(args.max_loss_jpy),
+        "--price-tolerance-ticks", str(args.price_tolerance_ticks),
     ])
     mm = build_maker(instrument, run_args)
     venue = LiveVenue(instrument, quote_balance=quote_bal, base_balance=base_bal)
@@ -6597,6 +6598,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade.add_argument("--breaker-pct", type=float, default=1.5,
                         help="先行市場が60秒でこれだけ動いたら5分止める（%%）")
     p_trade.add_argument("--stale-s", type=float, default=5.0, help="板がこの秒数止まったら全取消し")
+    p_trade.add_argument("--price-tolerance-ticks", type=int, default=0,
+                         help="値段のずれがこのティック数以内なら注文を動かさない")
     p_trade.add_argument("--max-requests-per-s", type=float, default=4.0,
                         help="1秒あたりの注文・取消しの上限")
     p_trade.add_argument("--dry-jpy", type=float, default=50_000.0,
