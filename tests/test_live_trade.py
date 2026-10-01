@@ -320,3 +320,15 @@ def test_the_change_rate_is_measured_on_market_time_not_the_replay_banner():
         mm.on_event(DepthSnapshot(((37_190, 9_000_000),), ((37_210, 9_000_000),), i,
                                   day + i * 60_000_000_000))
     assert (mm.stats.last_event_ns - mm.stats.first_event_ns) / 1e9 == 120.0
+
+
+def test_orders_cancelled_before_sending_never_wait_for_the_budget():
+    from jsboard.live.runner import drop_noops
+
+    v = venue()
+    for price in (37_000, 36_990, 36_980):
+        order = v.place(bid(price, 10_000), 0, best_opposite=37_010)
+        v.cancel(order.order_id)  # the lead gate pulled the side at once
+    kept = v.place(bid(36_970, 10_000), 0, best_opposite=37_010)
+    drop_noops(v)
+    assert list(v.intents) == [("new", kept.order_id)]

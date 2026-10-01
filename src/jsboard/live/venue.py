@@ -63,6 +63,8 @@ class LiveVenue:
     blocked: str = ""
     """Non-empty while a guard forbids new orders; cancels still go out."""
     rejected: int = 0
+    requests_sent: int = 0
+    """Calls that went to the venue (a batch of cancels counts once)."""
     _ids: object = field(default_factory=lambda: itertools.count(1))
 
     # Read by the maker's summary; a live venue has no simulated queue.

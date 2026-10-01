@@ -3220,7 +3220,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     )
 
     reason, code = "板のデータが終わりました", 1
-    last_log, last_flag_check = time.monotonic(), time.monotonic()
+    last_log, last_flag_check, last_sent = time.monotonic(), time.monotonic(), 0
     # systemd stops a service with SIGTERM, which by default kills Python
     # on the spot and would leave every order resting. Turn it into a
     # cancellation so the cleanup below runs.
@@ -3257,12 +3257,14 @@ async def cmd_trade(args: argparse.Namespace) -> int:
                     reason, code = f"停止フラグ {flag}", 0
                     break
             if now - last_log >= args.log_every:
-                last_log = now
+                rate = (venue.requests_sent - last_sent) / (now - last_log)
+                last_log, last_sent = now, venue.requests_sent
                 s = mm.summary()
                 console.print(
                     f"  損益 {s['total']:+,.0f} {instrument.quote}  約定 {int(s['fills']):,}"
                     f"  在庫 {s['position']:+,.4g} {instrument.base}  注文中 {len(venue.open_orders())}"
-                    f"  送信待ち {len(venue.intents)}  {venue.blocked or mm.stats.last_decision}"
+                    f"  送信 {rate:.1f}/秒  送信待ち {len(venue.intents)}"
+                    f"  {venue.blocked or mm.stats.last_decision}"
                 )
     except _asyncio.CancelledError:
         reason, code = "停止の指示（systemctl stop / Ctrl+C）", 0
@@ -6597,7 +6599,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade.add_argument("--max-loss-jpy", type=float, default=2_000.0, help="この損失で止める（円）")
     p_trade.add_argument("--breaker-pct", type=float, default=1.5,
                         help="先行市場が60秒でこれだけ動いたら5分止める（%%）")
-    p_trade.add_argument("--stale-s", type=float, default=5.0, help="板がこの秒数止まったら全取消し")
+    p_trade.add_argument(
+        "--stale-s", type=float, default=30.0,
+        help="板の更新がこの秒数ないと全取消し（静かな板は数秒更新がないことがある）",
+    )
     p_trade.add_argument("--price-tolerance-ticks", type=int, default=0,
                          help="値段のずれがこのティック数以内なら注文を動かさない")
     p_trade.add_argument("--max-requests-per-s", type=float, default=4.0,

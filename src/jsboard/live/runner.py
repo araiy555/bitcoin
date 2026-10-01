@@ -206,13 +206,39 @@ async def _cancel_batch(venue: LiveVenue, api, pair: str, first, health: Health)
     return True
 
 
+def drop_noops(venue: LiveVenue) -> None:
+    """Clear intents at the head of the queue that would send nothing.
+
+    An order cancelled before it went out leaves a new-then-cancel pair that
+    resolves without a request. Each used to wait for a slot in the request
+    budget anyway, and with the lead gate pulling and restoring a side every
+    few seconds those pairs kept the queue 20-30 deep.
+    """
+    while venue.intents:
+        kind, order_id = venue.intents[0]
+        order = venue.orders.get(order_id)
+        if order is None or order.state == DONE:
+            pass
+        elif kind == "new" and order.state == CANCELLING:
+            order.state = DONE
+        elif kind == "cancel" and order.exchange_id is None:
+            order.state = DONE  # its placement was dropped or refused
+        else:
+            return
+        venue.intents.popleft()
+
+
 async def run_executor(
     venue: LiveVenue, api, pair: str, health: Health, budget: RequestBudget
 ) -> None:
     while True:
+        drop_noops(venue)
         if venue.intents:
             await budget.take()
-            await execute_once(venue, api, pair, health)
+            drop_noops(venue)  # the wait may have made the head moot
+            if venue.intents:
+                venue.requests_sent += 1
+                await execute_once(venue, api, pair, health)
         else:
             await asyncio.sleep(0.01)
 
