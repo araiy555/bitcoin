@@ -79,6 +79,10 @@ class DayResult:
     after_fees_bps: float = math.nan
     pnl: float = math.nan
     """The day's profit in the quote currency (yen), fees and inventory included."""
+    notional: float = math.nan
+    """Yen traded, at the day's opening price."""
+    gap_share: float = math.nan
+    """Share of filled size the model filled on a book move, not a print."""
     note: str = ""
     trial: dict | None = None
     """The same day under the book's trial settings, when it has any."""
@@ -93,6 +97,8 @@ class DayResult:
                 None if math.isnan(self.after_fees_bps) else round(self.after_fees_bps, 3)
             ),
             "pnl": None if math.isnan(self.pnl) else round(self.pnl),
+            "notional": None if math.isnan(self.notional) else round(self.notional),
+            "gap_share": None if math.isnan(self.gap_share) else round(self.gap_share, 1),
             "note": self.note,
         }
 
@@ -110,6 +116,13 @@ def losing_streak(key: str, today: float, history: list[dict]) -> int:
     return streak
 
 
+def _volume(r: DayResult) -> str:
+    if math.isnan(r.notional):
+        return ""
+    gap = "" if math.isnan(r.gap_share) else f"・飛び越え {r.gap_share:.0f}%"
+    return f"（約 {r.notional / 1e4:,.0f}万円分{gap}）"
+
+
 def _yen(value: float) -> str:
     return "損益 —" if math.isnan(value) else f"*損益 {value:+,.0f}円*"
 
@@ -125,7 +138,7 @@ def slack_text(date: str, results: list[DayResult], history: list[dict]) -> str:
         flag = f"  :warning: {streak}日連続マイナス" if streak >= ALERT_AFTER_DAYS else ""
         lines.append(
             f"• {r.target.label}: {_yen(r.pnl)}  10秒内計 {r.short_bps:+.2f}bps  "
-            f"手数料後 {r.after_fees_bps:+.2f}bps  約定 {r.fills:,}{flag}"
+            f"手数料後 {r.after_fees_bps:+.2f}bps  約定 {r.fills:,}{_volume(r)}{flag}"
         )
         if r.trial:
             t = r.trial

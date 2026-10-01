@@ -1153,6 +1153,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
         "gap_share": (
             s.get("gap_filled", 0.0) / s["filled"] * 100.0 if s.get("filled") else math.nan
         ),
+        "volume": s.get("volume", 0.0),
         "tox_one_sided_pct": tox.get("one_sided_share", 0.0) * 100.0,
         "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
         "lead_pct": tox.get("lead_share", 0.0) * 100.0,
@@ -2740,8 +2741,8 @@ async def cmd_daily(args: argparse.Namespace) -> int:
         try:
             base = ["sweep", path, "--source", target.venue, "--lead-source", "binance"]
             instrument = _instrument_for_recording(path, build_parser().parse_args(base))
-            size = size_for(args.order_jpy, _first_mid(path, target.venue, instrument),
-                            instrument.lot_size)
+            first_price = _first_mid(path, target.venue, instrument)
+            size = size_for(args.order_jpy, first_price, instrument.lot_size)
             fixed = [
                 *base, *FIXED_FLAGS, f"--maker-bps={await _maker_bps_for(target)}",
                 "--size", size, "--max-position", str(Decimal(size) * 10),
@@ -2761,6 +2762,8 @@ async def cmd_daily(args: argparse.Namespace) -> int:
             short_bps=row["short_bps"],
             after_fees_bps=row["attributed_bps"],
             pnl=row["total"],
+            notional=row["volume"] * first_price,
+            gap_share=row["gap_share"],
         )
         # A trial change is replayed beside the fixed settings, never in
         # their place: the fixed row is what the halt and go-live checks read.
@@ -3054,6 +3057,10 @@ async def cmd_paper(args: argparse.Namespace) -> int:
                 )
             report = tally.roll(day(), mm.summary())
             if report is not None:
+                if mm.market.mid is not None:
+                    report["notional"] = report["volume"] * mm.market.mid * float(
+                        instrument.tick_size
+                    )
                 cumulative = mm.summary()
                 if args.s3_bucket:
                     # Kept for the morning check, which needs paper's running

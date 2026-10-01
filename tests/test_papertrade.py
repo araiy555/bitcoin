@@ -13,7 +13,8 @@ def test_the_day_closes_when_the_date_changes():
     tally = DailyTally("2026-09-26")
     assert tally.roll("2026-09-26", {"total": 50.0, "fills": 10, "fees": -4.0}) is None
     report = tally.roll("2026-09-27", {"total": 120.0, "fills": 30, "fees": -9.0, "position": 5})
-    assert report == {"day": "2026-09-26", "pnl": 120.0, "fills": 30, "fees": -9.0, "position": 5}
+    assert report == {"day": "2026-09-26", "pnl": 120.0, "fills": 30, "fees": -9.0, "position": 5,
+                      "volume": 0.0, "gap_share": None}
     # The next day is measured from where this one ended.
     nxt = tally.roll("2026-09-28", {"total": 100.0, "fills": 45, "fees": -12.0, "position": 0})
     assert nxt["pnl"] == -20.0 and nxt["fills"] == 15
@@ -157,3 +158,14 @@ async def test_a_trial_setting_is_applied_and_announced(monkeypatch, capsys):
     await args.func(args)
     assert "試験中: 在庫の片寄せ 20bps" in capsys.readouterr().out
     assert any("試験中" in p for p in posted)
+
+
+def test_the_day_reports_what_it_traded_and_how_it_was_filled():
+    tally = DailyTally("2026-09-26")
+    tally.roll("2026-09-26", {})
+    report = tally.roll("2026-09-27", {"volume": 5_000.0, "filled": 5_000.0, "gap_filled": 4_500.0})
+    assert report["volume"] == 5_000.0 and report["gap_share"] == 90.0
+    report["notional"] = 5_000.0 * 38.5
+    text = slack_text("bitbank ada_jpy", "JPY", "ADA", {**report, "pnl": 1.0, "fees": -1.0},
+                      {"total": 1.0, "fills": 1.0})
+    assert "約定量 5,000 ADA（約 19万円分）  飛び越え約定 90%" in text
