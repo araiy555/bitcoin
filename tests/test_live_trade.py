@@ -332,3 +332,43 @@ def test_orders_cancelled_before_sending_never_wait_for_the_budget():
     kept = v.place(bid(36_970, 10_000), 0, best_opposite=37_010)
     drop_noops(v)
     assert list(v.intents) == [("new", kept.order_id)]
+
+
+@pytest.mark.asyncio
+async def test_a_fill_read_after_the_order_was_cancelled_is_still_booked():
+    # The first live run bought 271 ADA and booked none of it: each fill was
+    # read a second after its order had been cancelled and forgotten.
+    v, api = venue(), DryRunApi()
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", Health())
+    v.cancel(order.order_id)
+    await execute_once(v, api, "ada_jpy", Health())
+    v.forget_done()
+    assert order.order_id not in v.orders
+
+    class Late(DryRunApi):
+        async def trade_history(self, pair, since_ms):
+            return [{"trade_id": 1, "order_id": order.exchange_id, "price": "37.000",
+                     "amount": "100", "maker_taker": "maker", "executed_at": 1}]
+
+    assert await poll_fills_once(v, Late(), "ada_jpy", {}) == 1
+    assert v.base_balance == Decimal("300") and len(v.pending_fills) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_account_that_drifts_from_the_records_stops_the_run():
+    from jsboard.live.runner import check_balance_once
+
+    class Account(DryRunApi):
+        held = Decimal("100")
+
+        async def onhand(self):
+            return {"ada": self.held}
+
+    v, api = venue(), Account()
+    state = {"tolerance": Decimal("50")}
+    lots = INST.to_lots("80")  # the run booked 80 ADA bought
+    assert await check_balance_once(v, api, Decimal("20"), lots, state) == ""
+    api.held = Decimal("271")  # bought far more than booked
+    assert await check_balance_once(v, api, Decimal("20"), lots, state) == ""  # once may be late
+    assert "記録と合いません" in await check_balance_once(v, api, Decimal("20"), lots, state)

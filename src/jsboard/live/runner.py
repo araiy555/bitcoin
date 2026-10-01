@@ -132,6 +132,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
             venue.rejected += 1
             health.error(exc)
             return True
+        venue.remember(order)
         health.ok()
         if order.state == NEW:
             order.state = OPEN
@@ -287,6 +288,49 @@ async def run_fill_poller(
         except BitbankError as exc:
             health.error(exc)
         await asyncio.sleep(interval_s)
+
+
+async def check_balance_once(venue: LiveVenue, api, start_base: Decimal, booked_lots: int,
+                             state: dict) -> str:
+    """Compare the coin the account holds with what the run has booked.
+
+    The maker's limits are only as good as its fill records. If the account
+    moved by more than one order's worth beyond what was booked, twice in a
+    row (a fill read a second late is not a mismatch), the records are wrong
+    and the run must stop. Returns the reason, or "".
+    """
+    held = (await api.onhand()).get(venue.instrument.base.lower())
+    if held is None:
+        return ""
+    expected = start_base + venue.amount_of(booked_lots)
+    gap = held - expected
+    limit = state.get("tolerance", Decimal(0))
+    if abs(gap) > limit:
+        state["misses"] = state.get("misses", 0) + 1
+    else:
+        state["misses"] = 0
+    if state["misses"] >= 2:
+        return (f"口座の{venue.instrument.base}が記録と合いません"
+                f"（口座 {held}、記録 {expected}、差 {gap:+}）")
+    return ""
+
+
+async def run_balance_check(venue: LiveVenue, api, start_base: Decimal,
+                            booked: Callable[[], int], tolerance: Decimal,
+                            health: Health, interval_s: float = 30.0) -> None:
+    if not hasattr(api, "onhand"):
+        return
+    state = {"tolerance": tolerance}
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            reason = await check_balance_once(venue, api, start_base, booked(), state)
+        except BitbankError as exc:
+            health.error(exc)
+            continue
+        if reason:
+            health.fatal = reason
+            return
 
 
 @dataclass

@@ -2651,8 +2651,12 @@ async def _record_with_lead(
 
 
 def _binance_lead(instrument: Instrument, depth_ms: int):
+    # Fifty levels: the lead gate reads the top of the book. A 1,000-level
+    # snapshot weighs ten times as much against Binance's per-IP budget, and
+    # recorders, paper and live trading on one server share that budget.
     return BinanceFuturesFeed(
-        instrument, depth_ms=depth_ms, open_interest_interval=60.0, rest_fallback="never"
+        instrument, depth_ms=depth_ms, open_interest_interval=60.0, rest_fallback="never",
+        snapshot_limit=50,
     )
 
 
@@ -3108,6 +3112,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         Health,
         RequestBudget,
         cancel_everything,
+        run_balance_check,
         run_executor,
         run_fill_poller,
         run_watchdog,
@@ -3215,6 +3220,9 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         _asyncio.create_task(pump_lead()),
         _asyncio.create_task(run_executor(venue, api, target.symbol, health, budget)),
         _asyncio.create_task(run_fill_poller(venue, api, target.symbol, health)),
+        _asyncio.create_task(run_balance_check(
+            venue, api, base_bal, lambda: mm.position.lots, Decimal(size), health,
+        )),
         _asyncio.create_task(run_watchdog(
             venue, health, lambda: last_event[0], lambda: lead_view.mid, breaker,
             notes.append, stale_s=args.stale_s,

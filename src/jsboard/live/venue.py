@@ -62,6 +62,11 @@ class LiveVenue:
     pending_fills: list[Fill] = field(default_factory=list)
     blocked: str = ""
     """Non-empty while a guard forbids new orders; cancels still go out."""
+    sent: dict = field(default_factory=dict)
+    """Every order the venue accepted, by its exchange id, kept after it is
+    done: a fill is read from the trade history a second or more after it
+    happens, often after the order was cancelled or forgotten, and one that
+    finds no order is a fill the maker never books."""
     rejected: int = 0
     requests_sent: int = 0
     """Calls that went to the venue (a batch of cancels counts once)."""
@@ -143,8 +148,13 @@ class LiveVenue:
 
     # ------------------------------------------------ executor's callbacks
 
+    def remember(self, order: LiveOrder) -> None:
+        self.sent[order.exchange_id] = order
+        if len(self.sent) > 5000:
+            del self.sent[next(iter(self.sent))]
+
     def by_exchange_id(self, exchange_id: int) -> LiveOrder | None:
-        return next((o for o in self.orders.values() if o.exchange_id == exchange_id), None)
+        return self.sent.get(exchange_id)
 
     def record_fill(self, order: LiveOrder, fill: Fill) -> None:
         """A fill the venue reported: adjust the order, the balances, the maker."""

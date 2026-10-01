@@ -338,6 +338,17 @@ class BinanceFuturesFeed(Feed):
                 except Exception as exc:  # noqa: BLE001 - any failure means reconnect
                     attempt += 1
                     delay = min(self.max_reconnect_delay, 2.0 ** min(attempt, 5))
+                    status = getattr(exc, "status", None)
+                    if status in (418, 429):
+                        # Rate-limited (429) or banned for ignoring it (418).
+                        # Retrying sooner than asked is what escalates a 429
+                        # into a ban, so wait at least as long as Binance says.
+                        headers = getattr(exc, "headers", None) or {}
+                        try:
+                            asked = float(headers.get("Retry-After", 0))
+                        except (TypeError, ValueError):
+                            asked = 0.0
+                        delay = max(delay, asked, 60.0)
                     log.warning("futures feed dropped (%s); reconnecting in %.0fs", exc, delay)
                     yield FeedStatus("disconnected", f"{type(exc).__name__}: {exc}")
                     await asyncio.sleep(delay)
