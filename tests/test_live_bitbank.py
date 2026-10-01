@@ -182,3 +182,26 @@ async def test_without_yes_nothing_is_ordered(monkeypatch, capsys, tmp_path):
     assert "33.493" in out and "まだ注文は出していません" in out
     assert sent == ["https://api.bitbank.cc/v1/user/assets",
                     "https://api.bitbank.cc/v1/user/spot/active_orders?pair=ada_jpy"]
+
+
+@pytest.mark.asyncio
+async def test_calls_reach_the_venue_one_at_a_time_in_nonce_order():
+    import asyncio
+
+    arrived = []
+
+    class Wire(BitbankPrivate):
+        def __init__(self):
+            super().__init__("key", "secret")
+
+        async def _send(self, method, url, headers, body):
+            nonce = int(headers["ACCESS-NONCE"])
+            # A later call that overtook an earlier one would arrive first.
+            await asyncio.sleep(0.02 if len(arrived) % 2 == 0 else 0)
+            arrived.append(nonce)
+            return {"success": 1, "data": {"assets": [], "trades": [], "orders": []}}
+
+    api = Wire()
+    await asyncio.gather(api.assets(), api.trade_history("ada_jpy", 0),
+                         api.active_orders("ada_jpy"), api.assets())
+    assert arrived == sorted(arrived) and len(set(arrived)) == 4

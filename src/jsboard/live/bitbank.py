@@ -68,6 +68,7 @@ class BitbankPrivate:
     secret: str = field(repr=False)
     session: object = field(default=None, repr=False)
     _nonce: int = 0
+    _lock: asyncio.Lock | None = field(default=None, repr=False)
 
     def _next_nonce(self) -> str:
         # Must rise on every call, even two in the same millisecond.
@@ -95,12 +96,18 @@ class BitbankPrivate:
     async def _call(
         self, method: str, path: str, payload: dict | None = None, params: dict | None = None
     ) -> dict:
-        if method == "GET":
-            path = path + ("?" + urlencode(params) if params else "")
-            reply = await self._send("GET", API_URL + path, self._headers(path), None)
-        else:
-            body = json.dumps(payload or {}, separators=(",", ":"))
-            reply = await self._send("POST", API_URL + path, self._headers(body), body)
+        # One call at a time. bitbank refuses a nonce lower than the last one
+        # it saw (20001), and two calls in flight together can arrive in
+        # either order: the live run's order sender and fill reader did.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if method == "GET":
+                path = path + ("?" + urlencode(params) if params else "")
+                reply = await self._send("GET", API_URL + path, self._headers(path), None)
+            else:
+                body = json.dumps(payload or {}, separators=(",", ":"))
+                reply = await self._send("POST", API_URL + path, self._headers(body), body)
         if reply.get("success") != 1:
             raise BitbankError((reply.get("data") or {}).get("code"), path)
         return reply["data"]
