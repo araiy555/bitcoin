@@ -25,6 +25,7 @@ from decimal import Decimal
 
 from ..core.types import Fill, Side
 from ..sim.paper import PAPER_OWNER
+from . import clock
 from .bitbank import DONE as FINISHED
 from .bitbank import NOT_FOUND, BitbankError, OrderRefused
 from .venue import CANCELLING, DONE, NEW, OPEN, LiveVenue
@@ -33,6 +34,7 @@ log = logging.getLogger(__name__)
 
 MAX_CANCEL_TRIES = 40
 CANNOT_CANCEL = 50010
+INSUFFICIENT = 60001
 LOST_GIVE_UP_S = 60.0
 """How long to keep cancelling an order the venue says it cannot find."""
 """Retries of a cancel the venue says it cannot find (about two seconds);
@@ -140,6 +142,13 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
         except BitbankError as exc:
             order.state = DONE
             venue.rejected += 1
+            if exc.code == INSUFFICIENT:
+                # The venue still holds balance we counted as free (a cancel
+                # not yet released). About this order, not the connection;
+                # a real drift is caught by the balance check.
+                venue.insufficient += 1
+                log.info("order refused for balance (60001)")
+                return True
             health.error(exc)
             return True
         venue.remember(order)
@@ -164,7 +173,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
             # Accepted but not yet on the book: try again shortly. The wait is
             # recorded on the order, never slept here: sleeping would hold up
             # every other cancel queued behind this one.
-            order.retry_at = time.monotonic() + min(0.05 * order.cancel_tries, 0.5)
+            order.retry_at = clock.monotonic() + min(0.05 * order.cancel_tries, 0.5)
             venue.intents.append(("cancel", order_id))
             return True
         state = "?"
@@ -182,9 +191,9 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
                 # chased it), its balance counted as free (60001), and its
                 # stale price open to be picked off. So it stays a cancel in
                 # progress, retried every second, for up to a minute.
-                lost_for = time.time() - (order.cancel_asked or time.time())
+                lost_for = clock.wall() - (order.cancel_asked or clock.wall())
                 if lost_for < LOST_GIVE_UP_S:
-                    order.retry_at = time.monotonic() + 1.0
+                    order.retry_at = clock.monotonic() + 1.0
                     venue.intents.append(("cancel", order_id))
                     return True
                 order.state = DONE
@@ -198,7 +207,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
             # rather than counted toward stopping the run.
             log.info("order %s not cancellable yet (status %s); retrying",
                      order.exchange_id, state)
-            order.retry_at = time.monotonic() + min(0.1 * order.cancel_tries, 1.0)
+            order.retry_at = clock.monotonic() + min(0.1 * order.cancel_tries, 1.0)
             return True
         log.warning("cancel of %s failed (status %s)", order.exchange_id, state)
         health.error(exc)
@@ -279,7 +288,7 @@ def head_due(venue: LiveVenue) -> bool:
     A cancel waiting out a retry delay moves to the back, so the orders
     behind it are not held up. False when nothing is due yet.
     """
-    now = time.monotonic()
+    now = clock.monotonic()
     for _ in range(len(venue.intents)):
         kind, order_id = venue.intents[0]
         order = venue.orders.get(order_id)
@@ -341,7 +350,7 @@ async def poll_fills_once(venue: LiveVenue, api, pair: str, state: dict) -> int:
 async def run_fill_poller(
     venue: LiveVenue, api, pair: str, health: Health, interval_s: float = 0.5
 ) -> None:
-    state = {"since_ms": int(time.time() * 1000)}
+    state = {"since_ms": int(clock.wall() * 1000)}
     while True:
         try:
             await poll_fills_once(venue, api, pair, state)

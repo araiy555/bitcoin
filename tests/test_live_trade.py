@@ -95,7 +95,7 @@ async def test_a_cancel_that_arrives_before_the_order_lands_is_retried():
 async def test_repeated_refusals_end_the_run():
     class Refusing(DryRunApi):
         async def order(self, pair, side, price, amount):
-            raise BitbankError(60001, "order")
+            raise BitbankError(20001, "order")  # authentication: the connection is sick
 
     v, api, health = venue(), Refusing(), Health(max_errors=3)
     for price in (37_000, 36_990, 36_980):
@@ -576,3 +576,15 @@ async def test_a_refused_post_only_order_is_dropped_without_counting_as_a_failur
     await execute_once(v, Refuses(), "ada_jpy", health)
     assert order.state == DONE and v.post_only_refused == 1 and not health.fatal
     assert v.strip_own(DepthSnapshot(((37_000, 1_000_000),), ((37_010, 1),), 1)).bids
+
+
+@pytest.mark.asyncio
+async def test_a_balance_refusal_drops_the_order_without_stopping_the_run():
+    class Short(DryRunApi):
+        async def order(self, pair, side, price, amount):
+            raise BitbankError(60001, "order")
+
+    v, health = venue(), Health(max_errors=1)
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, Short(), "ada_jpy", health)
+    assert order.state == DONE and v.insufficient == 1 and not health.fatal

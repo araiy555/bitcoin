@@ -3469,6 +3469,105 @@ async def cmd_bbprobe(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_livesim(args: argparse.Namespace) -> int:
+    """Replay a recording through the live trader against a bitbank model.
+
+    The same maker, venue, executor and fill poller that trade for real, on
+    recorded time, against `SimBitbank`: orders rest late, cancels can be
+    refused, only executions fill, balances bind. Check it against a live
+    run over the same hours before trusting it with anything new.
+    """
+    import dataclasses
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.daily import FIXED_FLAGS, size_for
+    from .sim.bitbank_sim import SimBitbank, VenueBehaviour, run_livesim
+    from .sim.s3 import exists, meta_uri, read_bytes
+
+    path = args.path
+    base_args = build_parser().parse_args(["sweep", path, "--source", "bitbank"])
+    instrument = _instrument_for_recording(path, base_args)
+    meta_path = meta_uri(path)
+    sources = json.loads(read_bytes(meta_path)).get("sources", {}) if exists(meta_path) else {}
+    if args.lead_source not in sources:
+        raise ConfigError(f"--lead-source {args.lead_source} は録画にありません。")
+    lead_inst = _instrument_from_spec(sources[args.lead_source])
+    since, until = _parse_when(args.since), _parse_when(args.until)
+    price = _first_mid(path, "bitbank", instrument)
+    size = size_for(args.order_jpy, price, instrument.lot_size)
+
+    trade_fields = {"order_jpy", "max_orders", "max_loss_jpy", "price_tolerance_ticks",
+                    "min_edge_bps", "lead_threshold_bps", "max_inventory_age_s", "levels"}
+    behaviour_fields = {f.name for f in dataclasses.fields(VenueBehaviour)}
+    grid: list[tuple[str, list]] = []
+    for spec in args.vary or []:
+        name, _, values = spec.partition("=")
+        name = name.strip().replace("-", "_")
+        if name not in trade_fields | behaviour_fields:
+            raise ConfigError(f"--vary {name}: 変えられるのは {sorted(trade_fields | behaviour_fields)}")
+        grid.append((name, [float(v) for v in values.split(",")]))
+    combos = list(itertools.product(*[v for _, v in grid])) or [()]
+
+    console.print(f"{path}: {instrument.symbol}  1回 {size} {instrument.base}  {len(combos)} 通り")
+    rows_out = []
+    for combo in combos:
+        settings = dict(zip([n for n, _ in grid], combo, strict=True))
+        trade = {k: settings.get(k, getattr(args, k)) for k in trade_fields}
+        behaviour = VenueBehaviour(**{
+            f: settings.get(f, getattr(args, f)) for f in behaviour_fields
+        })
+        size_now = size_for(trade["order_jpy"], price, instrument.lot_size)
+        flags = [*FIXED_FLAGS]
+        for flag, key in (("--min-edge-bps", "min_edge_bps"),
+                          ("--lead-threshold-bps", "lead_threshold_bps"),
+                          ("--max-inventory-age-s", "max_inventory_age_s")):
+            i = flags.index(flag)
+            flags[i + 1] = f"{trade[key]:g}"
+        run_args = build_parser().parse_args([
+            "sweep", "-", "--source", "bitbank", *flags, "--maker-bps=-2",
+            "--size", size_now, "--max-position", str(Decimal(size_now) * int(trade["max_orders"])),
+            "--max-drawdown", str(trade["max_loss_jpy"]),
+            "--price-tolerance-ticks", str(int(trade["price_tolerance_ticks"])),
+            "--levels", str(int(trade["levels"])),
+        ])
+        mm = build_maker(instrument, run_args)
+        lead_view = MarketView(instrument=lead_inst, depth=20)
+        mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
+        sim = SimBitbank(instrument, behaviour, jpy=Decimal(str(args.jpy)),
+                         coin=Decimal(str(args.coin)), seed=args.seed)
+
+        async def rows():
+            for src, rx, event in iter_tagged_timed(path):
+                if not isinstance(event, _Status):
+                    if since is not None and rx < since:
+                        continue
+                    if until is not None and rx > until:
+                        break
+                if src == args.lead_source:
+                    yield "lead", rx, event
+                elif src == "bitbank":
+                    yield "bitbank", rx, event
+
+        result = await run_livesim(rows(), mm, lead_view, sim, pair=instrument.symbol,
+                                   per_s=args.per_s, breaker_pct=args.breaker_pct)
+        shown = "  ".join(f"{k}={v:g}" for k, v in settings.items())
+        console.print(f"  {shown or '設定どおり'}  約定 {result.fills}  損益 {result.pnl:+,.0f}円")
+        rows_out.append((shown, result))
+
+    header = ["設定", "約定", "損益円", "取消中約定%", "指値拒否", "残高不足", "見つからない",
+              "取消不可", "遅着", "停止"]
+    print("\t".join(header))
+    for shown, r in rows_out:
+        c = r.counts
+        print("\t".join([
+            shown or "-", f"{r.fills:,}", f"{r.pnl:+,.0f}", f"{r.doomed_pct:.0f}",
+            str(c["refused"]), str(c["insufficient"]), str(c["not_found"]),
+            str(c["cannot_cancel"]), str(c["slow_land"]), r.stopped or "-",
+        ]))
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -6652,6 +6751,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument("--env-file", default="/etc/jsboard.env", help="キーを読むファイル")
     p_probe.add_argument("--yes", action="store_true", help="実際に注文を出して測る")
     p_probe.set_defaults(func=cmd_bbprobe)
+
+    p_ls = sub.add_parser("livesim", help="本番のプログラムを bitbank の仕様どおりの偽取引所で再生する")
+    p_ls.add_argument("path", help="録画（s3://… のフォルダも可）")
+    p_ls.add_argument("--lead-source", default="binance")
+    p_ls.add_argument("--since", default=None, help="UTC 2026-10-02T08:33")
+    p_ls.add_argument("--until", default=None)
+    p_ls.add_argument("--jpy", type=float, default=50_000.0, help="始めの円")
+    p_ls.add_argument("--coin", type=float, default=0.0, help="始めのコイン")
+    p_ls.add_argument("--order-jpy", type=float, default=10_000.0)
+    p_ls.add_argument("--max-orders", type=float, default=10)
+    p_ls.add_argument("--max-loss-jpy", type=float, default=3_000.0)
+    p_ls.add_argument("--price-tolerance-ticks", type=float, default=0)
+    p_ls.add_argument("--min-edge-bps", type=float, default=2.0)
+    p_ls.add_argument("--lead-threshold-bps", type=float, default=2.0)
+    p_ls.add_argument("--max-inventory-age-s", type=float, default=120.0)
+    p_ls.add_argument("--levels", type=float, default=3)
+    p_ls.add_argument("--per-s", type=float, default=4.0, help="1秒あたりの注文・取消しの上限")
+    p_ls.add_argument("--breaker-pct", type=float, default=1.5)
+    p_ls.add_argument("--seed", type=int, default=7)
+    from .sim.bitbank_sim import VenueBehaviour as _VB
+    for _f in __import__("dataclasses").fields(_VB):
+        p_ls.add_argument(f"--{_f.name.replace('_', '-')}", type=float, default=_f.default)
+    p_ls.add_argument("--vary", action="append",
+                      help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
+    p_ls.set_defaults(func=cmd_livesim)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")
     p_tune.add_argument("--target", required=True, help="取引所:銘柄")

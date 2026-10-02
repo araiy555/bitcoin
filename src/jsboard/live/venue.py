@@ -17,7 +17,6 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import statistics
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -25,8 +24,11 @@ from decimal import Decimal
 from ..core.types import Fill, Instrument, Side
 from ..feed.base import DepthDelta, DepthSnapshot
 from ..mm.quoter import Quote
+from . import clock
 
 NEW, OPEN, CANCELLING, DONE = "new", "open", "cancelling", "done"
+RELEASE_GRACE_S = 1.0
+"""How long a cancelled order's yen or coin is still treated as locked."""
 
 
 @dataclass(slots=True)
@@ -71,6 +73,8 @@ class LiveVenue:
     pending_fills: list[Fill] = field(default_factory=list)
     blocked: str = ""
     """Non-empty while a guard forbids new orders; cancels still go out."""
+    releasing: deque = field(default_factory=deque)
+    """(until, order): cancelled orders whose balance is still held back."""
     sent: dict = field(default_factory=dict)
     """Every order the venue accepted, by its exchange id, kept after it is
     done: a fill is read from the trade history a second or more after it
@@ -78,6 +82,7 @@ class LiveVenue:
     finds no order is a fill the maker never books."""
     rejected: int = 0
     post_only_refused: int = 0
+    insufficient: int = 0
     requests_sent: int = 0
     """Calls that went to the venue (a batch of cancels counts once)."""
     _ids: object = field(default_factory=lambda: itertools.count(1))
@@ -103,7 +108,11 @@ class LiveVenue:
         return self.instrument.lot_size * lots
 
     def _reserved(self, side: Side) -> Decimal:
+        now = clock.monotonic()
+        while self.releasing and self.releasing[0][0] <= now:
+            self.releasing.popleft()
         live = [o for o in self.orders.values() if o.side is side and o.is_live]
+        live += [o for _, o in self.releasing if o.side is side]
         if side is Side.BUY:
             return sum((self.price_of(o.price) * self.amount_of(o.remaining) for o in live),
                        Decimal(0))
@@ -138,15 +147,18 @@ class LiveVenue:
         if order is None or order.state in (CANCELLING, DONE):
             return False
         order.state = CANCELLING
-        order.cancel_asked = time.time()
+        order.cancel_asked = clock.wall()
         self.intents.append(("cancel", order_id))
         return True
 
     def cancelled(self, order: LiveOrder) -> None:
         """The venue confirmed the cancel: note how long getting out took."""
         if order.cancel_asked is not None and order.exchange_id is not None:
-            self.cancel_ms.append((time.time() - order.cancel_asked) * 1000)
+            self.cancel_ms.append((clock.wall() - order.cancel_asked) * 1000)
             del self.cancel_ms[:-500]
+            # The venue frees what the order locked a little after it confirms
+            # the cancel. Reusing it at once was what drew runs of 60001.
+            self.releasing.append((clock.monotonic() + RELEASE_GRACE_S, order))
         order.state = DONE
 
     def cancel_report(self) -> str:
@@ -154,7 +166,8 @@ class LiveVenue:
         share = self.doomed_fills / self.fills_seen * 100 if self.fills_seen else 0.0
         typical = f"{statistics.median(self.cancel_ms):.0f}ms" if self.cancel_ms else "—"
         return (f"取消し中の約定 {self.doomed_fills}/{self.fills_seen}回（{share:.0f}%）"
-                f"  取消し 中央値 {typical}  指値拒否 {self.post_only_refused}回")
+                f"  取消し 中央値 {typical}  指値拒否 {self.post_only_refused}回"
+                f"  残高不足 {self.insufficient}回")
 
     def cancel_all(self) -> int:
         return sum(self.cancel(o.order_id) for o in list(self.orders.values()))
