@@ -372,3 +372,36 @@ async def test_an_account_that_drifts_from_the_records_stops_the_run():
     api.held = Decimal("271")  # bought far more than booked
     assert await check_balance_once(v, api, Decimal("20"), lots, state) == ""  # once may be late
     assert "記録と合いません" in await check_balance_once(v, api, Decimal("20"), lots, state)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_the_batch_skipped_is_retried_not_forgotten():
+    # bitbank's cancel_orders succeeds while skipping an order that has not
+    # reached the book; treating the batch as done left such orders resting.
+    class Skips(DryRunApi):
+        async def cancel_many(self, pair, order_ids):
+            self.cancels_sent += 1
+            done = set(order_ids[:-1])  # the newest one was not on the book yet
+            self.open.difference_update(done)
+            return done
+
+    v, api, health = venue(), Skips(), Health()
+    orders = [v.place(bid(37_000 - i, 10_000), 0, best_opposite=37_010) for i in range(3)]
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    v.cancel_all()
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    assert all(o.state == DONE for o in orders) and api.open == set()
+
+
+@pytest.mark.asyncio
+async def test_orders_the_run_lost_track_of_are_swept():
+    from jsboard.live.runner import sweep_strays
+
+    v, api = venue(), DryRunApi()
+    kept = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", Health())
+    api.open.add(999)  # resting on the venue, unknown to the run
+    assert await sweep_strays(v, api, "ada_jpy") == [999]
+    assert api.open == {kept.exchange_id}

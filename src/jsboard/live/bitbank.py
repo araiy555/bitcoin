@@ -129,11 +129,20 @@ class BitbankPrivate:
             "POST", "/v1/user/spot/cancel_order", {"pair": pair, "order_id": order_id}
         )
 
-    async def cancel_many(self, pair: str, order_ids: list[int]) -> None:
-        """Up to 30 cancels in one request, which counts once against the limit."""
-        await self._call(
+    async def cancel_many(self, pair: str, order_ids: list[int]) -> set[int]:
+        """Up to 30 cancels in one request; returns the ids the venue cancelled.
+
+        The request succeeds even when some orders were not cancelled — one
+        that had not reached the book yet is skipped silently — so only the
+        ids in the reply are gone.
+        """
+        data = await self._call(
             "POST", "/v1/user/spot/cancel_orders", {"pair": pair, "order_ids": order_ids}
         )
+        return {
+            int(o["order_id"]) for o in data.get("orders", [])
+            if str(o.get("status", "")).startswith("CANCELED")
+        }
 
     async def status(self, pair: str, order_id: int) -> str:
         data = await self._call(

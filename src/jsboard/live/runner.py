@@ -57,12 +57,11 @@ class DryRunApi:
             raise BitbankError(NOT_FOUND, "dry-run cancel")
         self.open.discard(order_id)
 
-    async def cancel_many(self, pair, order_ids) -> None:
+    async def cancel_many(self, pair, order_ids) -> set[int]:
         self.cancels_sent += 1
-        missing = [i for i in order_ids if i not in self.open]
-        if missing:
-            raise BitbankError(NOT_FOUND, "dry-run cancel_orders")
-        self.open.difference_update(order_ids)
+        done = {i for i in order_ids if i in self.open}
+        self.open.difference_update(done)
+        return done
 
     async def status(self, pair, order_id) -> str:
         return "UNFILLED" if order_id in self.open else "CANCELED_UNFILLED"
@@ -195,15 +194,24 @@ async def _cancel_batch(venue: LiveVenue, api, pair: str, first, health: Health)
     if len(batch) == 1:
         return False
     try:
-        await api.cancel_many(pair, [o.exchange_id for o in batch])
+        cancelled = await api.cancel_many(pair, [o.exchange_id for o in batch])
     except BitbankError:
         for order in batch:
             order.cancel_tries = 1  # retry singly
         venue.intents.extendleft(("cancel", o.order_id) for o in reversed(batch[1:]))
         return False
-    for order in batch:
-        order.state = DONE
     health.ok()
+    # Only what the reply names is gone. The rest (not on the book yet, or
+    # filling) go back for a single cancel, which knows how to wait; marking
+    # them done was how orders were left resting untracked until the balance
+    # they held ran out (60001).
+    missed = [o for o in batch if o.exchange_id not in cancelled]
+    for order in batch:
+        if order.exchange_id in cancelled:
+            order.state = DONE
+    for order in missed:
+        order.cancel_tries = 1
+    venue.intents.extendleft(("cancel", o.order_id) for o in reversed(missed))
     return True
 
 
@@ -315,15 +323,38 @@ async def check_balance_once(venue: LiveVenue, api, start_base: Decimal, booked_
     return ""
 
 
+async def sweep_strays(venue: LiveVenue, api, pair: str) -> list[int]:
+    """Cancel orders resting on the venue that the run is no longer tracking.
+
+    Whatever the cause — a cancel the venue skipped, an order given up as
+    never placed that landed after all — an order the maker does not know
+    about is unmanaged risk and holds balance the maker thinks is free.
+    """
+    from .bitbank import cancel_until_gone
+
+    active = await api.active_orders(pair)
+    # Read what is tracked after the venue answers: an order placed while the
+    # listing was in flight must not look like a stray.
+    tracked = {o.exchange_id for o in venue.orders.values()
+               if o.state != DONE and o.exchange_id is not None}
+    strays = [i for i in active if i not in tracked]
+    for order_id in strays:
+        log.warning("cancelling untracked order %s", order_id)
+        await cancel_until_gone(api, pair, order_id)
+    return strays
+
+
 async def run_balance_check(venue: LiveVenue, api, start_base: Decimal,
                             booked: Callable[[], int], tolerance: Decimal,
-                            health: Health, interval_s: float = 30.0) -> None:
+                            health: Health, interval_s: float = 30.0,
+                            pair: str = "") -> None:
     if not hasattr(api, "onhand"):
         return
     state = {"tolerance": tolerance}
     while True:
         await asyncio.sleep(interval_s)
         try:
+            await sweep_strays(venue, api, pair)
             reason = await check_balance_once(venue, api, start_base, booked(), state)
         except BitbankError as exc:
             health.error(exc)

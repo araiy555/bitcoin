@@ -3222,6 +3222,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         _asyncio.create_task(run_fill_poller(venue, api, target.symbol, health)),
         _asyncio.create_task(run_balance_check(
             venue, api, base_bal, lambda: mm.position.lots, Decimal(size), health,
+            pair=target.symbol,
         )),
         _asyncio.create_task(run_watchdog(
             venue, health, lambda: last_event[0], lambda: lead_view.mid, breaker,
