@@ -187,6 +187,23 @@ class BitbankPrivate:
         )
         return list(data.get("trades", []))
 
+    async def trades_between(self, pair: str, since_ms: int, end_ms: int) -> list[dict]:
+        """Every execution of ours in [since_ms, end_ms], oldest first (read only)."""
+        out: list[dict] = []
+        seen: set = set()
+        while True:
+            data = await self._call(
+                "GET", "/v1/user/spot/trade_history",
+                params={"pair": pair, "since": since_ms, "end": end_ms,
+                        "order": "asc", "count": 1000},
+            )
+            page = [t for t in data.get("trades", []) if t["trade_id"] not in seen]
+            if not page:
+                return out
+            out += page
+            seen.update(t["trade_id"] for t in page)
+            since_ms = max(int(t["executed_at"]) for t in page)
+
     async def active_orders(self, pair: str) -> list[int]:
         data = await self._call("GET", "/v1/user/spot/active_orders", params={"pair": pair})
         return [int(o["order_id"]) for o in data.get("orders", [])]

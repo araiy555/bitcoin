@@ -3509,6 +3509,22 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         grid.append((name, [float(v) for v in values.split(",")]))
     combos = list(itertools.product(*[v for _, v in grid])) or [()]
 
+    live_fills = None
+    if args.compare_live:
+        from .live.bitbank import BitbankPrivate, load_keys
+        from .research.fillcheck import from_trade
+
+        if since is None or until is None:
+            raise ConfigError("--compare-live には --since と --until が要ります。")
+        keys = load_keys(args.env_file)
+        if keys is None:
+            raise ConfigError(f"API キーを読めません（{args.env_file}）。sudo で実行してください。")
+        async with make_session() as session:
+            trades = await BitbankPrivate(*keys, session=session).trades_between(
+                instrument.symbol, since // 1_000_000, until // 1_000_000)
+        live_fills = [from_trade(t) for t in trades]
+        console.print(f"  本番の約定 {len(live_fills)} 件を bitbank から読みました")
+
     console.print(f"{path}: {instrument.symbol}  1回 {size} {instrument.base}  {len(combos)} 通り")
     rows_out = []
     for combo in combos:
@@ -3549,10 +3565,18 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
                 elif src == "bitbank":
                     yield "bitbank", rx, event
 
+        from .research.fillcheck import MidLine, from_trade, report
+
+        mids = MidLine()
         result = await run_livesim(rows(), mm, lead_view, sim, pair=instrument.symbol,
-                                   per_s=args.per_s, breaker_pct=args.breaker_pct)
+                                   per_s=args.per_s, breaker_pct=args.breaker_pct, mids=mids)
         shown = "  ".join(f"{k}={v:g}" for k, v in settings.items())
         console.print(f"  {shown or '設定どおり'}  約定 {result.fills}  損益 {result.pnl:+,.0f}円")
+        if live_fills is not None and mids.ts:
+            print(f"\n=== 本番と検証の比較（{shown or '設定どおり'}） ===")
+            print(report(live_fills, [from_trade(t) for t in sim.all_trades], mids,
+                         since, min(until, mids.ts[-1])))
+            print()
         rows_out.append((shown, result))
 
     header = ["設定", "約定", "損益円", "取消中約定%", "指値拒否", "残高不足", "見つからない",
@@ -6773,6 +6797,9 @@ def build_parser() -> argparse.ArgumentParser:
     from .sim.bitbank_sim import VenueBehaviour as _VB
     for _f in __import__("dataclasses").fields(_VB):
         p_ls.add_argument(f"--{_f.name.replace('_', '-')}", type=float, default=_f.default)
+    p_ls.add_argument("--compare-live", action="store_true",
+                      help="同じ時間の本番の約定を bitbank から読んで並べる（読むだけ・sudo で）")
+    p_ls.add_argument("--env-file", default="/etc/jsboard.env")
     p_ls.add_argument("--vary", action="append",
                       help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
     p_ls.set_defaults(func=cmd_livesim)

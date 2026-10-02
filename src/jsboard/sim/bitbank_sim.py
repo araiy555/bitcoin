@@ -107,6 +107,8 @@ class SimBitbank:
         self.history: deque = deque()
         self._trade_ids = iter(range(1, 10**12))
         self._cancelled: set[int] = set()
+        self.all_trades: list[dict] = []
+        """Every execution, kept whole for comparing with a live run."""
 
     # ---------------------------------------------------------- the market
 
@@ -140,11 +142,14 @@ class SimBitbank:
                 self.jpy += price * amount
                 self.coin -= amount
             self.counts["fills"] += 1
-            self.history.append({
+            trade = {
                 "trade_id": next(self._trade_ids), "order_id": exchange_id,
+                "side": "buy" if order.side is Side.BUY else "sell",
                 "price": str(price), "amount": str(amount), "maker_taker": "maker",
                 "executed_at": self.now_ns // MS,
-            })
+            }
+            self.history.append(trade)
+            self.all_trades.append(trade)
 
     # ------------------------------------------------------ order helpers
 
@@ -274,6 +279,7 @@ async def run_livesim(
     poll_ms: float = 500.0,
     check_s: float = 30.0,
     breaker_pct: float = 1.5,
+    mids=None,
 ) -> LiveSimResult:
     """Run the live venue and executor over recorded rows on replay time.
 
@@ -281,7 +287,8 @@ async def run_livesim(
     lead view, the rest are the bitbank book. Time moves only with the rows,
     and between them the executor and poller act at the instants they would
     have: one call at a time, each holding the connection for its round
-    trip, no more than `per_s` order changes in any second.
+    trip, no more than `per_s` order changes in any second. A `mids`
+    line (`research.fillcheck.MidLine`) is filled with the book's mid.
     """
     from ..live import clock
     from ..live.runner import (
@@ -359,6 +366,8 @@ async def run_livesim(
             continue
         sim.on_market(event)
         mm.on_event(event)
+        if mids is not None and mm.market.mid is not None:
+            mids.add(rx, mm.market.mid * float(mm.instrument.tick_size))
         sim.touch(mm.market.book.best_bid(), mm.market.book.best_ask())
         if not venue.blocked:
             mm.requote()

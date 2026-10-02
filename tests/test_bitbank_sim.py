@@ -153,3 +153,53 @@ def test_a_cancelled_order_keeps_its_balance_for_a_moment():
         assert v.can_afford(Side.BUY, 37_000, 1_000_000)
     finally:
         clock.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_replay_lines_up_beside_the_live_fills(monkeypatch, capsys):
+    import jsboard.cli as cli
+    import jsboard.live.bitbank as bb
+    import jsboard.sim.s3 as s3
+
+    objects = recording()
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    class Account:
+        def __init__(self, *keys, session=None):
+            pass
+
+        async def trades_between(self, pair, since_ms, end_ms):
+            return [{"trade_id": 1, "executed_at": since_ms + 5_000, "side": "buy",
+                     "price": "37.19", "amount": "100", "maker_taker": "maker"}]
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    monkeypatch.setattr(bb, "BitbankPrivate", Account)
+    monkeypatch.setattr(bb, "load_keys", lambda path: ("k", "s"))
+    monkeypatch.setattr(cli, "make_session", Session)
+    start = "2026-09-26T00:00"
+    args = cli.build_parser().parse_args([
+        "livesim", "s3://b/raw/live/symbol=ADA_JPY/date=2026-09-26/",
+        "--since", start, "--until", "2026-09-26T00:30",
+        "--slow-land-share", "0", "--refuse-share", "0", "--compare-live",
+    ])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out.replace("\n", "\n")
+    assert "本番の約定 1 件" in out and "板の中値との差" in out and "30分ごとの損益" in out
