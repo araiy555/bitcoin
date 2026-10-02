@@ -33,6 +33,8 @@ log = logging.getLogger(__name__)
 
 MAX_CANCEL_TRIES = 40
 CANNOT_CANCEL = 50010
+LOST_GIVE_UP_S = 60.0
+"""How long to keep cancelling an order the venue says it cannot find."""
 """Retries of a cancel the venue says it cannot find (about two seconds);
 after that the order's status decides, and the final sweep is the backstop."""
 
@@ -165,7 +167,18 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
                 return True
         except BitbankError as missing:
             if missing.code == NOT_FOUND:
-                # Still unknown after two seconds: the venue never took it.
+                # The venue still says it has no such order. It sometimes says
+                # so for many seconds about an order that then appears and
+                # rests. Letting go of it here left it untracked until the
+                # stray sweep found it: unstripped from the book (the maker
+                # chased it), its balance counted as free (60001), and its
+                # stale price open to be picked off. So it stays a cancel in
+                # progress, retried every second, for up to a minute.
+                lost_for = time.time() - (order.cancel_asked or time.time())
+                if lost_for < LOST_GIVE_UP_S:
+                    order.retry_at = time.monotonic() + 1.0
+                    venue.intents.append(("cancel", order_id))
+                    return True
                 order.state = DONE
                 log.warning("order %s never reached the book", order.exchange_id)
                 return True

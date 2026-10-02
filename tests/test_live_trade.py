@@ -510,3 +510,35 @@ def test_a_cancel_waiting_to_retry_does_not_hold_up_the_queue():
     assert head_due(v) and v.intents[0] == ("cancel", fast.order_id)
     v.intents.popleft()
     assert not head_due(v)  # only the waiting one is left
+
+
+@pytest.mark.asyncio
+async def test_an_order_the_venue_cannot_find_yet_stays_tracked_until_it_appears():
+    # bitbank answered 50009 for many seconds about orders that then rested;
+    # dropping them left them untracked, unstripped and holding balance.
+    class Slow(DryRunApi):
+        hidden = True
+
+        async def cancel(self, pair, order_id):
+            if self.hidden:
+                raise BitbankError(NOT_FOUND, "cancel")
+            await super().cancel(pair, order_id)
+
+        async def status(self, pair, order_id):
+            if self.hidden:
+                raise BitbankError(NOT_FOUND, "status")
+            return await super().status(pair, order_id)
+
+    v, api, health = venue(), Slow(), Health()
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", health)
+    order.cancel_tries = 39  # past the quick retries
+    v.cancel(order.order_id)
+    await execute_once(v, api, "ada_jpy", health)
+    assert order.state == CANCELLING and v.intents  # still ours, still being cancelled
+    assert not v.can_afford(Side.BUY, 37_000, INST.to_lots("200"))  # its yen stays reserved
+    api.hidden = False
+    order.retry_at = 0
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    assert order.state == DONE and api.open == set() and not health.fatal
