@@ -128,6 +128,49 @@ def breakdown(fills: list[FillRow], mids: MidLine, end_ns: int) -> Breakdown:
     return out
 
 
+def holding(fills: list[FillRow], start_ns: int, end_ns: int,
+            min_yen: float = 1_000.0) -> tuple[float, float, float, float]:
+    """How much coin the fills left us holding, and for how long.
+
+    Returns (time-weighted average |coin|, largest |coin|, share of the
+    window holding at least `min_yen` of it, longest such stretch in
+    minutes). Counted from the window's start, so coin held before it
+    (a previous run's leftovers) is not included.
+    """
+    fills = sorted(fills, key=lambda f: f.ts_ns)
+    coin, price, t = 0.0, 0.0, start_ns
+    area = biggest = held_ns = longest = 0.0
+    since = None
+
+    def advance(to: int) -> None:
+        nonlocal area, held_ns, longest, t
+        span = max(0, to - t)
+        area += abs(coin) * span
+        if since is not None:
+            held_ns += span
+            longest = max(longest, to - since)
+        t = to
+
+    for f in fills:
+        if f.ts_ns > end_ns:
+            break
+        advance(max(f.ts_ns, start_ns))
+        coin += f.sign * f.amount
+        price = f.price
+        biggest = max(biggest, abs(coin))
+        if abs(coin) * price >= min_yen:
+            since = since if since is not None else t
+        else:
+            since = None
+    advance(end_ns)
+    window = max(1, end_ns - start_ns)
+    return area / window, biggest, held_ns / window, longest / NS / 60
+
+
+def coin_at(fills: list[FillRow], at_ns: int) -> float:
+    return sum(f.sign * f.amount for f in fills if f.ts_ns <= at_ns)
+
+
 def slices(fills: list[FillRow], mids: MidLine, start_ns: int, end_ns: int,
            step_s: int = 1800) -> list[tuple[int, float]]:
     """(slice start, yen made in the slice) for each `step_s` of the window."""
@@ -172,12 +215,21 @@ def report(live: list[FillRow], sim: list[FillRow], mids: MidLine,
         f"在庫の値動き(円)\t{a.carry:+,.0f}\t{b.carry:+,.0f}",
         f"手数料(円,マイナスはリベート)\t{a.fees:+,.0f}\t{b.fees:+,.0f}",
         f"損益(円)\t{a.pnl:+,.0f}\t{b.pnl:+,.0f}",
+    ]
+    ha, hb = holding(live, start_ns, end_ns), holding(sim, start_ns, end_ns)
+    lines += [
+        f"平均の在庫(枚)\t{ha[0]:,.0f}\t{hb[0]:,.0f}",
+        f"一番多い在庫(枚)\t{ha[1]:,.0f}\t{hb[1]:,.0f}",
+        f"在庫を持っていた時間(%)\t{ha[2] * 100:.0f}\t{hb[2] * 100:.0f}",
+        f"続けて持っていた最長(分)\t{ha[3]:.0f}\t{hb[3]:.0f}",
         "",
-        "30分ごとの損益(UTC)\t本番\t検証",
+        "30分ごとの損益(UTC)\t本番\t検証\t在庫 本番\t在庫 検証",
     ]
     for (t, x), (_, y) in zip(slices(live, mids, start_ns, end_ns),
                               slices(sim, mids, start_ns, end_ns), strict=True):
-        lines.append(f"{hhmm(t)[:5]}\t{x:+,.0f}\t{y:+,.0f}")
+        end = min(t + 1800 * NS, end_ns)
+        lines.append(f"{hhmm(t)[:5]}\t{x:+,.0f}\t{y:+,.0f}"
+                     f"\t{coin_at(live, end):+,.0f}\t{coin_at(sim, end):+,.0f}")
     for name, fills in (("本番", live), ("検証", sim)):
         lines += ["", f"{name}: 1分以内に一番逆に動いた約定\t損(円)\t売買\t値段\t量"]
         for loss, f in worst(fills, mids, end_ns):

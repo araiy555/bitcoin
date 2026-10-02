@@ -57,3 +57,12 @@ def test_a_print_inside_a_wide_spread_pays_the_maker():
     row = next(line for line in text.splitlines() if line.startswith("すべての約定"))
     edge, *after = (float(x) for x in row.split("\t")[3:])
     assert edge > 2.5 and all(a > 4 for a in after)  # half spread 2.7bps + 2bps rebate
+
+
+def test_holding_measures_how_much_and_how_long():
+    from jsboard.research.fillcheck import holding
+
+    fills = [FillRow(10 * NS, 1, 40.0, 100), FillRow(70 * NS, -1, 40.0, 100)]
+    avg, biggest, share, longest = holding(fills, 0, 100 * NS)
+    assert biggest == 100 and abs(avg - 60.0) < 1e-9
+    assert abs(share - 0.6) < 1e-9 and abs(longest - 1.0) < 1e-9
