@@ -151,9 +151,11 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
     except BitbankError as exc:
         order.cancel_tries += 1
         if exc.code == NOT_FOUND and order.cancel_tries < MAX_CANCEL_TRIES:
-            # Accepted but not yet on the book: try again after the queue.
+            # Accepted but not yet on the book: try again shortly. The wait is
+            # recorded on the order, never slept here: sleeping would hold up
+            # every other cancel queued behind this one.
+            order.retry_at = time.monotonic() + min(0.05 * order.cancel_tries, 0.5)
             venue.intents.append(("cancel", order_id))
-            await asyncio.sleep(0.05)
             return True
         state = "?"
         try:
@@ -175,7 +177,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
             # rather than counted toward stopping the run.
             log.info("order %s not cancellable yet (status %s); retrying",
                      order.exchange_id, state)
-            await asyncio.sleep(min(0.1 * order.cancel_tries, 1.0))
+            order.retry_at = time.monotonic() + min(0.1 * order.cancel_tries, 1.0)
             return True
         log.warning("cancel of %s failed (status %s)", order.exchange_id, state)
         health.error(exc)
@@ -250,15 +252,32 @@ def drop_noops(venue: LiveVenue) -> None:
         venue.intents.popleft()
 
 
+def head_due(venue: LiveVenue) -> bool:
+    """Bring an intent that may be sent now to the head of the queue.
+
+    A cancel waiting out a retry delay moves to the back, so the orders
+    behind it are not held up. False when nothing is due yet.
+    """
+    now = time.monotonic()
+    for _ in range(len(venue.intents)):
+        kind, order_id = venue.intents[0]
+        order = venue.orders.get(order_id)
+        if kind == "cancel" and order is not None and order.retry_at > now:
+            venue.intents.rotate(-1)
+            continue
+        return True
+    return False
+
+
 async def run_executor(
     venue: LiveVenue, api, pair: str, health: Health, budget: RequestBudget
 ) -> None:
     while True:
         drop_noops(venue)
-        if venue.intents:
+        if venue.intents and head_due(venue):
             await budget.take()
             drop_noops(venue)  # the wait may have made the head moot
-            if venue.intents:
+            if venue.intents and head_due(venue):
                 venue.requests_sent += 1
                 await execute_once(venue, api, pair, health)
         else:
@@ -299,7 +318,7 @@ async def poll_fills_once(venue: LiveVenue, api, pair: str, state: dict) -> int:
 
 
 async def run_fill_poller(
-    venue: LiveVenue, api, pair: str, health: Health, interval_s: float = 1.0
+    venue: LiveVenue, api, pair: str, health: Health, interval_s: float = 0.5
 ) -> None:
     state = {"since_ms": int(time.time() * 1000)}
     while True:

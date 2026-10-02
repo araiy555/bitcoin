@@ -447,3 +447,66 @@ async def test_fills_on_orders_being_pulled_are_counted():
     await execute_once(v, api, "ada_jpy", Health())
     assert v.doomed_fills == 1 and v.fills_seen == 1 and len(v.cancel_ms) == 1
     assert "取消し中の約定 1/1回（100%）" in v.cancel_report()
+
+
+@pytest.mark.asyncio
+async def test_our_own_resting_orders_are_taken_out_of_the_public_book():
+    from jsboard.feed.base import DepthDelta
+
+    v, api = venue(), DryRunApi()
+    order = v.place(bid(37_000, 1_000_000), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", Health())
+    # The venue's book: our 100 ADA is the whole best bid at 37.000.
+    snap = DepthSnapshot(((37_000, 1_000_000), (36_990, 5_000_000)),
+                         ((37_010, 2_000_000),), 1)
+    seen = v.strip_own(snap)
+    assert seen.bids == ((36_990, 5_000_000),)  # the touch is somebody else's again
+    delta = DepthDelta(((37_000, 1_500_000),), (), 2, 2)  # someone joined behind us
+    assert v.strip_own(delta).bids == ((37_000, 500_000),)
+    v.cancel(order.order_id)
+    await execute_once(v, api, "ada_jpy", Health())
+    assert v.strip_own(snap) is snap  # nothing of ours left to take out
+
+
+def test_without_the_correction_the_unwind_would_chase_its_own_order():
+    from jsboard.cli import build_maker, build_parser
+    from jsboard.research.daily import FIXED_FLAGS
+
+    args = build_parser().parse_args([
+        "sweep", "-", "--source", "bitbank", *FIXED_FLAGS, "--maker-bps=-2",
+        "--size", "100", "--max-position", "1000", "--requote-ms", "0",
+    ])
+    mm = build_maker(INST, args)
+    v = venue()
+    mm.venue = v
+    mm.on_event(FeedStatus("live", "fake"))
+    now = time.time_ns()
+    book = DepthSnapshot(((36_990, 9_000_000),), ((37_020, 9_000_000),), 1, now)
+    mm.on_event(v.strip_own(book))
+    first = mm.quoter.quote(fair_value=mm.fair_value.estimate(mm.market), sigma_ticks=0,
+                            inventory_lots=0, best_bid=36_990, best_ask=37_020)
+    assert first.bids  # sanity: the maker has a bid to place
+    # Rest a bid one tick inside, as an unwind would, then show the venue's
+    # book with it at the touch: stripped, the touch is still 36.990.
+    order = v.place(Quote(Side.BUY, 36_991, 1_000_000), 0, best_opposite=37_020)
+    order.exchange_id, order.state = 1, OPEN
+    mm.on_event(v.strip_own(DepthSnapshot(((36_991, 1_000_000), (36_990, 9_000_000)),
+                                          ((37_020, 9_000_000),), 2, now)))
+    assert mm.market.book.best_bid() == 36_990
+
+
+def test_a_cancel_waiting_to_retry_does_not_hold_up_the_queue():
+    from jsboard.live.runner import head_due
+
+    v = venue()
+    slow = v.place(bid(37_000, 10_000), 0, best_opposite=37_010)
+    fast = v.place(bid(36_990, 10_000), 0, best_opposite=37_010)
+    for o, i in ((slow, 1), (fast, 2)):
+        o.exchange_id, o.state = i, OPEN
+    v.intents.clear()
+    v.cancel(slow.order_id)
+    v.cancel(fast.order_id)
+    slow.retry_at = time.monotonic() + 60
+    assert head_due(v) and v.intents[0] == ("cancel", fast.order_id)
+    v.intents.popleft()
+    assert not head_due(v)  # only the waiting one is left

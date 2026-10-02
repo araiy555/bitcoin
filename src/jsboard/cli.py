@@ -3251,7 +3251,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     try:
         async for event in events():
             last_event[0] = time.monotonic()
-            mm.on_event(event)
+            mm.on_event(venue.strip_own(event))
             if not venue.blocked:
                 mm.requote()
             venue.forget_done()

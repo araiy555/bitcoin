@@ -14,6 +14,7 @@ checked against the balance left after what is already resting.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import statistics
 import time
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from ..core.types import Fill, Instrument, Side
+from ..feed.base import DepthDelta, DepthSnapshot
 from ..mm.quoter import Quote
 
 NEW, OPEN, CANCELLING, DONE = "new", "open", "cancelling", "done"
@@ -38,6 +40,8 @@ class LiveOrder:
     exchange_id: int | None = None
     filled: int = 0
     cancel_tries: int = 0
+    retry_at: float = 0.0
+    """Monotonic time before which a retried cancel is not sent again."""
     cancel_asked: float | None = None
     """Wall-clock seconds when the maker asked to cancel; a fill executed
     after this is one the guard meant to avoid."""
@@ -174,6 +178,41 @@ class LiveVenue:
         self.sent[order.exchange_id] = order
         if len(self.sent) > 5000:
             del self.sent[next(iter(self.sent))]
+
+    def strip_own(self, event):
+        """The public book without our own resting orders in it.
+
+        On paper our orders never reach the public feed. Live they do, and a
+        maker that reads its own order as somebody else's chases itself: the
+        unwind quote goes "one tick inside the touch", the touch is our own
+        order, so every requote steps a tick further until it meets the other
+        side; and our size at the touch tilts the microprice toward us.
+        Depth updates carry each level's total, so our share is taken out.
+        """
+        if not isinstance(event, (DepthSnapshot, DepthDelta)):
+            return event
+        mine = {Side.BUY: {}, Side.SELL: {}}
+        for o in self.orders.values():
+            if o.exchange_id is not None and o.state in (OPEN, CANCELLING) and o.remaining > 0:
+                book = mine[o.side]
+                book[o.price] = book.get(o.price, 0) + o.remaining
+        if not mine[Side.BUY] and not mine[Side.SELL]:
+            return event
+        keep_empty = isinstance(event, DepthDelta)  # a zero in a delta deletes the level
+
+        def strip(levels, own):
+            out = []
+            for price, qty in levels:
+                qty = max(0, qty - own.get(price, 0))
+                if qty > 0 or keep_empty:
+                    out.append((price, qty))
+            return tuple(out)
+
+        return dataclasses.replace(
+            event,
+            bids=strip(event.bids, mine[Side.BUY]),
+            asks=strip(event.asks, mine[Side.SELL]),
+        )
 
     def by_exchange_id(self, exchange_id: int) -> LiveOrder | None:
         return self.sent.get(exchange_id)
