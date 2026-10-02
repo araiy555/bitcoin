@@ -66,3 +66,15 @@ def test_holding_measures_how_much_and_how_long():
     avg, biggest, share, longest = holding(fills, 0, 100 * NS)
     assert biggest == 100 and abs(avg - 60.0) < 1e-9
     assert abs(share - 0.6) < 1e-9 and abs(longest - 1.0) < 1e-9
+
+
+def test_the_listing_interleaves_both_runs_with_their_inventory():
+    from jsboard.research.fillcheck import listing
+
+    mids = line((0, 40.0), (200, 39.0))
+    live = [FillRow(10 * NS, 1, 40.0, 100), FillRow(100 * NS, -1, 39.5, 100)]
+    sim = [FillRow(20 * NS, 1, 40.0, 50)]
+    text = listing(live, sim, mids, 0, 150 * NS, 200 * NS)
+    rows = text.splitlines()[2:]
+    assert [r.split("\t")[1] for r in rows] == ["本番", "検証", "本番"]
+    assert rows[-1].endswith("+0") and rows[1].endswith("+50")

@@ -158,10 +158,8 @@ def holding(fills: list[FillRow], start_ns: int, end_ns: int,
         coin += f.sign * f.amount
         price = f.price
         biggest = max(biggest, abs(coin))
-        if abs(coin) * price >= min_yen:
-            since = since if since is not None else t
-        else:
-            since = None
+        holding_now = abs(coin) * price >= min_yen
+        since = (t if since is None else since) if holding_now else None
     advance(end_ns)
     window = max(1, end_ns - start_ns)
     return area / window, biggest, held_ns / window, longest / NS / 60
@@ -236,4 +234,32 @@ def report(live: list[FillRow], sim: list[FillRow], mids: MidLine,
             side = "買い" if f.sign > 0 else "売り"
             maker = "" if f.maker else "(成行)"
             lines.append(f"{hhmm(f.ts_ns)}\t{loss:+,.0f}\t{side}{maker}\t{f.price:g}\t{f.amount:g}")
+    return "\n".join(lines)
+
+
+def listing(live: list[FillRow], sim: list[FillRow], mids: MidLine,
+            from_ns: int, to_ns: int, end_ns: int) -> str:
+    """Every fill of both runs between two instants, in time order, with the
+    coin each side held after it: where the two runs part ways."""
+    from datetime import UTC, datetime
+
+    held = {"本番": coin_at(live, from_ns - 1), "検証": coin_at(sim, from_ns - 1)}
+    rows = sorted(
+        [(f.ts_ns, "本番", f) for f in live if from_ns <= f.ts_ns <= to_ns]
+        + [(f.ts_ns, "検証", f) for f in sim if from_ns <= f.ts_ns <= to_ns],
+        key=lambda r: (r[0], r[1]),
+    )
+    lines = [f"約定の一覧\t始めの在庫 本番 {held['本番']:+,.0f} 検証 {held['検証']:+,.0f}",
+             "時刻(UTC)\tどちら\t売買\t値段\t量\t中値\t60秒後(円)\t在庫"]
+    for ts, who, f in rows:
+        held[who] += f.sign * f.amount
+        mid = mids.at(ts)
+        later = mids.at(min(ts + 60 * NS, end_ns))
+        after = f"{f.sign * (later - f.price) * f.amount:+,.0f}" if later is not None else "-"
+        side = ("買い" if f.sign > 0 else "売り") + ("" if f.maker else "(成行)")
+        lines.append(
+            f"{datetime.fromtimestamp(ts / NS, UTC).strftime('%H:%M:%S')}\t{who}\t{side}"
+            f"\t{f.price:g}\t{f.amount:g}\t{mid if mid is None else round(mid, 3)}"
+            f"\t{after}\t{held[who]:+,.0f}"
+        )
     return "\n".join(lines)

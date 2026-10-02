@@ -3469,6 +3469,15 @@ async def cmd_bbprobe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hhmm_ns(text: str) -> int:
+    """'13:33' as nanoseconds after midnight."""
+    try:
+        h, m = (int(x) for x in text.strip().split(":"))
+    except ValueError as exc:
+        raise ConfigError(f"時刻は 13:33 の形で: {text!r}") from exc
+    return (h * 3600 + m * 60) * 1_000_000_000
+
+
 async def cmd_livesim(args: argparse.Namespace) -> int:
     """Replay a recording through the live trader against a bitbank model.
 
@@ -3577,8 +3586,17 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         console.print(f"  {shown or '設定どおり'}  約定 {result.fills}  損益 {result.pnl:+,.0f}円")
         if live_fills is not None and mids.ts:
             print(f"\n=== 本番と検証の比較（{shown or '設定どおり'}） ===")
-            print(report(live_fills, [from_trade(t) for t in sim.all_trades], mids,
-                         since, min(until, mids.ts[-1])))
+            sim_fills = [from_trade(t) for t in sim.all_trades]
+            end_ns = min(until, mids.ts[-1])
+            print(report(live_fills, sim_fills, mids, since, end_ns))
+            if args.list_fills:
+                from .research.fillcheck import listing
+
+                day = since - since % (86_400 * 1_000_000_000)
+                a, _, b = args.list_fills.partition("-")
+                lo, hi = (day + _hhmm_ns(x) for x in (a, b))
+                print()
+                print(listing(live_fills, sim_fills, mids, lo, hi, end_ns))
             print()
         rows_out.append((shown, result))
 
@@ -6843,6 +6861,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--compare-live", action="store_true",
                       help="同じ時間の本番の約定を bitbank から読んで並べる（読むだけ・sudo で）")
     p_ls.add_argument("--env-file", default="/etc/jsboard.env")
+    p_ls.add_argument("--list-fills", default=None,
+                      help="この時間の約定を本番・検証とも1件ずつ並べる（UTC 13:33-14:33）")
     p_ls.add_argument("--no-own-prints", action="store_true",
                       help="本番で自分に当たった約定を、検証の注文にも当てる補正をしない")
     p_ls.add_argument("--vary", action="append",
