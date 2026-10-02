@@ -146,7 +146,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
         return True
     try:
         await api.cancel(pair, order.exchange_id)
-        order.state = DONE
+        venue.cancelled(order)
         health.ok()
     except BitbankError as exc:
         order.cancel_tries += 1
@@ -159,7 +159,7 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
         try:
             state = await api.status(pair, order.exchange_id)
             if state in FINISHED:
-                order.state = DONE
+                venue.cancelled(order)
                 return True
         except BitbankError as missing:
             if missing.code == NOT_FOUND:
@@ -221,7 +221,7 @@ async def _cancel_batch(venue: LiveVenue, api, pair: str, first, health: Health)
     missed = [o for o in batch if o.exchange_id not in cancelled]
     for order in batch:
         if order.exchange_id in cancelled:
-            order.state = DONE
+            venue.cancelled(order)
     for order in missed:
         order.cancel_tries = 1
     venue.intents.extendleft(("cancel", o.order_id) for o in reversed(missed))

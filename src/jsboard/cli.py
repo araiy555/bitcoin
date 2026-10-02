@@ -3282,6 +3282,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
                     f"  送信 {rate:.1f}/秒  送信待ち {len(venue.intents)}"
                     f"  {venue.blocked or mm.stats.last_decision}"
                 )
+                console.print(f"  {venue.cancel_report()}")
     except _asyncio.CancelledError:
         reason, code = "停止の指示（systemctl stop / Ctrl+C）", 0
     finally:

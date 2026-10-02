@@ -428,3 +428,22 @@ async def test_a_cancel_refused_while_the_venue_is_busy_is_retried_quietly():
     while await execute_once(v, api, "ada_jpy", health):
         pass
     assert order.state == DONE and api.open == set() and not health.fatal
+
+
+@pytest.mark.asyncio
+async def test_fills_on_orders_being_pulled_are_counted():
+    v, api = venue(), DryRunApi()
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", Health())
+    v.cancel(order.order_id)
+    after = int((order.cancel_asked + 0.1) * 1e9)
+
+    class Late(DryRunApi):
+        async def trade_history(self, pair, since_ms):
+            return [{"trade_id": 5, "order_id": order.exchange_id, "price": "37.000",
+                     "amount": "10", "maker_taker": "maker", "executed_at": after // 1_000_000}]
+
+    await poll_fills_once(v, Late(), "ada_jpy", {})
+    await execute_once(v, api, "ada_jpy", Health())
+    assert v.doomed_fills == 1 and v.fills_seen == 1 and len(v.cancel_ms) == 1
+    assert "取消し中の約定 1/1回（100%）" in v.cancel_report()

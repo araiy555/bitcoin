@@ -15,6 +15,8 @@ checked against the balance left after what is already resting.
 from __future__ import annotations
 
 import itertools
+import statistics
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -36,6 +38,9 @@ class LiveOrder:
     exchange_id: int | None = None
     filled: int = 0
     cancel_tries: int = 0
+    cancel_asked: float | None = None
+    """Wall-clock seconds when the maker asked to cancel; a fill executed
+    after this is one the guard meant to avoid."""
 
     @property
     def is_live(self) -> bool:
@@ -80,6 +85,8 @@ class LiveVenue:
     gap_filled_lots: int = 0
     doomed_fills: int = 0
     doomed_lots: int = 0
+    fills_seen: int = 0
+    cancel_ms: list = field(default_factory=list)
     filled_lots: int = 0
 
     # ------------------------------------------------------------ balances
@@ -126,8 +133,23 @@ class LiveVenue:
         if order is None or order.state in (CANCELLING, DONE):
             return False
         order.state = CANCELLING
+        order.cancel_asked = time.time()
         self.intents.append(("cancel", order_id))
         return True
+
+    def cancelled(self, order: LiveOrder) -> None:
+        """The venue confirmed the cancel: note how long getting out took."""
+        if order.cancel_asked is not None and order.exchange_id is not None:
+            self.cancel_ms.append((time.time() - order.cancel_asked) * 1000)
+            del self.cancel_ms[:-500]
+        order.state = DONE
+
+    def cancel_report(self) -> str:
+        """How often and how slowly we got out of the way, for the log."""
+        share = self.doomed_fills / self.fills_seen * 100 if self.fills_seen else 0.0
+        typical = f"{statistics.median(self.cancel_ms):.0f}ms" if self.cancel_ms else "—"
+        return (f"取消し中の約定 {self.doomed_fills}/{self.fills_seen}回（{share:.0f}%）"
+                f"  取消し 中央値 {typical}")
 
     def cancel_all(self) -> int:
         return sum(self.cancel(o.order_id) for o in list(self.orders.values()))
@@ -161,6 +183,12 @@ class LiveVenue:
         order.remaining = max(0, order.remaining - fill.qty)
         order.filled += fill.qty
         self.filled_lots += fill.qty
+        self.fills_seen += 1
+        if order.cancel_asked is not None and fill.ts_ns / 1e9 >= order.cancel_asked:
+            # We had already decided to pull this order and the venue filled
+            # it anyway: the cost of a slow or refused cancel.
+            self.doomed_fills += 1
+            self.doomed_lots += fill.qty
         price, amount = self.price_of(fill.price), self.amount_of(fill.qty)
         if order.side is Side.BUY:
             self.quote_balance -= price * amount
