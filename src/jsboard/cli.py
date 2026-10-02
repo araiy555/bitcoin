@@ -3509,7 +3509,7 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         grid.append((name, [float(v) for v in values.split(",")]))
     combos = list(itertools.product(*[v for _, v in grid])) or [()]
 
-    live_fills = None
+    live_fills, live_trades = None, []
     if args.compare_live:
         from .live.bitbank import BitbankPrivate, load_keys
         from .research.fillcheck import from_trade
@@ -3522,6 +3522,7 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         async with make_session() as session:
             trades = await BitbankPrivate(*keys, session=session).trades_between(
                 instrument.symbol, since // 1_000_000, until // 1_000_000)
+        live_trades = trades
         live_fills = [from_trade(t) for t in trades]
         console.print(f"  本番の約定 {len(live_fills)} 件を bitbank から読みました")
 
@@ -3552,6 +3553,8 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
         sim = SimBitbank(instrument, behaviour, jpy=Decimal(str(args.jpy)),
                          coin=Decimal(str(args.coin)), seed=args.seed)
+        if live_trades and not args.no_own_prints:
+            sim.mark_own_prints(live_trades)
 
         async def rows():
             for src, rx, event in iter_tagged_timed(path):
@@ -3580,14 +3583,15 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         rows_out.append((shown, result))
 
     header = ["設定", "約定", "損益円", "取消中約定%", "指値拒否", "残高不足", "見つからない",
-              "取消不可", "遅着", "停止"]
+              "取消不可", "遅着", "本番の約定に一致", "停止"]
     print("\t".join(header))
     for shown, r in rows_out:
         c = r.counts
         print("\t".join([
             shown or "-", f"{r.fills:,}", f"{r.pnl:+,.0f}", f"{r.doomed_pct:.0f}",
             str(c["refused"]), str(c["insufficient"]), str(c["not_found"]),
-            str(c["cannot_cancel"]), str(c["slow_land"]), r.stopped or "-",
+            str(c["cannot_cancel"]), str(c["slow_land"]), str(c["own_prints"]),
+            r.stopped or "-",
         ]))
     return 0
 
@@ -6839,6 +6843,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--compare-live", action="store_true",
                       help="同じ時間の本番の約定を bitbank から読んで並べる（読むだけ・sudo で）")
     p_ls.add_argument("--env-file", default="/etc/jsboard.env")
+    p_ls.add_argument("--no-own-prints", action="store_true",
+                      help="本番で自分に当たった約定を、検証の注文にも当てる補正をしない")
     p_ls.add_argument("--vary", action="append",
                       help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
     p_ls.set_defaults(func=cmd_livesim)

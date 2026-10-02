@@ -84,7 +84,7 @@ class SimBitbank:
     best_ask: int | None = None
     counts: dict = field(default_factory=lambda: {
         "orders": 0, "refused": 0, "insufficient": 0, "not_found": 0,
-        "cannot_cancel": 0, "slow_land": 0, "fills": 0,
+        "cannot_cancel": 0, "slow_land": 0, "fills": 0, "own_prints": 0,
     })
 
     def __post_init__(self) -> None:
@@ -109,6 +109,10 @@ class SimBitbank:
         self._cancelled: set[int] = set()
         self.all_trades: list[dict] = []
         """Every execution, kept whole for comparing with a live run."""
+        self.own_prints: list[tuple] = []
+        """(maker side, price ticks, lots, exchange ms) of executions that
+        hit the live trader's own orders on the day the recording was made;
+        see `mark_own_prints`."""
 
     # ---------------------------------------------------------- the market
 
@@ -119,7 +123,41 @@ class SimBitbank:
                 for price, qty in levels:
                     self.book.on_depth(side, price, qty)
         elif isinstance(event, TradeTick):
+            self._front_if_ours(event)
             self._book(self.book.on_trade(event))
+
+    def mark_own_prints(self, trades: list[dict]) -> None:
+        """Tell the model which recorded prints filled our live orders.
+
+        A recording made while the live trader ran has our own orders in
+        its depth. A replayed order at the same price is queued behind
+        that ghost of itself, and the print that filled us live is eaten
+        by the ghost: the replay skipped exactly the fills that cost the
+        most. When such a print comes, a replayed order resting at that
+        price is put at the front, where the live order stood.
+        """
+        inst = self.instrument
+        self.own_prints = sorted(
+            (Side.BUY if t["side"] == "buy" else Side.SELL,
+             int((Decimal(str(t["price"])) / inst.tick_size).to_integral_value()),
+             inst.to_lots(str(t["amount"])), int(t["executed_at"]))
+            for t in trades
+        )
+
+    def _front_if_ours(self, trade: TradeTick, window_ms: int = 1500) -> None:
+        if not self.own_prints:
+            return
+        maker = trade.aggressor.opposite
+        ms = (trade.ts_ns or self.now_ns) // MS
+        for i, (side, price, lots, at) in enumerate(self.own_prints):
+            if side is maker and price == trade.price and lots == trade.qty \
+                    and abs(at - ms) <= window_ms:
+                del self.own_prints[i]
+                self.counts["own_prints"] += 1
+                for order in self.book.orders.values():
+                    if order.side is maker and order.price == price:
+                        order.queue_ahead = 0
+                return
 
     def touch(self, best_bid: int | None, best_ask: int | None) -> None:
         """The public touch after an event, for post-only checks (and gap fills)."""

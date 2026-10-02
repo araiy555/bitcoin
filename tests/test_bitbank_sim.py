@@ -230,3 +230,24 @@ async def test_the_print_ceiling_reads_a_recording(monkeypatch, capsys):
     assert await args.func(args) == 0
     out = capsys.readouterr().out
     assert "すべての約定" in out and "60秒後bps" in out and "スプレッド 中央値" in out
+
+
+@pytest.mark.asyncio
+async def test_a_print_that_filled_us_live_is_not_eaten_by_our_own_ghost():
+    # The recorded bid of 100 ADA at 36.990 was our live order; the print of
+    # 100 ADA filled it. Replayed behind that ghost, our order gets nothing.
+    def run(own):
+        sim = venue(land_ms=0)
+        sim.on_market(DepthSnapshot(((36_990, 1_000_000),), ((37_010, 1_000_000),), 2, T0))
+        if own:
+            sim.mark_own_prints([{"side": "buy", "price": "36.990", "amount": "100",
+                                  "executed_at": T0 // MS + 300}])
+        return sim
+
+    for own, expect in ((False, 0), (True, 1)):
+        sim = run(own)
+        oid = await sim.order("ada_jpy", "buy", Decimal("36.990"), Decimal("100"))
+        sim.on_market(TradeTick(36_990, 1_000_000, Side.SELL, 9, T0 + 300 * MS))
+        fills = await sim.trade_history("ada_jpy", 0)
+        assert len(fills) == expect and all(f["order_id"] == oid for f in fills)
+        assert sim.counts["own_prints"] == expect

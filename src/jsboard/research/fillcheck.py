@@ -80,6 +80,10 @@ class Breakdown:
     edge: float = 0.0
     move_10s: float = 0.0
     move_60s: float = 0.0
+    from_price_60s: float = 0.0
+    """Fill price to the mid a minute later. Does not depend on which clock
+    stamped the fill: the live run's are the venue's, the replay's are the
+    time we received the print, a moment after the book had moved."""
     fees: float = 0.0
     pnl: float = 0.0
 
@@ -109,6 +113,9 @@ def breakdown(fills: list[FillRow], mids: MidLine, end_ns: int) -> Breakdown:
         out.buys += f.sign > 0
         out.volume += f.price * f.amount
         out.fees += f.fee
+        later = mids.at(min(f.ts_ns + 60 * NS, end_ns))
+        if later is not None:
+            out.from_price_60s += f.sign * (later - f.price) * f.amount
         mid = mids.at(f.ts_ns)
         if mid is None:
             continue
@@ -161,6 +168,7 @@ def report(live: list[FillRow], sim: list[FillRow], mids: MidLine,
         f"板の中値との差(円)\t{a.edge:+,.0f}\t{b.edge:+,.0f}",
         f"10秒後の値動き(円)\t{a.move_10s:+,.0f}\t{b.move_10s:+,.0f}",
         f"60秒後の値動き(円)\t{a.move_60s:+,.0f}\t{b.move_60s:+,.0f}",
+        f"約定値段→60秒後の中値(円)\t{a.from_price_60s:+,.0f}\t{b.from_price_60s:+,.0f}",
         f"在庫の値動き(円)\t{a.carry:+,.0f}\t{b.carry:+,.0f}",
         f"手数料(円,マイナスはリベート)\t{a.fees:+,.0f}\t{b.fees:+,.0f}",
         f"損益(円)\t{a.pnl:+,.0f}\t{b.pnl:+,.0f}",
