@@ -332,6 +332,7 @@ def build_maker(instrument: Instrument, args: argparse.Namespace) -> MarketMaker
             cancel_ahead_ratio=args.cancel_ahead,
             cancel_latency_ms=getattr(args, "cancel_latency_ms", 0.0),
             gap_through_fills=not getattr(args, "no_gap_fills", False),
+            gap_fill_share=getattr(args, "gap_fill_share", 1.0),
         ),
     )
     position = Position(
@@ -1154,6 +1155,7 @@ def _sweep_row(mm: MarketMaker, s: dict) -> dict:
             s.get("gap_filled", 0.0) / s["filled"] * 100.0 if s.get("filled") else math.nan
         ),
         "volume": s.get("volume", 0.0),
+        "doomed_pct": (s.get("doomed_fills", 0) / s["fills"] * 100.0 if s["fills"] else math.nan),
         "tox_one_sided_pct": tox.get("one_sided_share", 0.0) * 100.0,
         "tox_pull_pct": tox.get("pull_share", 0.0) * 100.0,
         "lead_pct": tox.get("lead_share", 0.0) * 100.0,
@@ -1308,6 +1310,8 @@ async def cmd_sweep(args: argparse.Namespace) -> int:
         ("先行引%", "lead_pct", "{:.0f}"),
         ("手仕舞%", "unwind_pct", "{:.0f}"),
         ("送信/秒", "req_per_s", "{:.1f}"),
+        ("損益円", "total", "{:+,.0f}"),
+        ("取消中約定%", "doomed_pct", "{:.0f}"),
     ]
 
     def cell(row: dict, key: str, fmt: str) -> str:
@@ -6155,6 +6159,10 @@ def add_common(p: argparse.ArgumentParser) -> None:
             "取消を出してから板から消えるまでのms。0は「即座に消える」で、"
             "モデル最大の楽観。危ないと気づいてから逃げ切るまでの時間がここ。"
         ),
+    )
+    sim.add_argument(
+        "--gap-fill-share", type=float, default=1.0,
+        help="板が指値を飛び越えたときに約定とみなす割合（本番に合わせて較正する）",
     )
     sim.add_argument(
         "--no-gap-fills",

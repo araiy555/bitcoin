@@ -542,3 +542,22 @@ async def test_an_order_the_venue_cannot_find_yet_stays_tracked_until_it_appears
     while await execute_once(v, api, "ada_jpy", health):
         pass
     assert order.state == DONE and api.open == set() and not health.fatal
+
+
+def test_a_gap_fill_share_fills_only_part_of_the_gap_throughs():
+    from jsboard.sim.paper import PaperConfig, PaperVenue
+
+    def fills(share):
+        v = PaperVenue(INST, config=PaperConfig(latency_ms=0, gap_fill_share=share),
+                       clock=lambda: 1)
+        for _ in range(200):
+            v.place(Quote(Side.BUY, 37_000, 10_000), 0, best_opposite=37_010)
+        # The book moves through every bid at once, twice.
+        first = len(v.on_book(36_990, 37_000, ts_ns=1))
+        again = len(v.on_book(36_990, 37_000, ts_ns=2))
+        return first, again, v.gap_passed
+
+    assert fills(1.0)[:2] == (200, 0)
+    first, again, passed = fills(0.15)
+    assert 15 <= first <= 50 and again == 0  # a pass is not re-rolled
+    assert passed == 2 * (200 - first)

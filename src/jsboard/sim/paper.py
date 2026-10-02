@@ -104,6 +104,17 @@ class PaperConfig:
     an artefact of never charging for being slow to leave.
     """
 
+    gap_fill_share: float = 1.0
+    """Share of gap-through events that become fills, the rest passing by.
+
+    A gap-through is the public book moving through a price where only our
+    virtual order stands. Live, part of that is a seller crossing our real
+    bid (a fill) and part is other makers re-posting around an order they
+    never had to trade with. The first live day on bitbank ADA filled about
+    one in seven of what this model filled at 1.0, so it is calibrated from
+    live runs rather than assumed. Chosen deterministically per order id,
+    so a replay gives the same answer every time."""
+
     gap_through_fills: bool = True
     """Fill a resting order the public touch has crossed, print or no print.
 
@@ -139,6 +150,8 @@ class PaperVenue:
     # a run whose recording is too coarse to trust for anything finer.
     gap_fills: int = 0
     gap_filled_lots: int = 0
+    gap_passed: int = 0
+    _gap_decided: dict = field(default_factory=dict)
 
     # Fills that landed on an order we had already asked to cancel. This is
     # the cost of not being fast enough to get out of the way, and it is the
@@ -340,6 +353,17 @@ class PaperVenue:
                 if best_bid is None or order.price > best_bid:
                     continue
                 aggressor = Side.BUY
+
+            share = self.config.gap_fill_share
+            if share < 1.0:
+                # Decide once per order: a pass stays a pass while the book
+                # sits through it, rather than being re-rolled every update.
+                if order.order_id not in self._gap_decided:
+                    keep = ((order.order_id * 2654435761) % 10_000) / 10_000 < share
+                    self._gap_decided[order.order_id] = keep
+                if not self._gap_decided[order.order_id]:
+                    self.gap_passed += 1
+                    continue
 
             fill_qty = order.remaining
             order.remaining = 0
