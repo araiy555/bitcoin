@@ -228,6 +228,22 @@ class LiveVenue:
             asks=strip(event.asks, mine[Side.SELL]),
         )
 
+    def idle(self) -> bool:
+        """Nothing of ours rests, waits to be sent, or still holds balance."""
+        return (not self.intents and self._reserved(Side.BUY) == 0
+                and self._reserved(Side.SELL) == 0)
+
+    def track_sale(self, exchange_id: int, side: Side, lots: int, price: int) -> LiveOrder:
+        """A market order sent to get out, kept so its fills are booked.
+
+        It never rests, so it stays out of `orders`: nothing cancels it and
+        the public book is not stripped of it.
+        """
+        order = LiveOrder(next(self._ids), side, price, lots, lots, state=OPEN,
+                          exchange_id=exchange_id)
+        self.remember(order)
+        return order
+
     def by_exchange_id(self, exchange_id: int) -> LiveOrder | None:
         return self.sent.get(exchange_id)
 

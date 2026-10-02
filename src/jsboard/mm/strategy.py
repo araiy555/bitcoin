@@ -430,6 +430,14 @@ class MarketMaker:
 
     # ---------------------------------------------------------------- reads
 
+    def book_venue_fills(self) -> list[Fill]:
+        """Book fills the venue found between events, such as the market
+        sale that closes a live run after its feed has stopped."""
+        fills = self.venue.on_book(self.market.book.best_bid(), self.market.book.best_ask())
+        if fills:
+            self._book_fills(fills, self.market.mid)
+        return fills
+
     def flatten(self) -> int:
         """Pull all quotes. Does not trade out of the position."""
         n = self.venue.cancel_all()

@@ -31,6 +31,8 @@ NOT_FOUND = 50009
 """What bitbank answers for an order it has not finished accepting: an order
 cancelled the instant its POST returns can still be on its way to the book."""
 DONE = ("CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED", "REJECTED")
+TAKER_BPS = 12.0
+"""bitbank's taker fee (0.12%), paid by the market order that sells out."""
 
 
 class OrderRefused(Exception):
@@ -137,6 +139,13 @@ class BitbankPrivate:
             # never cancellable (50009/50010), its price stripped from a book
             # it was not in.
             raise OrderRefused(int(data["order_id"]), status)
+        return int(data["order_id"])
+
+    async def market_order(self, pair: str, side: str, amount: Decimal) -> int:
+        """A market order, used only to get out of a position: it takes."""
+        data = await self._call("POST", "/v1/user/spot/order", {
+            "pair": pair, "amount": f"{amount:f}", "side": side, "type": "market",
+        })
         return int(data["order_id"])
 
     async def cancel(self, pair: str, order_id: int) -> None:
