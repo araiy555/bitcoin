@@ -405,3 +405,26 @@ async def test_orders_the_run_lost_track_of_are_swept():
     api.open.add(999)  # resting on the venue, unknown to the run
     assert await sweep_strays(v, api, "ada_jpy") == [999]
     assert api.open == {kept.exchange_id}
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_refused_while_the_venue_is_busy_is_retried_quietly():
+    class Busy(DryRunApi):
+        def __init__(self):
+            super().__init__()
+            self.refusals = 3
+
+        async def cancel(self, pair, order_id):
+            if self.refusals:
+                self.refusals -= 1
+                raise BitbankError(50010, "cancel")
+            await super().cancel(pair, order_id)
+
+    v, api, health = venue(), Busy(), Health(max_errors=2)
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, api, "ada_jpy", health)
+    order.cancel_tries = 1  # skip the batch path
+    v.cancel(order.order_id)
+    while await execute_once(v, api, "ada_jpy", health):
+        pass
+    assert order.state == DONE and api.open == set() and not health.fatal

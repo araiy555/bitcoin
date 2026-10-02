@@ -32,6 +32,7 @@ from .venue import CANCELLING, DONE, NEW, OPEN, LiveVenue
 log = logging.getLogger(__name__)
 
 MAX_CANCEL_TRIES = 40
+CANNOT_CANCEL = 50010
 """Retries of a cancel the venue says it cannot find (about two seconds);
 after that the order's status decides, and the final sweep is the backstop."""
 
@@ -154,8 +155,10 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
             venue.intents.append(("cancel", order_id))
             await asyncio.sleep(0.05)
             return True
+        state = "?"
         try:
-            if await api.status(pair, order.exchange_id) in FINISHED:
+            state = await api.status(pair, order.exchange_id)
+            if state in FINISHED:
                 order.state = DONE
                 return True
         except BitbankError as missing:
@@ -165,6 +168,16 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
                 log.warning("order %s never reached the book", order.exchange_id)
                 return True
         venue.intents.append(("cancel", order_id))
+        if exc.code == CANNOT_CANCEL and order.cancel_tries < MAX_CANCEL_TRIES:
+            # bitbank refuses a cancel while it is still processing the order
+            # (a fill in progress, or an order just accepted). That is about
+            # this order, not the connection, so it is retried after a pause
+            # rather than counted toward stopping the run.
+            log.info("order %s not cancellable yet (status %s); retrying",
+                     order.exchange_id, state)
+            await asyncio.sleep(min(0.1 * order.cancel_tries, 1.0))
+            return True
+        log.warning("cancel of %s failed (status %s)", order.exchange_id, state)
         health.error(exc)
     return True
 
