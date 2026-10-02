@@ -35,3 +35,25 @@ def test_trades_parse_and_report_prints_both_sides():
     assert t.sign == -1 and not t.maker and t.fee > 0
     text = report([t], [], line((0, 37.0)), 0, 10 * NS)
     assert "本番\t検証" in text and "30分ごとの損益" in text
+
+
+def test_a_print_inside_a_wide_spread_pays_the_maker():
+    from decimal import Decimal
+
+    from jsboard.core.types import Instrument, Side
+    from jsboard.feed.base import DepthSnapshot, TradeTick
+    from jsboard.research.printedge import collect, report
+
+    inst = Instrument("ada_jpy", Decimal("0.001"), Decimal("0.0001"), "ADA", "JPY")
+    lead = Instrument("ADAUSDT", Decimal("0.0001"), Decimal("1"), "ADA", "USDT")
+    rows = []
+    for i in range(120):
+        rows.append(("bitbank", i * NS, DepthSnapshot(((36_990, 10**7),), ((37_010, 10**7),), i)))
+        if i % 10 == 0:  # sellers hit the bid; the mid never moves
+            rows.append(("bitbank", i * NS + 1, TradeTick(36_990, 10**6, Side.SELL, i)))
+    prints, mids, spreads = collect(rows, inst, lead)
+    assert len(prints) == 12 and all(p.sign == 1 for p in prints)
+    text = report(prints, mids, spreads, 10_000)
+    row = next(line for line in text.splitlines() if line.startswith("すべての約定"))
+    edge, *after = (float(x) for x in row.split("\t")[3:])
+    assert edge > 2.5 and all(a > 4 for a in after)  # half spread 2.7bps + 2bps rebate

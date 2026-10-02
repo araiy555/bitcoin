@@ -3592,6 +3592,45 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_printedge(args: argparse.Namespace) -> int:
+    """What a maker earned on every print of a recording: the ceiling for us."""
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.printedge import collect, report
+    from .sim.s3 import exists, meta_uri, read_bytes
+
+    path = args.path
+    base_args = build_parser().parse_args(["sweep", path, "--source", "bitbank"])
+    instrument = _instrument_for_recording(path, base_args)
+    meta_path = meta_uri(path)
+    sources = json.loads(read_bytes(meta_path)).get("sources", {}) if exists(meta_path) else {}
+    if args.lead_source not in sources:
+        raise ConfigError(f"--lead-source {args.lead_source} は録画にありません。")
+    lead_inst = _instrument_from_spec(sources[args.lead_source])
+    since, until = _parse_when(args.since), _parse_when(args.until)
+
+    def rows():
+        for src, rx, event in iter_tagged_timed(path):
+            if isinstance(event, _Status):
+                continue
+            if since is not None and rx < since:
+                continue
+            if until is not None and rx > until:
+                break
+            if src == args.lead_source:
+                yield "lead", rx, event
+            elif src == "bitbank":
+                yield "bitbank", rx, event
+
+    prints, mids, spreads = collect(rows(), instrument, lead_inst)
+    if not prints:
+        console.print("[red]この時間に約定がありません。[/red]")
+        return 1
+    print(f"{path}: {instrument.symbol}")
+    print(report(prints, mids, spreads, args.order_jpy))
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -6803,6 +6842,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--vary", action="append",
                       help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
     p_ls.set_defaults(func=cmd_livesim)
+
+    p_pe = sub.add_parser("printedge", help="すべての約定の反対側にいたら、いくらもうかったか（勝てる上限）")
+    p_pe.add_argument("path", help="録画（s3://… のフォルダも可）")
+    p_pe.add_argument("--lead-source", default="binance")
+    p_pe.add_argument("--since", default=None, help="UTC 2026-10-02T08:33")
+    p_pe.add_argument("--until", default=None)
+    p_pe.add_argument("--order-jpy", type=float, default=10_000.0)
+    p_pe.set_defaults(func=cmd_printedge)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")
     p_tune.add_argument("--target", required=True, help="取引所:銘柄")

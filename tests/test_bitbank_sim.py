@@ -203,3 +203,30 @@ async def test_the_replay_lines_up_beside_the_live_fills(monkeypatch, capsys):
     assert await args.func(args) == 0
     out = capsys.readouterr().out.replace("\n", "\n")
     assert "本番の約定 1 件" in out and "板の中値との差" in out and "30分ごとの損益" in out
+
+
+@pytest.mark.asyncio
+async def test_the_print_ceiling_reads_a_recording(monkeypatch, capsys):
+    import jsboard.sim.s3 as s3
+    from jsboard.cli import build_parser
+
+    objects = recording()
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    args = build_parser().parse_args(
+        ["printedge", "s3://b/raw/live/symbol=ADA_JPY/date=2026-09-26/"])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "すべての約定" in out and "60秒後bps" in out and "スプレッド 中央値" in out
