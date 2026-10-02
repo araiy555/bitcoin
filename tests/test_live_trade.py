@@ -561,3 +561,18 @@ def test_a_gap_fill_share_fills_only_part_of_the_gap_throughs():
     first, again, passed = fills(0.15)
     assert 15 <= first <= 50 and again == 0  # a pass is not re-rolled
     assert passed == 2 * (200 - first)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_post_only_order_is_dropped_without_counting_as_a_failure():
+    from jsboard.live.bitbank import OrderRefused
+
+    class Refuses(DryRunApi):
+        async def order(self, pair, side, price, amount):
+            raise OrderRefused(5, "REJECTED")
+
+    v, health = venue(), Health(max_errors=1)
+    order = v.place(bid(), 0, best_opposite=37_010)
+    await execute_once(v, Refuses(), "ada_jpy", health)
+    assert order.state == DONE and v.post_only_refused == 1 and not health.fatal
+    assert v.strip_own(DepthSnapshot(((37_000, 1_000_000),), ((37_010, 1),), 1)).bids

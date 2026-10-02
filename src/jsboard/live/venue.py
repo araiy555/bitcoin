@@ -77,6 +77,7 @@ class LiveVenue:
     happens, often after the order was cancelled or forgotten, and one that
     finds no order is a fill the maker never books."""
     rejected: int = 0
+    post_only_refused: int = 0
     requests_sent: int = 0
     """Calls that went to the venue (a batch of cancels counts once)."""
     _ids: object = field(default_factory=lambda: itertools.count(1))
@@ -153,7 +154,7 @@ class LiveVenue:
         share = self.doomed_fills / self.fills_seen * 100 if self.fills_seen else 0.0
         typical = f"{statistics.median(self.cancel_ms):.0f}ms" if self.cancel_ms else "—"
         return (f"取消し中の約定 {self.doomed_fills}/{self.fills_seen}回（{share:.0f}%）"
-                f"  取消し 中央値 {typical}")
+                f"  取消し 中央値 {typical}  指値拒否 {self.post_only_refused}回")
 
     def cancel_all(self) -> int:
         return sum(self.cancel(o.order_id) for o in list(self.orders.values()))

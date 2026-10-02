@@ -30,7 +30,16 @@ KEY_VARS = ("BITBANK_API_KEY", "BITBANK_API_SECRET")
 NOT_FOUND = 50009
 """What bitbank answers for an order it has not finished accepting: an order
 cancelled the instant its POST returns can still be on its way to the book."""
-DONE = ("CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED")
+DONE = ("CANCELED_UNFILLED", "CANCELED_PARTIALLY_FILLED", "FULLY_FILLED", "REJECTED")
+
+
+class OrderRefused(Exception):
+    """The venue answered the order but did not rest it (status REJECTED or
+    already cancelled, as a post-only order that would have taken is)."""
+
+    def __init__(self, order_id: int, status: str) -> None:
+        self.order_id, self.status = order_id, status
+        super().__init__(f"order {order_id} not rested: {status}")
 
 
 class BitbankError(RuntimeError):
@@ -122,6 +131,12 @@ class BitbankPrivate:
             "pair": pair, "amount": f"{amount:f}", "price": f"{price:f}",
             "side": side, "type": "limit", "post_only": True,
         })
+        status = str(data.get("status", ""))
+        if status == "REJECTED" or status.startswith("CANCELED"):
+            # Treated as resting, this order was a phantom: never on the book,
+            # never cancellable (50009/50010), its price stripped from a book
+            # it was not in.
+            raise OrderRefused(int(data["order_id"]), status)
         return int(data["order_id"])
 
     async def cancel(self, pair: str, order_id: int) -> None:

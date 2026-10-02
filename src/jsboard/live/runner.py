@@ -26,7 +26,7 @@ from decimal import Decimal
 from ..core.types import Fill, Side
 from ..sim.paper import PAPER_OWNER
 from .bitbank import DONE as FINISHED
-from .bitbank import NOT_FOUND, BitbankError
+from .bitbank import NOT_FOUND, BitbankError, OrderRefused
 from .venue import CANCELLING, DONE, NEW, OPEN, LiveVenue
 
 log = logging.getLogger(__name__)
@@ -129,6 +129,14 @@ async def execute_once(venue: LiveVenue, api, pair: str, health: Health) -> bool
                 pair, "buy" if order.side is Side.BUY else "sell",
                 venue.price_of(order.price), venue.amount_of(order.remaining),
             )
+        except OrderRefused as refused:
+            # A post-only order the venue would not rest: about the price,
+            # not the connection, so it does not count toward stopping.
+            order.state = DONE
+            venue.rejected += 1
+            venue.post_only_refused += 1
+            log.info("%s", refused)
+            return True
         except BitbankError as exc:
             order.state = DONE
             venue.rejected += 1

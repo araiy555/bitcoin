@@ -205,3 +205,12 @@ async def test_calls_reach_the_venue_one_at_a_time_in_nonce_order():
     await asyncio.gather(api.assets(), api.trade_history("ada_jpy", 0),
                          api.active_orders("ada_jpy"), api.assets())
     assert arrived == sorted(arrived) and len(set(arrived)) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_post_only_order_the_venue_refused_is_not_treated_as_resting():
+    from jsboard.live.bitbank import OrderRefused
+
+    api = Recorder([{"success": 1, "data": {"order_id": 77, "status": "REJECTED"}}])
+    with pytest.raises(OrderRefused):
+        await api.order("ada_jpy", "buy", Decimal("37"), Decimal("1"))
