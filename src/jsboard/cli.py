@@ -1221,6 +1221,8 @@ async def _run_combos(
             source=args.source,
             lead_source=getattr(args, "lead_source", None),
             on_lead=attach_lead(mm, path, run_args),
+            since_ns=_parse_when(getattr(args, "since", None)),
+            until_ns=_parse_when(getattr(args, "until", None)),
         )
         await run(feed, mm, duration_s=None, max_events=args.max_events)
         row = _sweep_row(mm, mm.summary())
@@ -6294,6 +6296,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="表ではなくタブ区切りで出す（折り返さないので貼り付けやすい）",
     )
+    p_sw.add_argument("--since", default=None, help="この時刻以降だけ再生 (UTC, 2026-10-02T07:18)")
+    p_sw.add_argument("--until", default=None, help="この時刻まで再生 (UTC)")
     p_sw.set_defaults(func=cmd_sweep, headless=True)
 
     p_hg = sub.add_parser("hedge", help="メイク＋即時ヘッジの最終損益テスト")
