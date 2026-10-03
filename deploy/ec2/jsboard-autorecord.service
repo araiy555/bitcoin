@@ -7,7 +7,7 @@ Wants=network-online.target
 User=jsboard
 EnvironmentFile=/etc/jsboard.env
 StateDirectory=jsboard
-ExecStart=/opt/jsboard/venv/bin/jsboard autorecord --always ${JSBOARD_TARGETS} --top 2 --s3-bucket ${JSBOARD_BUCKET} --workdir /var/lib/jsboard/autorecord --slack
+ExecStart=/opt/jsboard/venv/bin/jsboard autorecord --always ${JSBOARD_TARGETS} --top 2 --s3-bucket ${JSBOARD_BUCKET} --workdir /var/lib/jsboard/autorecord --min-free-gb 1 --slack
 Restart=always
 RestartSec=30
 
