@@ -323,3 +323,37 @@ async def test_a_book_recorded_without_a_lead_still_replays(monkeypatch, capsys)
     assert await args.func(args) == 0
     out = capsys.readouterr().out
     assert "先物を見ない形で再生" in out.replace("\n", "") and "損益の中身" in out
+
+
+@pytest.mark.asyncio
+async def test_a_book_gets_one_word_on_slack(monkeypatch, capsys):
+    import jsboard.cli as cli
+    import jsboard.sim.s3 as s3
+
+    objects = recording()
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    posted = []
+
+    async def post(text):
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    monkeypatch.setattr(cli, "_post_slack", post)
+    args = cli.build_parser().parse_args(
+        ["verdict", "s3://b/raw/live/symbol=ADA_JPY/", "--slack"])
+    code = await args.func(args)
+    assert len(posted) == 1 and ("仮合格" in posted[0]) == (code == 0)
+    assert "上限" in posted[0] and "厳しめの検証" in posted[0]

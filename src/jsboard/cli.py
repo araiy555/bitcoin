@@ -3672,6 +3672,8 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
                 print(listing(live_fills, sim_fills, mids, lo, hi, end_ns))
             print()
         rows_out.append((shown, result))
+        if getattr(args, "results", None) is not None:
+            args.results.append(result)
 
     header = ["設定", "約定", "損益円", "取消中約定%", "指値拒否", "残高不足", "見つからない",
               "取消不可", "遅着", "本番の約定に一致", "停止"]
@@ -3810,24 +3812,37 @@ async def cmd_tradeedge(args: argparse.Namespace) -> int:
 
 async def cmd_printedge(args: argparse.Namespace) -> int:
     """What a maker earned on every print of a recording: the ceiling for us."""
-    from .feed.base import FeedStatus as _Status
-    from .feed.replay import iter_tagged_timed
-    from .research.printedge import collect, report
-    from .sim.s3 import exists, meta_uri, read_bytes
+    from .research.printedge import report
 
     if args.all:
         return await _printedge_all(args)
     path = args.path
+    instrument, prints, mids, spreads = _printedge_collect(
+        path, args.lead_source, _parse_when(args.since), _parse_when(args.until))
+    if not prints:
+        console.print("[red]この時間に約定がありません。[/red]")
+        return 1
+    print(f"{path}: {instrument.symbol}")
+    print(report(prints, mids, spreads, args.order_jpy))
+    return 0
+
+
+def _printedge_collect(path: str, lead_source: str, since: int | None, until: int | None):
+    """(instrument, prints, mids, spreads) for one recording."""
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.printedge import collect
+    from .sim.s3 import exists, meta_uri, read_bytes
+
     base_args = build_parser().parse_args(["sweep", path, "--source", "bitbank"])
     instrument = _instrument_for_recording(path, base_args)
     meta_path = meta_uri(path)
     sources = json.loads(read_bytes(meta_path)).get("sources", {}) if exists(meta_path) else {}
-    if args.lead_source in sources:
-        lead_inst = _instrument_from_spec(sources[args.lead_source])
+    if lead_source in sources:
+        lead_inst = _instrument_from_spec(sources[lead_source])
     else:
-        console.print(f"[yellow]録画に {args.lead_source} がないので、先物の区分は出せません。[/yellow]")
+        console.print(f"[yellow]録画に {lead_source} がないので、先物の区分は出せません。[/yellow]")
         lead_inst = instrument
-    since, until = _parse_when(args.since), _parse_when(args.until)
 
     def rows():
         for src, rx, event in iter_tagged_timed(path):
@@ -3837,18 +3852,58 @@ async def cmd_printedge(args: argparse.Namespace) -> int:
                 continue
             if until is not None and rx > until:
                 break
-            if src == args.lead_source:
+            if src == lead_source:
                 yield "lead", rx, event
             elif src == "bitbank":
                 yield "bitbank", rx, event
 
-    prints, mids, spreads = collect(rows(), instrument, lead_inst)
+    return (instrument, *collect(rows(), instrument, lead_inst))
+
+
+async def cmd_verdict(args: argparse.Namespace) -> int:
+    """Pass or fail for one recorded book: the ceiling, then the strict replay.
+
+    Runs both checks with fixed settings and says only what the rules say,
+    so the person waiting is told one word, not handed two tables to read.
+    """
+    import contextlib as _ctx
+    import io as _io
+
+    from .research.printedge import group
+
+    instrument, prints, mids, spreads = _printedge_collect(args.path, "binance", None, None)
+    label = f"bitbank {instrument.symbol}"
+    hours = (mids.ts[-1] - mids.ts[0]) / 3.6e12 if mids.ts else 0.0
     if not prints:
-        console.print("[red]この時間に約定がありません。[/red]")
+        text = f":x: {label}: 録画に約定がありません（{hours:.1f}時間分）。判定できません。"
+        console.print(text)
+        if args.slack:
+            await _post_slack(text)
         return 1
-    print(f"{path}: {instrument.symbol}")
-    print(report(prints, mids, spreads, args.order_jpy))
-    return 0
+    ceiling = group(prints, mids)["全部"][0].bps(60)
+
+    ls = build_parser().parse_args([
+        "livesim", args.path, "--order-jpy", str(args.order_jpy),
+        "--cancel-ahead", "0", "--cancel-ms", str(args.cancel_ms),
+    ])
+    ls.results = []
+    with _ctx.redirect_stdout(_io.StringIO()):
+        await cmd_livesim(ls)
+    replay = ls.results[0]
+
+    passed = ceiling > 0 and replay.pnl > 0
+    head = ":white_check_mark: 仮合格" if passed else ":x: 不合格"
+    text = (
+        f"{head}  {label}（録画 {hours:.1f}時間分）\n"
+        f"  上限（約定の反対側・60秒後）: {ceiling:+.1f}bps  約定 {len(prints):,}件\n"
+        f"  厳しめの検証（取消し{args.cancel_ms:g}ms・1回{args.order_jpy:,.0f}円）: "
+        f"損益 {replay.pnl:+,.0f}円  約定 {replay.fills}回"
+        + ("" if passed else "\n  どちらかがマイナスなので不合格です。")
+    )
+    console.print(text)
+    if args.slack:
+        await _post_slack(text)
+    return 0 if passed else 2
 
 
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
@@ -7073,6 +7128,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--vary", action="append",
                       help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
     p_ls.set_defaults(func=cmd_livesim)
+
+    p_vd = sub.add_parser("verdict", help="録画した1銘柄を、上限と厳しめの検証で合格・不合格にする")
+    p_vd.add_argument("path", help="録画（例: s3://jsboard-capture/raw/live/symbol=OAS_JPY/）")
+    p_vd.add_argument("--order-jpy", type=float, default=2_000.0)
+    p_vd.add_argument("--cancel-ms", type=float, default=1_000.0)
+    p_vd.add_argument("--slack", action="store_true", help="結果を Slack に送る")
+    p_vd.set_defaults(func=cmd_verdict)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
     p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")
