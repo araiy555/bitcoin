@@ -3718,7 +3718,9 @@ async def cmd_tradeedge(args: argparse.Namespace) -> int:
                     payload = await _get_json(session, url)
                     tapes.append(parse((payload.get("data") or {}).get("transactions") or []))
                 except Exception as exc:  # noqa: BLE001 - one missing day must not stop the table
-                    console.print(f"[yellow]{pair} {day}: 読めませんでした ({exc})[/yellow]")
+                    # The latest day or two are not published yet: expected, not news.
+                    if "404" not in str(exc):
+                        console.print(f"[yellow]{pair} {day}: 読めませんでした ({exc})[/yellow]")
                     tapes.append([])
                 await _asyncio.sleep(args.pause)
             edge = PairEdge(pair, books[pair].rebate_bps)
