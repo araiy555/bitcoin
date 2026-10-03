@@ -263,3 +263,27 @@ def listing(live: list[FillRow], sim: list[FillRow], mids: MidLine,
             f"\t{after}\t{held[who]:+,.0f}"
         )
     return "\n".join(lines)
+
+
+def single(fills: list[FillRow], mids: MidLine, start_ns: int, end_ns: int) -> str:
+    """One run taken apart, for a day with no live run to set beside it."""
+    b = breakdown(fills, mids, end_ns)
+    h = holding(fills, start_ns, end_ns)
+    first = mids.at(start_ns)
+    last = mids.at(end_ns)
+    move = f"{(last - first) / first * 100:+.2f}%" if first and last else "-"
+    lines = [
+        f"この日の値動き(始め→終わり)\t{move}",
+        f"約定\t{b.fills}（買い {b.buys}）",
+        f"約定額(円)\t{b.volume:,.0f}",
+        f"約定値段→60秒後の中値(円)\t{b.from_price_60s:+,.0f}",
+        f"60秒より長く持った分(円)\t{b.pnl - b.from_price_60s + b.fees:+,.0f}",
+        f"手数料(円,マイナスはリベート)\t{b.fees:+,.0f}",
+        f"損益(円)\t{b.pnl:+,.0f}",
+        f"平均の在庫(枚)\t{h[0]:,.0f}",
+        f"一番多い在庫(枚)\t{h[1]:,.0f}",
+        f"在庫を持っていた時間(%)\t{h[2] * 100:.0f}",
+        f"続けて持っていた最長(分)\t{h[3]:.0f}",
+        f"終わりの在庫(枚)\t{coin_at(fills, end_ns):+,.0f}",
+    ]
+    return "\n".join(lines)

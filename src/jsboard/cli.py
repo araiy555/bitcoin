@@ -3584,6 +3584,13 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
                                    per_s=args.per_s, breaker_pct=args.breaker_pct, mids=mids)
         shown = "  ".join(f"{k}={v:g}" for k, v in settings.items())
         console.print(f"  {shown or '設定どおり'}  約定 {result.fills}  損益 {result.pnl:+,.0f}円")
+        if args.breakdown and live_fills is None and mids.ts:
+            from .research.fillcheck import single
+
+            print(f"\n=== 損益の中身（{shown or '設定どおり'}） ===")
+            print(single([from_trade(t) for t in sim.all_trades], mids,
+                         since or mids.ts[0], min(until or mids.ts[-1], mids.ts[-1])))
+            print(flush=True)
         if live_fills is not None and mids.ts:
             print(f"\n=== 本番と検証の比較（{shown or '設定どおり'}） ===")
             sim_fills = [from_trade(t) for t in sim.all_trades]
@@ -6932,6 +6939,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--compare-live", action="store_true",
                       help="同じ時間の本番の約定を bitbank から読んで並べる（読むだけ・sudo で）")
     p_ls.add_argument("--env-file", default="/etc/jsboard.env")
+    p_ls.add_argument("--breakdown", action="store_true",
+                      help="本番がない日でも、損益の中身（すぐの損・長く持った損・在庫）を出す")
     p_ls.add_argument("--list-fills", default=None,
                       help="この時間の約定を本番・検証とも1件ずつ並べる（UTC 13:33-14:33）")
     p_ls.add_argument("--no-own-prints", action="store_true",

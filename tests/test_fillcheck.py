@@ -78,3 +78,12 @@ def test_the_listing_interleaves_both_runs_with_their_inventory():
     rows = text.splitlines()[2:]
     assert [r.split("\t")[1] for r in rows] == ["本番", "検証", "本番"]
     assert rows[-1].endswith("+0") and rows[1].endswith("+50")
+
+
+def test_a_single_run_splits_into_quick_and_held_parts():
+    from jsboard.research.fillcheck import single
+
+    mids = line((0, 40.0), (100, 39.0), (300, 39.0))
+    text = single([FillRow(10 * NS, 1, 40.0, 100)], mids, 0, 300 * NS)
+    assert "この日の値動き(始め→終わり)\t-2.50%" in text
+    assert "終わりの在庫(枚)\t+100" in text and "損益(円)\t-99" in text and "60秒より長く持った分(円)\t-100" in text
