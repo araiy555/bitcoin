@@ -3634,6 +3634,12 @@ async def _printedge_all(args: argparse.Namespace) -> int:
     if not dates:
         console.print(f"[red]{root} に録画がありません。[/red]")
         return 1
+    if args.only:
+        wanted = {x.strip().upper() for x in args.only.split(",") if x.strip()}
+        dates = {k: v for k, v in dates.items() if k.upper() in wanted}
+        if not dates:
+            console.print(f"[red]--only {args.only} に当たる銘柄がありません。[/red]")
+            return 1
     console.print(f"{len(dates)} 銘柄: {', '.join(sorted(dates))}")
     print(SUMMARY_HEADER, flush=True)
     done = []
@@ -6943,6 +6949,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--all", action="store_true",
                       help="path の下の全銘柄を調べて1行ずつ並べる（例: s3://jsboard-capture/raw/live/）")
     p_pe.add_argument("--days", type=int, default=7, help="--all のとき、各銘柄の新しい方から何日分")
+    p_pe.add_argument("--only", default=None, help="--all のとき、この銘柄だけ（例: ETH,SUI_JPY,XRP）")
     p_pe.set_defaults(func=cmd_printedge)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")

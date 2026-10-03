@@ -281,3 +281,7 @@ async def test_every_recorded_book_gets_one_line(monkeypatch, capsys):
     lines = [x for x in out.splitlines() if x.startswith("bitbank:ada_jpy")]
     assert len(lines) == 4  # two books, each in the table and in the ranking
     assert "60秒がプラスの日" in out and lines[0].split("\t")[1] == "1"
+
+    args = build_parser().parse_args(["printedge", "--all", "s3://b/raw/live/", "--only", "xrp_jpy"])
+    assert await args.func(args) == 0
+    assert "1 銘柄: XRP_JPY" in capsys.readouterr().out
