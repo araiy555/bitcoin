@@ -21,14 +21,14 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from ..core.types import Fill, Side
 from ..sim.paper import PAPER_OWNER
 from . import clock
 from .bitbank import DONE as FINISHED
 from .bitbank import NOT_FOUND, BitbankError, OrderRefused
-from .venue import CANCELLING, DONE, NEW, OPEN, LiveVenue
+from .venue import CANCELLING, DONE, NEW, OPEN, LiveOrder, LiveVenue
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,10 @@ MAX_CANCEL_TRIES = 40
 CANNOT_CANCEL = 50010
 INSUFFICIENT = 60001
 LOST_GIVE_UP_S = 60.0
+BREAKER = "急変ブレーカー作動中"
+FLATTEN_MIN_JPY = Decimal(100)
+"""Coin worth less than this is left unsold: bitbank's smallest order is
+about this size, and the exposure is a rounding error."""
 """How long to keep cancelling an order the venue says it cannot find."""
 """Retries of a cancel the venue says it cannot find (about two seconds);
 after that the order's status decides, and the final sweep is the backstop."""
@@ -485,7 +489,7 @@ async def run_watchdog(
                 notify(f"先行市場が{breaker.window_s:.0f}秒で{breaker.move_pct:g}%以上動いたので、"
                        f"{breaker.cooldown_s / 60:.0f}分止めます")
             if breaker.active(now):
-                reason = "急変ブレーカー作動中"
+                reason = BREAKER
         if reason and venue.blocked != reason:
             venue.blocked = reason
             venue.cancel_all()
@@ -518,3 +522,71 @@ async def cancel_everything(api, pair: str, venue: LiveVenue, timeout_s: float =
         if order.state != DONE:
             order.state = DONE
     return stuck
+
+
+async def sell_out(api, pair: str, venue: LiveVenue, *, keep: Decimal, mid_ticks: float | None,
+                   track: bool = True, tries: int = 4, settle_s: float = 1.0,
+                   sleep=asyncio.sleep) -> list[LiveOrder]:
+    """Sell at market the coin the account holds beyond `keep`.
+
+    A spot maker holds coin between a buy and the sell that matches it.
+    Whatever is left when quoting stops is a bet on the price that nothing
+    manages: after the halt on 2026-10-02 about 248 ADA sat in the account
+    and lost about 250 yen no log showed. Taking costs 0.12%; holding cost
+    more.
+
+    Every resting order must be cancelled first. Coin a cancel has just
+    released can read as locked for a moment, and a market order that meets
+    a thin bid side can fill in part, so the account is read again after
+    each sale until what is left is too small to matter. With `track` each
+    sale is kept by the venue so its fills are booked like any other.
+    """
+    inst = venue.instrument
+    price = inst.tick_size * Decimal(str(mid_ticks)) if mid_ticks else None
+    sold: list[LiveOrder] = []
+    for _ in range(tries):
+        free = (await api.assets()).get(inst.base.lower(), Decimal(0))
+        amount = (free - keep).quantize(inst.lot_size, rounding=ROUND_DOWN)
+        if amount <= 0 or (price is not None and amount * price < FLATTEN_MIN_JPY):
+            break
+        try:
+            exchange_id = await api.market_order(pair, "sell", amount)
+        except BitbankError as exc:
+            if exc.code != INSUFFICIENT:
+                raise
+            # Not released yet, or the last sale still being processed.
+            await sleep(settle_s)
+            continue
+        log.warning("sold %s %s at market (order %s)", amount, inst.base, exchange_id)
+        lots = inst.to_lots(amount)
+        ticks = int(mid_ticks or 0)
+        order = (venue.track_sale(exchange_id, Side.SELL, lots, ticks) if track
+                 else LiveOrder(0, Side.SELL, ticks, lots, lots, state=OPEN, exchange_id=exchange_id))
+        sold.append(order)
+        await sleep(settle_s)
+    return sold
+
+
+async def book_sale(api, pair: str, venue: LiveVenue, sold: list[LiveOrder], since_ms: int,
+                    timeout_s: float = 5.0, sleep=asyncio.sleep) -> None:
+    """Read a closing sale's executions into the venue once the poller has
+    stopped, so the run's last result includes what getting out cost."""
+    ids = {o.exchange_id for o in sold}
+    deadline = clock.monotonic() + timeout_s
+    while ids and clock.monotonic() < deadline:
+        try:
+            states = [await api.status(pair, i) for i in ids]
+        except BitbankError as exc:
+            if exc.code != NOT_FOUND:
+                raise
+            states = []
+        if states and all(s in FINISHED for s in states):
+            break
+        await sleep(0.2)
+    if not ids:
+        return
+    for trade in await api.trade_history(pair, since_ms):
+        if int(trade["order_id"]) in ids:
+            mapped = fill_from_trade(venue, trade)
+            if mapped is not None:
+                venue.record_fill(*mapped)

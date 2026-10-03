@@ -3111,17 +3111,20 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     """
     import asyncio as _asyncio
 
-    from .live.bitbank import BitbankPrivate, load_keys
+    from .live.bitbank import TAKER_BPS, BitbankPrivate, load_keys
     from .live.runner import (
+        BREAKER,
         Breaker,
         DryRunApi,
         Health,
         RequestBudget,
+        book_sale,
         cancel_everything,
         run_balance_check,
         run_executor,
         run_fill_poller,
         run_watchdog,
+        sell_out,
     )
     from .live.venue import LiveVenue
     from .research.daily import FIXED_FLAGS, Target, halt_key, live_halt_key, size_for
@@ -3154,15 +3157,22 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         return 0
 
     instrument, feed = await _live_book(target)
-    lead_inst = await fetch_futures_instrument(
-        (args.lead_symbol or f"{instrument.base}USDT").upper()
-    )
+    try:
+        lead_inst = await fetch_futures_instrument(
+            (args.lead_symbol or f"{instrument.base}USDT").upper()
+        )
+    except Exception as exc:  # noqa: BLE001 - some books have no Binance perp
+        # Without a lead the gate cannot pull quotes ahead of a move; the
+        # breaker then watches the book's own price instead.
+        console.print(f"[yellow]Binance の先物がないので、先物を見ずに動かします ({exc})[/yellow]")
+        lead_inst = None
     stream = feed.stream()
-    buffered, price = [], None
+    buffered, price, mid_ticks0 = [], None, None
     async for event in stream:
         buffered.append(event)
         if isinstance(event, DepthSnapshot) and event.bids and event.asks:
-            price = (event.bids[0][0] + event.asks[0][0]) / 2 * float(instrument.tick_size)
+            mid_ticks0 = (event.bids[0][0] + event.asks[0][0]) / 2
+            price = mid_ticks0 * float(instrument.tick_size)
             break
     if price is None:
         console.print("[red]板を受け取れませんでした。[/red]")
@@ -3188,7 +3198,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     size = size_for(args.order_jpy, price, instrument.lot_size)
     run_args = build_parser().parse_args([
         "sweep", "-", "--source", target.venue, *FIXED_FLAGS,
-        f"--maker-bps={await _maker_bps_for(target)}",
+        f"--maker-bps={await _maker_bps_for(target)}", f"--taker-bps={TAKER_BPS}",
         "--size", size, "--max-position", str(Decimal(size) * args.max_orders),
         "--max-drawdown", str(args.max_loss_jpy),
         "--price-tolerance-ticks", str(args.price_tolerance_ticks),
@@ -3196,23 +3206,60 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     mm = build_maker(instrument, run_args)
     venue = LiveVenue(instrument, quote_balance=quote_bal, base_balance=base_bal)
     mm.venue = venue
-    lead_view = MarketView(instrument=lead_inst, depth=20)
+    lead_view = MarketView(instrument=lead_inst or instrument, depth=20)
     lead_view.clock = mm.market.clock
-    mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
+    if lead_inst is not None:
+        mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
 
     health, budget = Health(), RequestBudget(args.max_requests_per_s)
     breaker = Breaker(move_pct=args.breaker_pct)
     last_event = [time.monotonic()]
     notes: list[str] = []
 
+    base = instrument.base
+
     if args.live:
         stale = await cancel_everything(api, target.symbol, venue)
         venue.blocked = ""
         if stale:
             await say(f":warning: 始める前の注文を取り消せませんでした: {stale}")
+            await session.close()
             return 1
+        # Coin left by an earlier run is nobody's inventory: the maker would
+        # count it as a starting balance and never get out of it.
+        try:
+            leftover = await sell_out(api, target.symbol, venue, keep=Decimal(0),
+                                      mid_ticks=mid_ticks0, track=False)
+        except Exception as exc:  # noqa: BLE001 - starting on top of it is worse
+            await say(f":rotating_light: {label}: 前回の残りの {base} を売れませんでした ({exc})。"
+                      f"始めません。bitbank の画面で売ってから、もう一度起動してください。")
+            await session.close()
+            return 1
+        if leftover:
+            amount = sum(venue.amount_of(o.qty) for o in leftover)
+            await say(f":broom: {label}: 前回の残りの {base} {amount} を成行で売ってから始めます")
+            held = await api.onhand()
+            quote_bal = held.get(instrument.quote.lower(), Decimal(0))
+            base_bal = held.get(instrument.base.lower(), Decimal(0))
+            venue.quote_balance, venue.base_balance = quote_bal, base_bal
+
+    async def flatten(why: str) -> list:
+        """Sell what this run bought and still holds; say what happened."""
+        try:
+            sold = await sell_out(api, target.symbol, venue, keep=base_bal,
+                                  mid_ticks=mm.market.mid)
+        except Exception as exc:  # noqa: BLE001 - say so, the person must act
+            await say(f":rotating_light: {label}: {why}ときに {base} を売れませんでした ({exc})。"
+                      f"bitbank の画面で売ってください。")
+            return []
+        if sold:
+            amount = sum(venue.amount_of(o.qty) for o in sold)
+            await say(f":broom: {label}: {why}ので、持っていた {base} {amount} を成行で売りました")
+        return sold
 
     async def pump_lead() -> None:
+        if lead_inst is None:
+            return
         async for event in _binance_lead(lead_inst, 100).stream():
             lead_view.apply(event)
 
@@ -3231,7 +3278,8 @@ async def cmd_trade(args: argparse.Namespace) -> int:
             pair=target.symbol,
         )),
         _asyncio.create_task(run_watchdog(
-            venue, health, lambda: last_event[0], lambda: lead_view.mid, breaker,
+            venue, health, lambda: last_event[0],
+            (lambda: lead_view.mid) if lead_inst is not None else (lambda: mm.market.mid), breaker,
             notes.append, stale_s=args.stale_s,
         )),
     ]
@@ -3243,6 +3291,7 @@ async def cmd_trade(args: argparse.Namespace) -> int:
 
     reason, code = "板のデータが終わりました", 1
     last_log, last_flag_check, last_sent = time.monotonic(), time.monotonic(), 0
+    sold_in_pause = False
     # systemd stops a service with SIGTERM, which by default kills Python
     # on the spot and would leave every order resting. Turn it into a
     # cancellation so the cleanup below runs.
@@ -3261,6 +3310,14 @@ async def cmd_trade(args: argparse.Namespace) -> int:
             venue.forget_done()
             while notes:
                 await say(f":zap: {label}: {notes.pop(0)}")
+            if args.live:
+                # A lurch big enough to stop quoting is no time to hold coin
+                # either: once every order is gone, sell what was bought.
+                if venue.blocked != BREAKER:
+                    sold_in_pause = False
+                elif not sold_in_pause and venue.idle():
+                    sold_in_pause = True
+                    await flatten("急変ブレーカーが作動した")
             if health.fatal:
                 reason = health.fatal
                 break
@@ -3295,6 +3352,13 @@ async def cmd_trade(args: argparse.Namespace) -> int:
         for task in tasks:
             task.cancel()
         stuck = await cancel_everything(api, target.symbol, venue)
+        if args.live:
+            since_ms = int(time.time() * 1000) - 2000
+            sold = await flatten("止める")
+            if sold:
+                with contextlib.suppress(Exception):
+                    await book_sale(api, target.symbol, venue, sold, since_ms)
+                mm.book_venue_fills()
         if session is not None:
             await session.close()
     s = mm.summary()

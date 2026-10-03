@@ -588,3 +588,152 @@ async def test_a_balance_refusal_drops_the_order_without_stopping_the_run():
     order = v.place(bid(), 0, best_opposite=37_010)
     await execute_once(v, Short(), "ada_jpy", health)
     assert order.state == DONE and v.insufficient == 1 and not health.fatal
+
+
+class Account:
+    """A bitbank account for the trade command: rests orders, fills the
+    first buy at once, and sells at market from what it holds."""
+
+    def __init__(self, ada="300", jpy="20000"):
+        self.ada, self.jpy = Decimal(ada), Decimal(jpy)
+        self.open: dict[int, tuple] = {}
+        self.trades: list[dict] = []
+        self.market_sales: list[Decimal] = []
+        self._ids = iter(range(1, 10**9))
+        self.filled_a_buy = False
+
+    def _locked(self, side):
+        return sum((a if side == "sell" else p * a) for s, p, a in self.open.values() if s == side)
+
+    async def onhand(self):
+        return {"ada": self.ada, "jpy": self.jpy}
+
+    async def assets(self):
+        return {"ada": self.ada - self._locked("sell"), "jpy": self.jpy - self._locked("buy")}
+
+    async def order(self, pair, side, price, amount):
+        oid = next(self._ids)
+        if side == "buy" and not self.filled_a_buy:
+            self.filled_a_buy = True
+            self.ada += amount
+            self.jpy -= price * amount
+            self.trades.append({"trade_id": oid, "order_id": oid, "side": "buy", "price": str(price),
+                                "amount": str(amount), "maker_taker": "maker",
+                                "executed_at": int(time.time() * 1000)})
+            self.open[oid] = ("buy", price, Decimal(0))
+            return oid
+        self.open[oid] = (side, price, amount)
+        return oid
+
+    async def market_order(self, pair, side, amount):
+        assert side == "sell" and amount <= self.ada - self._locked("sell")
+        oid = next(self._ids)
+        self.ada -= amount
+        self.jpy += Decimal("37.1") * amount
+        self.market_sales.append(amount)
+        self.trades.append({"trade_id": oid, "order_id": oid, "side": "sell", "price": "37.1",
+                            "amount": str(amount), "maker_taker": "taker",
+                            "executed_at": int(time.time() * 1000)})
+        return oid
+
+    async def cancel(self, pair, order_id):
+        if order_id not in self.open:
+            raise BitbankError(NOT_FOUND, "cancel")
+        del self.open[order_id]
+
+    async def cancel_many(self, pair, order_ids):
+        done = {i for i in order_ids if i in self.open}
+        for i in done:
+            del self.open[i]
+        return done
+
+    async def status(self, pair, order_id):
+        return "UNFILLED" if order_id in self.open else "FULLY_FILLED"
+
+    async def active_orders(self, pair):
+        return list(self.open)
+
+    async def trade_history(self, pair, since_ms):
+        return [t for t in self.trades if t["executed_at"] >= since_ms]
+
+
+@pytest.mark.asyncio
+async def test_a_live_run_sells_leftovers_first_and_what_it_holds_last(monkeypatch):
+    import jsboard.live.bitbank as bb
+
+    posted = []
+    cli = wire(monkeypatch, posted)
+    account = Account()
+
+    class Session:
+        async def close(self):
+            return None
+
+    async def maker_bps(target):
+        return -2.0
+
+    class Endless(Feed):
+        async def stream(self):
+            yield FeedStatus("live", "fake")
+            while True:
+                yield DepthSnapshot(tuple((37_150 - j, 9_000_000) for j in range(5)),
+                                    tuple((37_250 + j, 9_000_000) for j in range(5)), 1)
+                await asyncio.sleep(0.01)
+
+    async def live_book(target):
+        return INST, Endless(INST)
+
+    monkeypatch.setattr(bb, "load_keys", lambda path: ("k", "s"))
+    monkeypatch.setattr(bb, "BitbankPrivate", lambda *keys, session=None: account)
+    monkeypatch.setattr(cli, "make_session", Session)
+    monkeypatch.setattr(cli, "_maker_bps_for", maker_bps)
+    monkeypatch.setattr(cli, "_live_book", live_book)
+
+    async def no_perp(symbol):
+        raise LookupError(f"{symbol}: no such perp")  # a book with no lead, as oas_jpy
+
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_perp)
+    args = cli.build_parser().parse_args(["trade", "--slack", "--live", "--order-jpy", "2000"])
+    run = asyncio.create_task(args.func(args))
+    for _ in range(300):
+        if account.filled_a_buy:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(1.2)  # the poller books the buy
+    run.cancel()
+    assert await run == 0
+    text = "\n".join(posted)
+    assert "前回の残りの ADA 300.0000" in text  # sold before quoting
+    assert account.market_sales[0] == Decimal("300")
+    assert "止めるので、持っていた ADA" in text  # sold on the way out
+    assert len(account.market_sales) >= 2
+    assert account.ada * Decimal("37.2") < 100  # nothing worth holding is left
+
+
+@pytest.mark.asyncio
+async def test_selling_out_waits_for_released_coin_and_leaves_dust():
+    from jsboard.live.runner import INSUFFICIENT, sell_out
+
+    class Api:
+        def __init__(self):
+            self.free = [Decimal("50"), Decimal("50"), Decimal("1")]
+            self.calls = 0
+
+        async def assets(self):
+            return {"ada": self.free[0]}
+
+        async def market_order(self, pair, side, amount):
+            self.calls += 1
+            if self.calls == 1:
+                raise BitbankError(INSUFFICIENT, "order")  # coin not released yet
+            self.free.pop(0)
+            self.free[0] = Decimal("1")  # what is left is worth about 37 yen
+            return 99
+
+    async def no_wait(_):
+        return None
+
+    v = venue(ada="0")
+    sold = await sell_out(Api(), "ada_jpy", v, keep=Decimal(0), mid_ticks=37_200, sleep=no_wait)
+    assert [o.qty for o in sold] == [INST.to_lots("50")]
+    assert v.by_exchange_id(99) is sold[0]  # its fill will be booked
