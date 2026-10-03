@@ -353,7 +353,13 @@ async def test_a_book_gets_one_word_on_slack(monkeypatch, capsys):
     monkeypatch.setattr(s3, "default_client", Bucket)
     monkeypatch.setattr(cli, "_post_slack", post)
     args = cli.build_parser().parse_args(
-        ["verdict", "s3://b/raw/live/symbol=ADA_JPY/", "--slack"])
+        ["verdict", "s3://b/raw/live/symbol=ADA_JPY/", "--slack", "--min-fills", "1"])
     code = await args.func(args)
     assert len(posted) == 1 and ("仮合格" in posted[0]) == (code == 0)
     assert "上限" in posted[0] and "厳しめの検証" in posted[0]
+
+    # Too little to judge is said as such, not reported as a fail.
+    args = cli.build_parser().parse_args(
+        ["verdict", "s3://b/raw/live/symbol=ADA_JPY/", "--slack", "--min-prints", "100000"])
+    assert await args.func(args) == 3
+    assert "判定保留" in posted[-1] and "不合格" not in posted[-1]

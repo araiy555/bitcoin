@@ -3873,7 +3873,10 @@ async def cmd_verdict(args: argparse.Namespace) -> int:
 
     instrument, prints, mids, spreads = _printedge_collect(args.path, "binance", None, None)
     label = f"bitbank {instrument.symbol}"
-    hours = (mids.ts[-1] - mids.ts[0]) / 3.6e12 if mids.ts else 0.0
+    # A thin book's mid can sit still for hours; the prints mark time too.
+    stamps = [t for t in (*mids.ts[:1], *mids.ts[-1:], *(p.ts_ns for p in prints[:1]),
+                          *(p.ts_ns for p in prints[-1:]))]
+    hours = (max(stamps) - min(stamps)) / 3.6e12 if stamps else 0.0
     if not prints:
         text = f":x: {label}: 録画に約定がありません（{hours:.1f}時間分）。判定できません。"
         console.print(text)
@@ -3891,19 +3894,25 @@ async def cmd_verdict(args: argparse.Namespace) -> int:
         await cmd_livesim(ls)
     replay = ls.results[0]
 
-    passed = ceiling > 0 and replay.pnl > 0
-    head = ":white_check_mark: 仮合格" if passed else ":x: 不合格"
+    enough = len(prints) >= args.min_prints and replay.fills >= args.min_fills
+    passed = enough and ceiling > 0 and replay.pnl > 0
+    if not enough:
+        head = ":hourglass: 判定保留（データ不足）"
+    else:
+        head = ":white_check_mark: 仮合格" if passed else ":x: 不合格"
     text = (
         f"{head}  {label}（録画 {hours:.1f}時間分）\n"
         f"  上限（約定の反対側・60秒後）: {ceiling:+.1f}bps  約定 {len(prints):,}件\n"
         f"  厳しめの検証（取消し{args.cancel_ms:g}ms・1回{args.order_jpy:,.0f}円）: "
         f"損益 {replay.pnl:+,.0f}円  約定 {replay.fills}回"
-        + ("" if passed else "\n  どちらかがマイナスなので不合格です。")
+        + ("" if passed else
+           f"\n  約定が少なすぎて判定できません（市場 {args.min_prints}件・検証 {args.min_fills}回は必要）。"
+           if not enough else "\n  どちらかがマイナスなので不合格です。")
     )
     console.print(text)
     if args.slack:
         await _post_slack(text)
-    return 0 if passed else 2
+    return 0 if passed else (3 if not enough else 2)
 
 
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
@@ -7134,6 +7143,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_vd.add_argument("--order-jpy", type=float, default=2_000.0)
     p_vd.add_argument("--cancel-ms", type=float, default=1_000.0)
     p_vd.add_argument("--slack", action="store_true", help="結果を Slack に送る")
+    p_vd.add_argument("--min-prints", type=int, default=100, help="判定に要る市場の約定数")
+    p_vd.add_argument("--min-fills", type=int, default=20, help="判定に要る検証の約定数")
     p_vd.set_defaults(func=cmd_verdict)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
