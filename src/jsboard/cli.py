@@ -3690,6 +3690,56 @@ async def _printedge_all(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_tradeedge(args: argparse.Namespace) -> int:
+    """Every bitbank pair over weeks of its published executions."""
+    import asyncio as _asyncio
+    from datetime import UTC, datetime, timedelta, timezone
+
+    from .research.jpscan import bitbank_books
+    from .research.tradeedge import HEADER, NOTE, PairEdge, day_edge, parse
+
+    jst = timezone(timedelta(hours=9))
+    today = datetime.now(UTC).astimezone(jst).date()
+    days = [today - timedelta(days=i) for i in range(args.days, -1, -1)]  # oldest .. today
+    async with make_session() as session:
+        books = bitbank_books(await _get_json(session, BITBANK_PAIRS_URL))
+        pairs = sorted(books)
+        if args.only:
+            wanted = {x.strip().lower() for x in args.only.split(",") if x.strip()}
+            pairs = [p for p in pairs if p in wanted]
+        console.print(f"{len(pairs)} 銘柄 × {args.days} 日（{days[0]}〜{days[-2]}、日本時間）")
+        print(HEADER, flush=True)
+        results = []
+        for pair in pairs:
+            tapes = []
+            for day in days:
+                url = f"https://public.bitbank.cc/{pair}/transactions/{day:%Y%m%d}"
+                try:
+                    payload = await _get_json(session, url)
+                    tapes.append(parse((payload.get("data") or {}).get("transactions") or []))
+                except Exception as exc:  # noqa: BLE001 - one missing day must not stop the table
+                    console.print(f"[yellow]{pair} {day}: 読めませんでした ({exc})[/yellow]")
+                    tapes.append([])
+                await _asyncio.sleep(args.pause)
+            edge = PairEdge(pair, books[pair].rebate_bps)
+            for i in range(len(days) - 1):
+                if tapes[i]:
+                    edge.days.append(day_edge(tapes[i], tapes[i + 1]))
+            print(edge.row(), flush=True)
+            results.append(edge)
+    print()
+    print("60秒後の成績順:")
+    print(HEADER)
+    ranked = sorted((e for e in results if e.counted_days), key=lambda e: e.bps(60), reverse=True)
+    for e in ranked:
+        print(e.row())
+    print()
+    passed = [e.pair for e in ranked if e.passed]
+    print(f"合格: {', '.join(passed) if passed else 'なし'}")
+    print(NOTE)
+    return 0
+
+
 async def cmd_printedge(args: argparse.Namespace) -> int:
     """What a maker earned on every print of a recording: the ceiling for us."""
     from .feed.base import FeedStatus as _Status
@@ -6948,6 +6998,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--vary", action="append",
                       help="name=v1,v2 で比べる（例: cancel_ms=250,1000 / min_edge_bps=2,4）")
     p_ls.set_defaults(func=cmd_livesim)
+
+    p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
+    p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")
+    p_te.add_argument("--only", default=None, help="この銘柄だけ（例: ada_jpy,xrp_jpy）")
+    p_te.add_argument("--pause", type=float, default=0.2, help="取得の間隔（秒）")
+    p_te.set_defaults(func=cmd_tradeedge)
 
     p_pe = sub.add_parser("printedge", help="すべての約定の反対側にいたら、いくらもうかったか（勝てる上限）")
     p_pe.add_argument("path", help="録画（s3://… のフォルダも可）")
