@@ -47,6 +47,18 @@ class Bucket:
     yen: float = 0.0
     edge: float = 0.0
     after: dict = field(default_factory=lambda: {h: 0.0 for h in HORIZONS_S})
+    rebate: float = REBATE_BPS
+
+    def bps(self, horizon: int) -> float:
+        """Maker's result at `horizon` seconds, rebate included, per yen traded."""
+        return self.after[horizon] / self.yen + self.rebate if self.yen else float("nan")
+
+    def merge(self, other: Bucket) -> None:
+        self.n += other.n
+        self.yen += other.yen
+        self.edge += other.edge
+        for h in HORIZONS_S:
+            self.after[h] += other.after[h]
 
     def add(self, p: Print, moves: dict) -> None:
         w = p.yen
@@ -61,7 +73,7 @@ class Bucket:
             return f"{self.name}\t0\t-\t-\t-\t-\t-"
         avg = self.yen / self.n
         edge = self.edge / self.yen
-        cols = [f"{self.after[h] / self.yen + REBATE_BPS:+.1f}" for h in HORIZONS_S]
+        cols = [f"{self.bps(h):+.1f}" for h in HORIZONS_S]
         return f"{self.name}\t{self.n:,}\t{avg:,.0f}\t{edge:+.1f}\t" + "\t".join(cols)
 
 
@@ -110,14 +122,18 @@ def collect(rows, instrument, lead_instrument) -> tuple[list[Print], MidLine, li
     return prints, mids, spreads
 
 
-def report(prints: list[Print], mids: MidLine, spreads: list[float], our_yen: float) -> str:
+def group(prints: list[Print], mids: MidLine, rebate: float = REBATE_BPS) -> dict:
+    """The prints sorted into the report's buckets."""
     end = mids.ts[-1] if mids.ts else 0
+
+    def b(name: str) -> Bucket:
+        return Bucket(name, rebate=rebate)
+
     groups: dict[str, list[Bucket]] = {
-        "全部": [Bucket("すべての約定")],
-        "大きさ": [Bucket("〜5千円"), Bucket("5千〜2万円"), Bucket("2万〜10万円"), Bucket("10万円〜")],
-        "スプレッド": [Bucket("2bps未満"), Bucket("2〜5bps"), Bucket("5bps以上")],
-        "先物": [Bucket("先物が同じ向きに2bps以上"), Bucket("先物が静か"),
-                 Bucket("先物が逆向きに2bps以上")],
+        "全部": [b("すべての約定")],
+        "大きさ": [b("〜5千円"), b("5千〜2万円"), b("2万〜10万円"), b("10万円〜")],
+        "スプレッド": [b("2bps未満"), b("2〜5bps"), b("5bps以上")],
+        "先物": [b("先物が同じ向きに2bps以上"), b("先物が静か"), b("先物が逆向きに2bps以上")],
     }
     for p in prints:
         moves = {}
@@ -135,7 +151,12 @@ def report(prints: list[Print], mids: MidLine, spreads: list[float], our_yen: fl
         groups["スプレッド"][spread].add(p, moves)
         lead = 0 if p.lead_bps >= 2 else 2 if p.lead_bps <= -2 else 1
         groups["先物"][lead].add(p, moves)
+    return groups
 
+
+def report(prints: list[Print], mids: MidLine, spreads: list[float], our_yen: float) -> str:
+    end = mids.ts[-1] if mids.ts else 0
+    groups = group(prints, mids)
     hours = (end - mids.ts[0]) / NS / 3600 if mids.ts else 0
     lines = []
     if spreads:
@@ -157,3 +178,66 @@ def report(prints: list[Print], mids: MidLine, spreads: list[float], our_yen: fl
         "マイナスなら、どれだけ速く・うまく並んでも、その区分の約定は損になる。",
     ]
     return "\n".join(lines)
+
+
+@dataclass
+class BookSummary:
+    """One book over several days, for the table that ranks every book."""
+
+    label: str
+    rebate: float
+    has_lead: bool = True
+    days: int = 0
+    hours: float = 0.0
+    prints: int = 0
+    spreads: list = field(default_factory=list)
+    good_days: int = 0
+    groups: dict | None = None
+
+    def add_day(self, prints: list[Print], mids: MidLine, spreads: list[float]) -> None:
+        if not prints or not mids.ts:
+            return
+        day = group(prints, mids, self.rebate)
+        self.days += 1
+        self.hours += (mids.ts[-1] - mids.ts[0]) / NS / 3600
+        self.prints += len(prints)
+        self.spreads += spreads[:: max(1, len(spreads) // 5000)]
+        self.good_days += day["全部"][0].bps(60) > 0
+        if self.groups is None:
+            self.groups = day
+        else:
+            for name, buckets in day.items():
+                for mine, theirs in zip(self.groups[name], buckets, strict=True):
+                    mine.merge(theirs)
+
+    def row(self) -> str:
+        if not self.groups:
+            return f"{self.label}\t0\t-"
+        every, quiet = self.groups["全部"][0], self.groups["先物"][1]
+        chase = self.groups["先物"][0]
+
+        def f(x: float) -> str:
+            return "-" if x != x else f"{x:+.1f}"
+
+        cols = [
+            self.label, str(self.days), f"{self.prints / self.hours if self.hours else 0:,.0f}",
+            f"{every.yen / every.n if every.n else 0:,.0f}",
+            f"{statistics.median(self.spreads):.1f}" if self.spreads else "-",
+            f(every.bps(1)), f(every.bps(10)), f(every.bps(60)),
+            *((f(quiet.bps(1)), f(quiet.bps(10)), f(quiet.bps(60)), f(chase.bps(10)))
+              if self.has_lead else ("先物なし", "-", "-", "-")),
+            f"{self.good_days}/{self.days}",
+        ]
+        return "\t".join(cols)
+
+
+SUMMARY_HEADER = "\t".join([
+    "銘柄", "日数", "約定/時", "平均額(円)", "スプレッド中央bps",
+    "全部1秒", "全部10秒", "全部60秒", "先物静か1秒", "先物静か10秒", "先物静か60秒",
+    "先物追い10秒", "60秒がプラスの日",
+])
+SUMMARY_NOTE = (
+    "数字は「その約定の反対側に自分がいたら」のもうけ（bps=0.01%、メイカーリベート込み）。\n"
+    "先物静か = 直前1秒に先物が2bps以上動いていない約定。先物追い = 先物と同じ向きの約定。\n"
+    "どれも速さ・並び順を最高に置いた上限。ここがマイナスの銘柄は、どうやっても勝てない。"
+)

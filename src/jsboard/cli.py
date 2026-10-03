@@ -3614,6 +3614,68 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _printedge_all(args: argparse.Namespace) -> int:
+    """Every recorded book under a folder, one line each, best first."""
+    import re
+    from collections import defaultdict
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.daily import MAKER_BPS
+    from .research.printedge import SUMMARY_HEADER, SUMMARY_NOTE, BookSummary, collect
+    from .sim.s3 import exists, list_parts, read_bytes
+
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    dates: dict[str, set] = defaultdict(set)
+    for uri in list_parts(root):
+        m = re.search(r"symbol=([^/]+)/date=(\d{4}-\d{2}-\d{2})/", uri)
+        if m:
+            dates[m[1]].add(m[2])
+    if not dates:
+        console.print(f"[red]{root} に録画がありません。[/red]")
+        return 1
+    console.print(f"{len(dates)} 銘柄: {', '.join(sorted(dates))}")
+    print(SUMMARY_HEADER, flush=True)
+    done = []
+    for symbol in sorted(dates):
+        meta = f"{root}symbol={symbol}/meta.json"
+        sources = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+        maker = next((s for s in sources if s in MAKER_BPS), None)
+        if maker is None:
+            print(f"{symbol}\t取引所の情報がない録画なので飛ばしました", flush=True)
+            continue
+        inst = _instrument_from_spec(sources[maker])
+        lead_spec = sources.get(args.lead_source)
+        lead_inst = _instrument_from_spec(lead_spec) if lead_spec else inst
+        book = BookSummary(f"{maker}:{inst.symbol}", rebate=-MAKER_BPS[maker],
+                           has_lead=lead_spec is not None)
+        for day in sorted(dates[symbol])[-args.days:]:
+            def rows(folder=f"{root}symbol={symbol}/date={day}/"):
+                for src, rx, event in iter_tagged_timed(folder):
+                    if isinstance(event, _Status):
+                        continue
+                    if src == args.lead_source and lead_spec:
+                        yield "lead", rx, event
+                    elif src == maker:
+                        yield "book", rx, event
+
+            try:
+                book.add_day(*collect(rows(), inst, lead_inst))
+            except Exception as exc:  # noqa: BLE001 - one bad day must not stop the table
+                console.print(f"[yellow]{symbol} {day}: 読めませんでした ({exc})[/yellow]")
+        print(book.row(), flush=True)
+        done.append(book)
+    print()
+    print("60秒後の成績順（全部60秒）:")
+    ranked = sorted((b for b in done if b.groups),
+                    key=lambda b: b.groups["全部"][0].bps(60), reverse=True)
+    for b in ranked:
+        print(b.row())
+    print()
+    print(SUMMARY_NOTE)
+    return 0
+
+
 async def cmd_printedge(args: argparse.Namespace) -> int:
     """What a maker earned on every print of a recording: the ceiling for us."""
     from .feed.base import FeedStatus as _Status
@@ -3621,6 +3683,8 @@ async def cmd_printedge(args: argparse.Namespace) -> int:
     from .research.printedge import collect, report
     from .sim.s3 import exists, meta_uri, read_bytes
 
+    if args.all:
+        return await _printedge_all(args)
     path = args.path
     base_args = build_parser().parse_args(["sweep", path, "--source", "bitbank"])
     instrument = _instrument_for_recording(path, base_args)
@@ -6875,6 +6939,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pe.add_argument("--since", default=None, help="UTC 2026-10-02T08:33")
     p_pe.add_argument("--until", default=None)
     p_pe.add_argument("--order-jpy", type=float, default=10_000.0)
+    p_pe.add_argument("--all", action="store_true",
+                      help="path の下の全銘柄を調べて1行ずつ並べる（例: s3://jsboard-capture/raw/live/）")
+    p_pe.add_argument("--days", type=int, default=7, help="--all のとき、各銘柄の新しい方から何日分")
     p_pe.set_defaults(func=cmd_printedge)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")

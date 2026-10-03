@@ -251,3 +251,33 @@ async def test_a_print_that_filled_us_live_is_not_eaten_by_our_own_ghost():
         fills = await sim.trade_history("ada_jpy", 0)
         assert len(fills) == expect and all(f["order_id"] == oid for f in fills)
         assert sim.counts["own_prints"] == expect
+
+
+@pytest.mark.asyncio
+async def test_every_recorded_book_gets_one_line(monkeypatch, capsys):
+    import jsboard.sim.s3 as s3
+    from jsboard.cli import build_parser
+
+    objects = recording()
+    for key, body in list(objects.items()):  # a second book, same data
+        objects[key.replace("ADA_JPY", "XRP_JPY")] = body
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    args = build_parser().parse_args(["printedge", "--all", "s3://b/raw/live/"])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out
+    lines = [x for x in out.splitlines() if x.startswith("bitbank:ada_jpy")]
+    assert len(lines) == 4  # two books, each in the table and in the ranking
+    assert "60秒がプラスの日" in out and lines[0].split("\t")[1] == "1"
