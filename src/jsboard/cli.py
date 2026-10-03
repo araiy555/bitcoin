@@ -3650,7 +3650,8 @@ async def _printedge_all(args: argparse.Namespace) -> int:
         book = BookSummary(f"{maker}:{inst.symbol}", rebate=-MAKER_BPS[maker],
                            has_lead=lead_spec is not None)
         for day in sorted(dates[symbol])[-args.days:]:
-            def rows(folder=f"{root}symbol={symbol}/date={day}/"):
+            def rows(folder=f"{root}symbol={symbol}/date={day}/", maker=maker,
+                     lead_spec=lead_spec):
                 for src, rx, event in iter_tagged_timed(folder):
                     if isinstance(event, _Status):
                         continue
