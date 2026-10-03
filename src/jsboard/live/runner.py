@@ -433,18 +433,26 @@ class Breaker:
     move_pct: float = 1.5
     window_s: float = 60.0
     cooldown_s: float = 300.0
-    _mids: deque = field(default_factory=deque)
+    _lows: deque = field(default_factory=deque)
+    _highs: deque = field(default_factory=deque)
     until: float = 0.0
 
     def observe(self, mid: float | None, now: float) -> bool:
         """True when this observation trips the breaker."""
         if mid is None or mid <= 0:
             return False
-        self._mids.append((now, mid))
-        while self._mids and now - self._mids[0][0] > self.window_s:
-            self._mids.popleft()
-        lo = min(m for _, m in self._mids)
-        hi = max(m for _, m in self._mids)
+        # The window's low and high, kept as it slides: a replay feeds every
+        # lead update here, and rescanning the minute each time was slow.
+        while self._lows and self._lows[-1][1] >= mid:
+            self._lows.pop()
+        while self._highs and self._highs[-1][1] <= mid:
+            self._highs.pop()
+        self._lows.append((now, mid))
+        self._highs.append((now, mid))
+        for q in (self._lows, self._highs):
+            while now - q[0][0] > self.window_s:
+                q.popleft()
+        lo, hi = self._lows[0][1], self._highs[0][1]
         if (hi - lo) / lo * 100 >= self.move_pct and now >= self.until:
             self.until = now + self.cooldown_s
             return True

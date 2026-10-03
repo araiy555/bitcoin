@@ -107,6 +107,7 @@ class SimBitbank:
         self.history: deque = deque()
         self._trade_ids = iter(range(1, 10**12))
         self._cancelled: set[int] = set()
+        self._live: dict[int, object] = {}
         self.all_trades: list[dict] = []
         """Every execution, kept whole for comparing with a live run."""
         self.own_prints: list[tuple] = []
@@ -197,10 +198,20 @@ class SimBitbank:
     def _open(self, order) -> bool:
         return order.remaining > 0 and not order.is_gone(self.now_ns)
 
+    def _still_open(self) -> list:
+        """(exchange id, order) for orders not yet filled or cancelled.
+
+        Every order ever placed stays in `by_id` for status calls; walking
+        all of them on each order made a day's replay take hours.
+        """
+        for exchange_id in [i for i, o in self._live.items() if not self._open(o)]:
+            del self._live[exchange_id]
+        return list(self._live.items())
+
     def _locked(self, side: Side) -> Decimal:
         total = Decimal(0)
-        for order in self.by_id.values():
-            if order.side is side and self._open(order):
+        for _, order in self._still_open():
+            if order.side is side:
                 amount = self.instrument.lot_size * order.remaining
                 if side is Side.BUY:
                     total += self.instrument.tick_size * order.price * amount
@@ -234,6 +245,7 @@ class SimBitbank:
         paper.active_ns = self.now_ns + int(land)
         exchange_id = next(self._ids)
         self.by_id[exchange_id] = paper
+        self._live[exchange_id] = paper
         self.paper_to_id[paper.order_id] = exchange_id
         return exchange_id
 
@@ -275,7 +287,7 @@ class SimBitbank:
         return "PARTIALLY_FILLED" if order.filled else "UNFILLED"
 
     async def active_orders(self, pair) -> list[int]:
-        return [i for i, o in self.by_id.items() if self._landed(o) and self._open(o)]
+        return [i for i, o in self._still_open() if self._landed(o)]
 
     async def trade_history(self, pair, since_ms: int) -> list[dict]:
         while self.history and self.history[0]["executed_at"] < since_ms - 60_000:
