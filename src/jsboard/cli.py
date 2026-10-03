@@ -3499,9 +3499,10 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
     instrument = _instrument_for_recording(path, base_args)
     meta_path = meta_uri(path)
     sources = json.loads(read_bytes(meta_path)).get("sources", {}) if exists(meta_path) else {}
-    if args.lead_source not in sources:
-        raise ConfigError(f"--lead-source {args.lead_source} は録画にありません。")
-    lead_inst = _instrument_from_spec(sources[args.lead_source])
+    has_lead = args.lead_source in sources
+    if not has_lead:
+        console.print(f"[yellow]録画に {args.lead_source} がないので、先物を見ない形で再生します。[/yellow]")
+    lead_inst = _instrument_from_spec(sources[args.lead_source]) if has_lead else instrument
     since, until = _parse_when(args.since), _parse_when(args.until)
     price = _first_mid(path, "bitbank", instrument)
     size = size_for(args.order_jpy, price, instrument.lot_size)
@@ -3559,7 +3560,8 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
         ])
         mm = build_maker(instrument, run_args)
         lead_view = MarketView(instrument=lead_inst, depth=20)
-        mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
+        if has_lead:
+            mm.toxicity.lead = CrossMarketFairValue(instrument, lead_inst, lead_view)
         sim = SimBitbank(instrument, behaviour, jpy=Decimal(str(args.jpy)),
                          coin=Decimal(str(args.coin)), seed=args.seed)
         if live_trades and not args.no_own_prints:
@@ -3756,9 +3758,11 @@ async def cmd_printedge(args: argparse.Namespace) -> int:
     instrument = _instrument_for_recording(path, base_args)
     meta_path = meta_uri(path)
     sources = json.loads(read_bytes(meta_path)).get("sources", {}) if exists(meta_path) else {}
-    if args.lead_source not in sources:
-        raise ConfigError(f"--lead-source {args.lead_source} は録画にありません。")
-    lead_inst = _instrument_from_spec(sources[args.lead_source])
+    if args.lead_source in sources:
+        lead_inst = _instrument_from_spec(sources[args.lead_source])
+    else:
+        console.print(f"[yellow]録画に {args.lead_source} がないので、先物の区分は出せません。[/yellow]")
+        lead_inst = instrument
     since, until = _parse_when(args.since), _parse_when(args.until)
 
     def rows():
@@ -3842,13 +3846,18 @@ async def _maker_bps_for(target) -> float:
 async def _lead_capture_parts(target, binance_depth_ms: int = 100):
     """Feeds and specs to record one book with Binance's perp as its lead."""
     instrument, feed = await _live_book(target)
-    binance = await fetch_futures_instrument(f"{instrument.base}USDT")
     market = "spot" if target.venue == "bitbank" or "_" not in target.symbol else "leverage"
-    sources = {target.venue: feed, "binance": _binance_lead(binance, binance_depth_ms)}
-    specs = {
-        target.venue: {**_spec_dict(instrument, market), "venue": target.venue},
-        "binance": {**_spec_dict(binance, "perp"), "venue": "binance"},
-    }
+    sources = {target.venue: feed}
+    specs = {target.venue: {**_spec_dict(instrument, market), "venue": target.venue}}
+    try:
+        binance = await fetch_futures_instrument(f"{instrument.base}USDT")
+    except Exception as exc:  # noqa: BLE001 - a coin Binance has no perp for is still worth a look
+        # The book alone still answers the first question (does it pay its
+        # makers?); only the lead gate needs the perp.
+        console.print(f"[yellow]{target.label}: Binance の先物がないので、板だけ録画します ({exc})[/yellow]")
+        return sources, specs
+    sources["binance"] = _binance_lead(binance, binance_depth_ms)
+    specs["binance"] = {**_spec_dict(binance, "perp"), "venue": "binance"}
     return sources, specs
 
 

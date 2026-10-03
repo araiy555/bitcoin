@@ -285,3 +285,41 @@ async def test_every_recorded_book_gets_one_line(monkeypatch, capsys):
     args = build_parser().parse_args(["printedge", "--all", "s3://b/raw/live/", "--only", "xrp_jpy"])
     assert await args.func(args) == 0
     assert "1 銘柄: XRP_JPY" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_a_book_recorded_without_a_lead_still_replays(monkeypatch, capsys):
+    import jsboard.sim.s3 as s3
+    from jsboard.cli import build_parser
+
+    objects = {}
+    for key, body in recording().items():
+        if key.endswith("meta.json"):
+            meta = json.loads(body)
+            del meta["sources"]["binance"]
+            objects[key] = json.dumps(meta).encode()
+        else:
+            lines = [ln for ln in gzip.decompress(body).decode().splitlines()
+                     if json.loads(ln).get("src") != "binance"]
+            objects[key] = gzip.compress(("\n".join(lines) + "\n").encode())
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    args = build_parser().parse_args([
+        "livesim", "s3://b/raw/live/symbol=ADA_JPY/date=2026-09-26/",
+        "--slow-land-share", "0", "--refuse-share", "0", "--breakdown",
+    ])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "先物を見ない形で再生" in out.replace("\n", "") and "損益の中身" in out
