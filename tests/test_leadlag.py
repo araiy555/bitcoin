@@ -107,5 +107,7 @@ def test_direction_counts_whether_the_slow_market_followed():
     stayed = direction(iter(tape()), GMO, LEAD, label="x", thresholds=[10])
     assert followed.signals[10] >= 1
     d5 = followed.cells[(10, 5)]
-    assert d5.same == d5.n and d5.total_bps > 0
+    # The jump is followed; GMO catching up a moment later reads as the lead
+    # lagging GMO, a second signal after which nothing moves.
+    assert d5.same >= 1 and d5.opposite == 0 and d5.total_bps > 0
     assert stayed.cells[(10, 5)].flat == stayed.cells[(10, 5)].n
