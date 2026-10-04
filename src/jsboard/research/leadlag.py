@@ -27,10 +27,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from ..core.market import MarketView
 from ..core.types import Instrument
 from ..feed.base import DepthDelta, DepthSnapshot
-from .hedgeedge import walk
+from .arbedge import _Book
 
 NS = 1_000_000_000
 
@@ -91,7 +90,15 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
             window_ms: float = 1000.0, latency_ms: float = 200.0, size_jpy: float = 10_000.0,
             fee_bps: float = 0.0, min_order: float = 0.0, depth: int = 100) -> LeadLagResult:
     """`rows` yields (source, receive_ns, event), source "gmo" or "lead"."""
-    gm, ld = MarketView(instrument=gmo, depth=depth), MarketView(instrument=lead, depth=depth)
+    # Plain books: only the touch is needed on every update, and the depth
+    # only when a trade is priced. A full MarketView per update made a day
+    # take many minutes.
+    gm, ld = _Book(), _Book()
+
+    def mid_of(book: _Book) -> float | None:
+        if book.best_bid is None or book.best_ask is None:
+            return None
+        return (book.best_bid + book.best_ask) / 2.0
     out = LeadLagResult(label)
     window, lat = int(window_ms * 1e6), int(latency_ms * 1e6)
     lead_hist: deque = deque()   # (rx, mid)
@@ -110,20 +117,19 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
         return datetime.fromtimestamp(ns / NS, UTC).strftime("%Y-%m-%d")
 
     def gmo_price(side: int, qty: float) -> float | None:
-        snap = gm.snapshot(depth)
-        if snap.mid is None:
+        if mid_of(gm) is None:
             return None
-        return walk(snap.asks if side > 0 else snap.bids, qty, gmo)
+        return gm.take(side, qty, gmo)
 
     def run_due(now: int) -> None:
         while tasks and tasks[0][0] <= now:
             due, _, kind, trade = heapq.heappop(tasks)
             if kind == "enter":
-                snap = gm.snapshot(1)
-                if snap.mid is None:
+                m = mid_of(gm)
+                if m is None:
                     out.no_book += 1
                     continue
-                mid = snap.mid * float(gmo.tick_size)
+                mid = m * float(gmo.tick_size)
                 step = float(gmo.lot_size)
                 qty = math.floor(size_jpy / mid / step + 1e-9) * step
                 if qty <= 0 or qty < min_order:
@@ -155,14 +161,16 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
             continue
         view, hist = (gm, gmo_hist) if src == "gmo" else (ld, lead_hist)
         view.apply(event)
-        if view.mid is not None:
-            hist.append((rx, view.mid))
-        if src != "lead" or ld.mid is None or gm.mid is None:
+        m = mid_of(view)
+        if m is not None and (not hist or hist[-1][1] != m):
+            hist.append((rx, m))
+        lead_mid, gmo_mid = mid_of(ld), mid_of(gm)
+        if src != "lead" or lead_mid is None or gmo_mid is None:
             continue
         lead_then, gmo_then = ago(lead_hist, rx), ago(gmo_hist, rx)
         if not lead_then or not gmo_then:
             continue
-        gap = (math.log(ld.mid / lead_then) - math.log(gm.mid / gmo_then)) * 1e4
+        gap = (math.log(lead_mid / lead_then) - math.log(gmo_mid / gmo_then)) * 1e4
         for t in thresholds:
             if abs(gap) < t:
                 continue
