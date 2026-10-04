@@ -4041,7 +4041,7 @@ async def cmd_hedgeedge(args: argparse.Namespace) -> int:
     print()
     print(NOTE)
     if args.slack and results:
-        await _post_slack(slack_summary(results))
+        await _post_slack(slack_summary(results, interim=args.interim))
     return 0
 
 
@@ -7294,6 +7294,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_he.add_argument("--latency-ms", type=float, default=200.0, help="約定からヘッジまでの遅れ")
     p_he.add_argument("--only", default=None, help="この銘柄だけ（例: XRP_JPY）")
     p_he.add_argument("--slack", action="store_true")
+    p_he.add_argument("--interim", action="store_true", help="Slack の見出しを「途中経過」にする")
     p_he.set_defaults(func=cmd_hedgeedge)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")

@@ -210,8 +210,9 @@ def analyse(rows, maker: Instrument, hedge: Instrument, *, label: str,
     return out
 
 
-def slack_summary(results: list[HedgeResult]) -> str:
-    lines = [":shield: ヘッジ込みの判定（bitbank でメイカー → GMO で即ヘッジ）"]
+def slack_summary(results: list[HedgeResult], interim: bool = False) -> str:
+    title = "途中経過" if interim else "判定"
+    lines = [f":shield: ヘッジ込みの{title}（bitbank でメイカー → GMO で即ヘッジ）"]
     for r in results:
         h60 = r.horizons[60]
         verdict = "仮合格" if r.passed else ("判定保留（データ不足）" if r.hedged < 100 else "不合格")
