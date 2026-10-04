@@ -241,3 +241,81 @@ SUMMARY_NOTE = (
     "先物静か = 直前1秒に先物が2bps以上動いていない約定。先物追い = 先物と同じ向きの約定。\n"
     "どれも速さ・並び順を最高に置いた上限。ここがマイナスの銘柄は、どうやっても勝てない。"
 )
+
+
+def _moves(p: Print, mids: MidLine, end: int) -> dict | None:
+    moves = {}
+    for h in HORIZONS_S:
+        later = mids.at(min(p.ts_ns + h * NS, end))
+        if later is None:
+            return None
+        moves[h] = later
+    return moves
+
+
+def chance_day(prints: list[Print], mids: MidLine, rebate: float, levels) -> dict:
+    """The maker's side of the prints that came just after the lead moved the
+    other way by at least each level: the lead rose and a seller hit the bid
+    anyway, so the maker bought ahead of the move. Quoting only then, and
+    only that side, is the "trade the chances only" maker."""
+    end = mids.ts[-1] if mids.ts else 0
+    out = {x: Bucket(f"先物が逆に{x:g}bps以上", rebate=rebate) for x in levels}
+    for p in prints:
+        if p.lead_bps > -min(levels):
+            continue
+        moves = _moves(p, mids, end)
+        if moves is None:
+            continue
+        for x in levels:
+            if p.lead_bps <= -x:
+                out[x].add(p, moves)
+    return out
+
+
+@dataclass
+class ChanceSummary:
+    label: str
+    rebate: float
+    levels: tuple
+    days: int = 0
+    totals: dict = field(default_factory=dict)
+    good: dict = field(default_factory=dict)
+    counted: dict = field(default_factory=dict)
+
+    def add_day(self, prints: list[Print], mids: MidLine) -> None:
+        if not prints or not mids.ts:
+            return
+        self.days += 1
+        for x, b in chance_day(prints, mids, self.rebate, self.levels).items():
+            total = self.totals.setdefault(x, Bucket(b.name, rebate=self.rebate))
+            total.merge(b)
+            if b.n:
+                self.counted[x] = self.counted.get(x, 0) + 1
+                self.good[x] = self.good.get(x, 0) + (b.bps(60) > 0)
+
+    def rows(self) -> list[str]:
+        out = []
+        for x in self.levels:
+            b = self.totals.get(x)
+            if b is None or not b.n:
+                out.append(f"{self.label}\t{x:g}\t{self.days}\t0")
+                continue
+            out.append("\t".join([
+                self.label, f"{x:g}", str(self.days), f"{b.n:,}",
+                f"{b.n / self.days:,.1f}" if self.days else "-",
+                f"{b.yen / b.n:,.0f}",
+                *(f"{b.bps(h):+.1f}" for h in HORIZONS_S),
+                f"{self.good.get(x, 0)}/{self.counted.get(x, 0)}",
+            ]))
+        return out
+
+
+CHANCE_HEADER = "\t".join([
+    "銘柄", "先物の逆向きbps以上", "日数", "約定", "1日あたり", "平均額(円)",
+    "1秒後bps", "10秒後bps", "60秒後bps", "60秒がプラスの日",
+])
+CHANCE_NOTE = (
+    "先物（Binance）が上がった直後に、bitbank で売ってきた人から買えた約定だけ（下がったときは逆）。\n"
+    "＝ 先物が動いた直後に、有利な側だけ注文を出す「チャンスだけ」のマーケットメイクの上限。\n"
+    "bps はリベート込み、約定額あたり。並び順と速さは最高の場合。"
+)

@@ -3718,6 +3718,8 @@ async def _printedge_all(args: argparse.Namespace) -> int:
             console.print(f"[red]--only {args.only} に当たる銘柄がありません。[/red]")
             return 1
     console.print(f"{len(dates)} 銘柄: {', '.join(sorted(dates))}")
+    if args.chance:
+        return await _printedge_chances(args, root, dates)
     print(SUMMARY_HEADER, flush=True)
     done = []
     for symbol in sorted(dates):
@@ -3811,6 +3813,48 @@ async def cmd_tradeedge(args: argparse.Namespace) -> int:
     print(NOTE)
     if args.slack:
         await _post_slack(slack_summary(ranked, args.days, f"{days[0]}〜{days[-2]}"))
+    return 0
+
+
+async def _printedge_chances(args, root: str, dates: dict) -> int:
+    """For each book: the prints right after the lead moved against the
+    taker, by how far it moved, day by day."""
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.daily import MAKER_BPS
+    from .research.printedge import CHANCE_HEADER, CHANCE_NOTE, ChanceSummary, collect
+    from .sim.s3 import exists, read_bytes
+
+    levels = tuple(float(x) for x in args.chance.split(","))
+    print(CHANCE_HEADER, flush=True)
+    for symbol in sorted(dates):
+        meta = f"{root}symbol={symbol}/meta.json"
+        sources = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+        maker = next((s for s in sources if s in MAKER_BPS), None)
+        if maker is None or args.lead_source not in sources:
+            continue
+        inst = _instrument_from_spec(sources[maker])
+        lead_inst = _instrument_from_spec(sources[args.lead_source])
+        summary = ChanceSummary(f"{maker}:{inst.symbol}", -MAKER_BPS[maker], levels)
+        for day in sorted(dates[symbol])[-args.days:]:
+            def rows(folder=f"{root}symbol={symbol}/date={day}/", maker=maker):
+                for src, rx, event in iter_tagged_timed(folder):
+                    if isinstance(event, _Status):
+                        continue
+                    if src == args.lead_source:
+                        yield "lead", rx, event
+                    elif src == maker:
+                        yield "book", rx, event
+
+            try:
+                prints, mids, _ = collect(rows(), inst, lead_inst)
+                summary.add_day(prints, mids)
+            except Exception as exc:  # noqa: BLE001 - one bad day must not stop the table
+                console.print(f"[yellow]{symbol} {day}: 読めませんでした ({exc})[/yellow]")
+        for line in summary.rows():
+            print(line, flush=True)
+    print()
+    print(CHANCE_NOTE)
     return 0
 
 
@@ -7478,6 +7522,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="path の下の全銘柄を調べて1行ずつ並べる（例: s3://jsboard-capture/raw/live/）")
     p_pe.add_argument("--days", type=int, default=7, help="--all のとき、各銘柄の新しい方から何日分")
     p_pe.add_argument("--only", default=None, help="--all のとき、この銘柄だけ（例: ETH,SUI_JPY,XRP）")
+    p_pe.add_argument("--chance", default=None,
+                      help="--all のとき、先物が逆に動いた直後の約定だけを、動きの大きさ別に出す（例: 2,5,10,20）")
     p_pe.set_defaults(func=cmd_printedge)
 
     p_tune = sub.add_parser("tune", help="1銘柄で設定の変更を試す／元に戻す")

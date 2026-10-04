@@ -87,3 +87,21 @@ def test_a_single_run_splits_into_quick_and_held_parts():
     text = single([FillRow(10 * NS, 1, 40.0, 100)], mids, 0, 300 * NS)
     assert "この日の値動き(始め→終わり)\t-2.50%" in text
     assert "終わりの在庫(枚)\t+100" in text and "損益(円)\t-99" in text and "60秒より長く持った分(円)\t-100" in text
+
+
+def test_chances_keep_only_prints_against_the_lead_and_split_by_size():
+    from jsboard.research.printedge import ChanceSummary, Print, chance_day
+
+    mids = line((0, 100.0), (5, 100.2), (400, 100.2))
+    # Lead up 10bps, a seller hits the bid at 99.95: the maker buys before the rise.
+    against = Print(ts_ns=1 * NS, sign=1, price=99.95, yen=10_000, mid=100.0,
+                    spread_bps=10, lead_bps=-10.0)
+    # Lead up, a buyer lifts the offer: that maker sold into the rise; not a chance.
+    along = Print(ts_ns=2 * NS, sign=-1, price=100.05, yen=10_000, mid=100.0,
+                  spread_bps=10, lead_bps=10.0)
+    day = chance_day([against, along], mids, rebate=2.0, levels=(5, 20))
+    assert day[5].n == 1 and day[20].n == 0
+    assert day[5].bps(60) > 2.0
+    s = ChanceSummary("bitbank:ada_jpy", 2.0, (5, 20))
+    s.add_day([against, along], mids)
+    assert s.rows()[0].endswith("1/1") and s.rows()[1].endswith("\t0")
