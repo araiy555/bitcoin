@@ -4050,6 +4050,137 @@ async def cmd_hedgeedge(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_leadrecord(args: argparse.Namespace) -> int:
+    """GMO's leverage book with Bybit's and Binance's perps, on one clock.
+
+    For the follow-the-leader test: when a perp jumps and GMO has not
+    moved yet. Each lead is optional (a coin either may not list); the
+    GMO book and at least one lead are needed. No orders.
+    """
+    import asyncio as _asyncio
+    from types import SimpleNamespace
+
+    from .research.daily import Target
+    from .research.jpscan import gmo_books
+
+    async with make_session() as session:
+        gmo_rules = (await _get_json(session, GMO_SYMBOLS_URL)).get("data") or []
+    fees = gmo_books({"data": gmo_rules})
+    minimum = {r["symbol"]: r.get("minOrderSize", "0") for r in gmo_rules}
+    workdir = Path(args.workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    runs, watched = [], []
+    for coin in (c.strip().upper() for c in args.coins.split(",") if c.strip()):
+        gm_symbol, perp = f"{coin}_JPY", f"{coin}USDT"
+        try:
+            gm_inst, gm_feed = await _live_book(Target("gmo", gm_symbol))
+        except Exception as exc:  # noqa: BLE001 - one missing book must not stop the rest
+            console.print(f"[yellow]{gm_symbol}: 録画できません ({exc})[/yellow]")
+            continue
+        sources = {"gmo": gm_feed}
+        specs = {"gmo": {**_spec_dict(gm_inst, "leverage"), "venue": "gmo",
+                         "taker_bps": fees[gm_symbol].taker_bps,
+                         "min_order": str(minimum.get(gm_symbol, "0"))}}
+        try:
+            bybit = await fetch_bybit_instrument(perp, "linear")
+            sources["bybit"] = BybitFeed(bybit, category="linear", depth=50)
+            specs["bybit"] = {**_spec_dict(bybit, "perp"), "venue": "bybit"}
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Bybit {perp}: 使えません ({exc})[/yellow]")
+        try:
+            binance = await fetch_futures_instrument(perp)
+            sources["binance"] = _binance_lead(binance, 100)
+            specs["binance"] = {**_spec_dict(binance, "perp"), "venue": "binance"}
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Binance {perp}: 使えません ({exc})[/yellow]")
+        if len(sources) < 2:
+            console.print(f"[yellow]{gm_symbol}: 先行市場がないので飛ばします[/yellow]")
+            continue
+        out = workdir / f"lead-{coin}.jsonl"
+        meta = write_meta(out, specs)
+        sink = RotatingJsonlSink(
+            path=out, target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
+            symbol=gm_symbol, rotate_seconds=args.rotate_minutes * 60.0,
+        )
+        sink.upload_meta(meta)
+        capture = MultiCapture(sources, out, sink=sink)
+        runs.append(capture.run(duration_s=args.hours * 3600))
+        watched.append((SimpleNamespace(label=f"GMO {gm_symbol} + {'/'.join(list(sources)[1:])}"),
+                        capture, sink))
+    if not runs:
+        console.print("[red]録画できる銘柄がありません。[/red]")
+        return 1
+    text = (f":movie_camera: 後追い用の録画を始めました（{args.hours:g}時間、注文は出しません）: "
+            + ", ".join(t.label for t, _, _ in watched))
+    console.print(text)
+    if args.slack:
+        await _post_slack(text)
+    pending = {_asyncio.create_task(r) for r in runs}
+    while pending:
+        _, pending = await _asyncio.wait(pending, timeout=args.log_every)
+        console.print(_autorecord_status(watched))
+    return 0
+
+
+async def cmd_leadlag(args: argparse.Namespace) -> int:
+    """Follow Bybit (and Binance) on GMO: every threshold, every hold, by day."""
+    import re
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.leadlag import NOTE, analyse, header, slack_summary
+    from .sim.s3 import exists, list_parts, read_bytes
+
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    symbols = sorted({m[1] for uri in list_parts(root)
+                      if (m := re.search(r"symbol=([^/]+)/date=", uri))})
+    if args.only:
+        wanted = {x.strip().upper() for x in args.only.split(",")}
+        symbols = [s for s in symbols if s in wanted]
+    if not symbols:
+        console.print(f"[red]{root} に録画がありません。[/red]")
+        return 1
+    thresholds = [float(x) for x in args.thresholds.split(",")]
+    holds = [int(x) for x in args.holds.split(",")]
+    print(header(holds), flush=True)
+    results = []
+    for symbol in symbols:
+        folder = f"{root}symbol={symbol}/"
+        meta = f"{folder}meta.json"
+        specs = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+        if "gmo" not in specs:
+            continue
+        gmo = _instrument_from_spec(specs["gmo"])
+        for lead_name in [x.strip() for x in args.leads.split(",")]:
+            if lead_name not in specs:
+                continue
+            lead = _instrument_from_spec(specs[lead_name])
+
+            def rows(folder=folder, lead_name=lead_name):
+                for src, rx, event in iter_tagged_timed(folder):
+                    if isinstance(event, _Status):
+                        continue
+                    if src == "gmo":
+                        yield "gmo", rx, event
+                    elif src == lead_name:
+                        yield "lead", rx, event
+
+            result = analyse(
+                rows(), gmo, lead, label=f"{symbol}({lead_name})", thresholds=thresholds,
+                holds=holds, window_ms=args.window_ms, latency_ms=args.latency_ms,
+                size_jpy=args.size_jpy, fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
+                min_order=float(specs["gmo"].get("min_order", 0) or 0),
+            )
+            for line in result.rows(holds):
+                print(line, flush=True)
+            results.append(result)
+    print()
+    print(NOTE)
+    if args.slack and results:
+        await _post_slack(slack_summary(results, holds, interim=args.interim))
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -7305,6 +7436,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_he.add_argument("--slack", action="store_true")
     p_he.add_argument("--interim", action="store_true", help="Slack の見出しを「途中経過」にする")
     p_he.set_defaults(func=cmd_hedgeedge)
+
+    p_lr = sub.add_parser("leadrecord", help="GMO（レバレッジ）と Bybit・Binance の先物を同時に録画（注文なし）")
+    p_lr.add_argument("--coins", default="xrp,eth")
+    p_lr.add_argument("--hours", type=float, default=48.0)
+    p_lr.add_argument("--s3-bucket", required=True)
+    p_lr.add_argument("--s3-prefix", default="raw/lead")
+    p_lr.add_argument("--rotate-minutes", type=float, default=5.0)
+    p_lr.add_argument("--workdir", default="/var/lib/jsboard/leadrecord")
+    p_lr.add_argument("--log-every", type=float, default=60.0)
+    p_lr.add_argument("--slack", action="store_true")
+    p_lr.set_defaults(func=cmd_leadrecord)
+
+    p_ll = sub.add_parser("leadlag", help="先行市場が動いたら GMO で後追いした損益（実際の板・手数料込み）")
+    p_ll.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
+    p_ll.add_argument("--leads", default="bybit,binance")
+    p_ll.add_argument("--thresholds", default="3,5,8,12,20", help="何bps 先に動いたら入るか")
+    p_ll.add_argument("--holds", default="5,10,30,60", help="何秒持つか")
+    p_ll.add_argument("--window-ms", type=float, default=1000.0)
+    p_ll.add_argument("--latency-ms", type=float, default=200.0)
+    p_ll.add_argument("--size-jpy", type=float, default=10_000.0)
+    p_ll.add_argument("--only", default=None)
+    p_ll.add_argument("--slack", action="store_true")
+    p_ll.add_argument("--interim", action="store_true")
+    p_ll.set_defaults(func=cmd_leadlag)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
     p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")

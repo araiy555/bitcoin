@@ -1,0 +1,198 @@
+"""Follow a fast market on a slow one: trade GMO only when the lead jumps.
+
+When Bybit's (or Binance's) perp moves and GMO's leverage book has not
+followed yet, buy (or sell) on GMO and get out a little later. GMO charges
+no taker fee on XRP and ETH, so the only costs are the book itself, both
+ways. Every price here is taken from the recorded books:
+
+- the signal: over the last `window_ms`, the lead's mid moved `gap` bps
+  more than GMO's mid did, in one direction, by at least the threshold;
+- entry `latency_ms` after the signal, at the price got by walking GMO's
+  recorded book for the order size (never its mid);
+- exit `h` seconds after entry, walking the other side of the book;
+- GMO's taker fee on both legs.
+
+One trade at a time per threshold: after a signal, the next is taken only
+once the longest hold has ended, so trades never overlap or stack.
+Results are kept per UTC day, so a threshold chosen on one day can be
+checked on the next.
+"""
+
+from __future__ import annotations
+
+import heapq
+import itertools
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from ..core.market import MarketView
+from ..core.types import Instrument
+from ..feed.base import DepthDelta, DepthSnapshot
+from .hedgeedge import walk
+
+NS = 1_000_000_000
+
+
+@dataclass
+class Cell:
+    n: int = 0
+    wins: int = 0
+    notional: float = 0.0
+    pnl: float = 0.0
+
+    def bps(self) -> float:
+        return self.pnl / self.notional * 1e4 if self.notional else float("nan")
+
+
+@dataclass
+class LeadLagResult:
+    label: str
+    signals: dict = field(default_factory=dict)
+    """threshold -> signals seen (before the one-at-a-time rule)."""
+    cells: dict = field(default_factory=dict)
+    """(day, threshold, hold) -> Cell."""
+    no_book: int = 0
+
+    def cell(self, day: str, threshold: float, hold: int) -> Cell:
+        return self.cells.setdefault((day, threshold, hold), Cell())
+
+    def rows(self, holds) -> list[str]:
+        out = []
+        for day, threshold in sorted({(d, t) for d, t, _ in self.cells}):
+            cols = [self.label, day, f"{threshold:g}"]
+            n = self.cells.get((day, threshold, holds[0]), Cell()).n
+            cols.append(f"{n:,}")
+            for h in holds:
+                c = self.cells.get((day, threshold, h), Cell())
+                win = f"{c.wins / c.n:.0%}" if c.n else "-"
+                bps = "-" if c.n == 0 else f"{c.bps():+.1f}"
+                cols += [bps, f"{c.pnl:+,.0f}", win]
+            out.append("\t".join(cols))
+        return out
+
+
+def header(holds) -> str:
+    cols = ["銘柄(先行)", "日(UTC)", "しきいbps", "取引数"]
+    for h in holds:
+        cols += [f"{h}秒bps", f"{h}秒円", f"{h}秒勝率"]
+    return "\t".join(cols)
+
+
+NOTE = (
+    "しきい = 先行市場が GMO より何bps 先に動いたら入るか（直前の窓の中で）。\n"
+    "入りも出も GMO の録画した実際の板を、注文の量ぶん上から食った値段。手数料込み。\n"
+    "1つのしきいにつき同時に1取引だけ。日ごとに分けてあるので、1日目で選んだしきいを2日目で確かめる。"
+)
+
+
+def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, holds,
+            window_ms: float = 1000.0, latency_ms: float = 200.0, size_jpy: float = 10_000.0,
+            fee_bps: float = 0.0, min_order: float = 0.0, depth: int = 100) -> LeadLagResult:
+    """`rows` yields (source, receive_ns, event), source "gmo" or "lead"."""
+    gm, ld = MarketView(instrument=gmo, depth=depth), MarketView(instrument=lead, depth=depth)
+    out = LeadLagResult(label)
+    window, lat = int(window_ms * 1e6), int(latency_ms * 1e6)
+    lead_hist: deque = deque()   # (rx, mid)
+    gmo_hist: deque = deque()
+    busy_until = {t: -1 for t in thresholds}
+    tasks: list = []
+    seq = itertools.count()
+    longest = max(holds) * NS
+
+    def ago(hist: deque, now: int):
+        while len(hist) >= 2 and hist[1][0] <= now - window:
+            hist.popleft()
+        return hist[0][1] if hist and hist[0][0] <= now - window else None
+
+    def day_of(ns: int) -> str:
+        return datetime.fromtimestamp(ns / NS, UTC).strftime("%Y-%m-%d")
+
+    def gmo_price(side: int, qty: float) -> float | None:
+        snap = gm.snapshot(depth)
+        if snap.mid is None:
+            return None
+        return walk(snap.asks if side > 0 else snap.bids, qty, gmo)
+
+    def run_due(now: int) -> None:
+        while tasks and tasks[0][0] <= now:
+            due, _, kind, trade = heapq.heappop(tasks)
+            if kind == "enter":
+                snap = gm.snapshot(1)
+                if snap.mid is None:
+                    out.no_book += 1
+                    continue
+                mid = snap.mid * float(gmo.tick_size)
+                step = float(gmo.lot_size)
+                qty = math.floor(size_jpy / mid / step + 1e-9) * step
+                if qty <= 0 or qty < min_order:
+                    out.no_book += 1
+                    continue
+                price = gmo_price(trade["side"], qty)
+                if price is None:
+                    out.no_book += 1
+                    continue
+                trade.update(qty=qty, entry=price, day=day_of(due))
+                for h in holds:
+                    heapq.heappush(tasks, (due + h * NS, next(seq), ("exit", h), trade))
+            else:
+                h = kind[1]
+                back = gmo_price(-trade["side"], trade["qty"])
+                if back is None:
+                    continue
+                q, s = trade["qty"], trade["side"]
+                pnl = s * q * (back - trade["entry"]) - (trade["entry"] + back) * q * fee_bps / 1e4
+                c = out.cell(trade["day"], trade["threshold"], h)
+                c.n += 1
+                c.wins += pnl > 0
+                c.notional += trade["entry"] * q
+                c.pnl += pnl
+
+    for src, rx, event in rows:
+        run_due(rx - 1)
+        if not isinstance(event, (DepthSnapshot, DepthDelta)):
+            continue
+        view, hist = (gm, gmo_hist) if src == "gmo" else (ld, lead_hist)
+        view.apply(event)
+        if view.mid is not None:
+            hist.append((rx, view.mid))
+        if src != "lead" or ld.mid is None or gm.mid is None:
+            continue
+        lead_then, gmo_then = ago(lead_hist, rx), ago(gmo_hist, rx)
+        if not lead_then or not gmo_then:
+            continue
+        gap = (math.log(ld.mid / lead_then) - math.log(gm.mid / gmo_then)) * 1e4
+        for t in thresholds:
+            if abs(gap) < t:
+                continue
+            out.signals[t] = out.signals.get(t, 0) + 1
+            if rx < busy_until[t]:
+                continue
+            busy_until[t] = rx + lat + longest
+            side = 1 if gap > 0 else -1  # the lead rose further: buy GMO
+            heapq.heappush(tasks, (rx + lat, next(seq), "enter",
+                                   {"side": side, "threshold": t}))
+    return out
+
+
+def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) -> str:
+    title = "途中経過" if interim else "結果"
+    lines = [f":zap: 後追い取引の{title}（先行市場が動いた → GMO で成行、実際の板・手数料込み）"]
+    for r in results:
+        best = None
+        for (day, t, h), c in r.cells.items():
+            if h != holds[-1] or c.n < 20:
+                continue
+            if best is None or c.pnl > best[1].pnl:
+                best = ((day, t, h), c)
+        if best is None:
+            lines.append(f"  • {r.label}  取引がまだ少なく判定できません")
+            continue
+        (day, t, h), c = best
+        lines.append(
+            f"  • {r.label}  一番良いしきい {t:g}bps（{day}）: {h}秒で {c.bps():+.1f}bps"
+            f"  {c.pnl:+,.0f}円  {c.n}回  勝率 {c.wins / c.n:.0%}"
+        )
+    lines.append("  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
+    return "\n".join(lines)
