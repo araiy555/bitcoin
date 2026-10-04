@@ -98,3 +98,14 @@ async def test_the_command_follows_on_bitbank_from_a_live_recording(monkeypatch,
     line = next(x for x in capsys.readouterr().out.splitlines() if x.startswith("XRP_JPY(binance)"))
     # +18bps move bought at the ask, less 12bps each way at bitbank: a loss
     assert line.split("\t")[3] == "1" and line.split("\t")[4].startswith("-")
+
+
+def test_direction_counts_whether_the_slow_market_followed():
+    from jsboard.research.leadlag import direction
+
+    followed = direction(iter(tape(gmo_follows_at=105)), GMO, LEAD, label="x", thresholds=[10])
+    stayed = direction(iter(tape()), GMO, LEAD, label="x", thresholds=[10])
+    assert followed.signals[10] >= 1
+    d5 = followed.cells[(10, 5)]
+    assert d5.same == d5.n and d5.total_bps > 0
+    assert stayed.cells[(10, 5)].flat == stayed.cells[(10, 5)].n

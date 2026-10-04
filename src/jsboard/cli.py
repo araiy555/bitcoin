@@ -4197,7 +4197,15 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
 
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
-    from .research.leadlag import NOTE, analyse, header, slack_summary
+    from .research.leadlag import (
+        DIRECTION_NOTE,
+        NOTE,
+        analyse,
+        direction,
+        direction_header,
+        header,
+        slack_summary,
+    )
     from .sim.s3 import exists, list_parts, read_bytes
 
     root = args.path if args.path.endswith("/") else args.path + "/"
@@ -4214,7 +4222,7 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
         return 1
     thresholds = [float(x) for x in args.thresholds.split(",")]
     holds = [int(x) for x in args.holds.split(",")]
-    print(header(holds), flush=True)
+    print(direction_header() if args.direction else header(holds), flush=True)
     results = []
     for symbol in symbols:
         folder = f"{root}symbol={symbol}/"
@@ -4243,6 +4251,12 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
                         elif src == lead_name:
                             yield "lead", rx, event
 
+            if args.direction:
+                moved = direction(rows(), gmo, lead, label=f"{symbol}({lead_name})",
+                                  thresholds=thresholds, window_ms=args.window_ms)
+                for line in moved.rows(thresholds):
+                    print(line, flush=True)
+                continue
             result = analyse(
                 rows(), gmo, lead, label=f"{symbol}({lead_name})", thresholds=thresholds,
                 holds=holds, window_ms=args.window_ms, latency_ms=args.latency_ms,
@@ -4253,7 +4267,7 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
                 print(line, flush=True)
             results.append(result)
     print()
-    print(NOTE)
+    print(DIRECTION_NOTE if args.direction else NOTE)
     if args.slack and results:
         await _post_slack(slack_summary(results, holds, interim=args.interim))
     return 0
@@ -7580,6 +7594,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll.add_argument("--fee-bps", type=float, default=None,
                       help="遅れて動く側の成行手数料（省略時は録画の値。bitbank は 12）")
     p_ll.add_argument("--days", type=int, default=None, help="新しい方から何日分")
+    p_ll.add_argument("--direction", action="store_true",
+                      help="損益ではなく、合図のあと遅い側が同じ向き・逆向きのどちらに動いたかを数える")
     p_ll.add_argument("--thresholds", default="3,5,8,12,20", help="何bps 先に動いたら入るか")
     p_ll.add_argument("--holds", default="5,10,30,60", help="何秒持つか")
     p_ll.add_argument("--window-ms", type=float, default=1000.0)

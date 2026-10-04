@@ -80,8 +80,8 @@ def header(holds) -> str:
 
 
 NOTE = (
-    "しきい = 先行市場が GMO より何bps 先に動いたら入るか（直前の窓の中で）。\n"
-    "入りも出も GMO の録画した実際の板を、注文の量ぶん上から食った値段。手数料込み。\n"
+    "しきい = 先行市場が遅い側より何bps 先に動いたら入るか（直前の窓の中で）。\n"
+    "入りも出も遅い側の録画した実際の板を、注文の量ぶん上から食った値段。手数料込み。\n"
     "1つのしきいにつき同時に1取引だけ。日ごとに分けてあるので、1日目で選んだしきいを2日目で確かめる。"
 )
 
@@ -204,3 +204,122 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) ->
         )
     lines.append("  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
     return "\n".join(lines)
+
+
+DIRECTION_HORIZONS = (1, 5, 10, 30, 60)
+
+
+@dataclass
+class Direction:
+    same: int = 0
+    opposite: int = 0
+    flat: int = 0
+    total_bps: float = 0.0
+
+    @property
+    def n(self) -> int:
+        return self.same + self.opposite + self.flat
+
+
+@dataclass
+class DirectionResult:
+    label: str
+    signals: dict = field(default_factory=dict)
+    cells: dict = field(default_factory=dict)
+    """(threshold, horizon) -> Direction."""
+
+    def rows(self, thresholds) -> list[str]:
+        out = []
+        for t in thresholds:
+            cols = [self.label, f"{t:g}", f"{self.signals.get(t, 0):,}"]
+            for h in DIRECTION_HORIZONS:
+                d = self.cells.get((t, h), Direction())
+                if not d.n:
+                    cols += ["-", "-", "-", "-"]
+                    continue
+                cols += [f"{d.same / d.n:.0%}", f"{d.opposite / d.n:.0%}",
+                         f"{d.flat / d.n:.0%}", f"{d.total_bps / d.n:+.1f}"]
+            out.append("\t".join(cols))
+        return out
+
+
+def direction_header() -> str:
+    cols = ["銘柄(先行)", "しきいbps", "合図の数"]
+    for h in DIRECTION_HORIZONS:
+        cols += [f"{h}秒 同じ向き", f"{h}秒 逆向き", f"{h}秒 変わらず", f"{h}秒 平均bps"]
+    return "\t".join(cols)
+
+
+DIRECTION_NOTE = (
+    "合図 = 先行市場が直前1秒で、遅い側より しきいbps 以上先に動いた瞬間（1秒に1回まで）。\n"
+    "その後、遅い側の中値が合図と同じ向きに動いたか、逆か、変わらないか。手数料・約定値段は入れない。\n"
+    "平均bps は合図の向きを正にした中値の動き（プラスなら追随、マイナスなら逆戻り）。"
+)
+
+
+def direction(rows, follower: Instrument, lead: Instrument, *, label: str, thresholds,
+              window_ms: float = 1000.0) -> DirectionResult:
+    """Which way the slow market goes after the fast one moves first.
+
+    `rows` yields (source, receive_ns, event), source "gmo" (the slow
+    market, whichever venue) or "lead"."""
+    fo, ld = _Book(), _Book()
+    out = DirectionResult(label)
+    window = int(window_ms * 1e6)
+    lead_hist: deque = deque()
+    fo_hist: deque = deque()
+    next_ok = {t: -1 for t in thresholds}
+    tasks: list = []
+    seq = itertools.count()
+
+    def mid_of(book: _Book) -> float | None:
+        if book.best_bid is None or book.best_ask is None:
+            return None
+        return (book.best_bid + book.best_ask) / 2.0
+
+    def ago(hist: deque, now: int):
+        while len(hist) >= 2 and hist[1][0] <= now - window:
+            hist.popleft()
+        return hist[0][1] if hist and hist[0][0] <= now - window else None
+
+    def run_due(now: int) -> None:
+        while tasks and tasks[0][0] <= now:
+            _, _, t, h, sign, start = heapq.heappop(tasks)
+            m = mid_of(fo)
+            if m is None:
+                continue
+            move = sign * math.log(m / start) * 1e4
+            d = out.cells.setdefault((t, h), Direction())
+            if move > 1e-9:
+                d.same += 1
+            elif move < -1e-9:
+                d.opposite += 1
+            else:
+                d.flat += 1
+            d.total_bps += move
+
+    for src, rx, event in rows:
+        run_due(rx - 1)
+        if not isinstance(event, (DepthSnapshot, DepthDelta)):
+            continue
+        book, hist = (fo, fo_hist) if src == "gmo" else (ld, lead_hist)
+        book.apply(event)
+        m = mid_of(book)
+        if m is not None and (not hist or hist[-1][1] != m):
+            hist.append((rx, m))
+        lead_mid, fo_mid = mid_of(ld), mid_of(fo)
+        if src != "lead" or lead_mid is None or fo_mid is None:
+            continue
+        lead_then, fo_then = ago(lead_hist, rx), ago(fo_hist, rx)
+        if not lead_then or not fo_then:
+            continue
+        gap = (math.log(lead_mid / lead_then) - math.log(fo_mid / fo_then)) * 1e4
+        for t in thresholds:
+            if abs(gap) < t or rx < next_ok[t]:
+                continue
+            next_ok[t] = rx + window
+            out.signals[t] = out.signals.get(t, 0) + 1
+            sign = 1 if gap > 0 else -1
+            for h in DIRECTION_HORIZONS:
+                heapq.heappush(tasks, (rx + h * NS, next(seq), t, h, sign, fo_mid))
+    return out
