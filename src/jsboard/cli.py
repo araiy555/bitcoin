@@ -3922,6 +3922,129 @@ async def cmd_verdict(args: argparse.Namespace) -> int:
     return 0 if passed else (3 if not enough else 2)
 
 
+PAIR_COINS = {"xrp": "xrp_jpy", "eth": "eth_jpy", "ltc": "ltc_jpy", "bch": "bcc_jpy"}
+"""bitbank's pair for each coin GMO lets us short without a taker fee."""
+
+
+async def cmd_pairrecord(args: argparse.Namespace) -> int:
+    """Record bitbank's book and GMO's leverage book for the same coins at once.
+
+    One file per coin with both venues on one receive-time clock, so a
+    bitbank fill can be hedged against the GMO book as it stood a moment
+    later. Fees and GMO's smallest order go into the spec. No orders.
+    """
+    import asyncio as _asyncio
+    from types import SimpleNamespace
+
+    from .research.daily import Target
+    from .research.jpscan import bitbank_books, gmo_books
+
+    coins = [c.strip().lower() for c in args.coins.split(",") if c.strip()]
+    async with make_session() as session:
+        bb_fees = bitbank_books(await _get_json(session, BITBANK_PAIRS_URL))
+        gmo_rules = (await _get_json(session, GMO_SYMBOLS_URL)).get("data") or []
+    gm_fees = gmo_books({"data": gmo_rules})
+    gm_min = {r["symbol"]: r.get("minOrderSize", "0") for r in gmo_rules}
+    workdir = Path(args.workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    runs, watched = [], []
+    for coin in coins:
+        bb_symbol = PAIR_COINS.get(coin, f"{coin}_jpy")
+        gm_symbol = f"{coin.upper()}_JPY"
+        try:
+            bb_inst, bb_feed = await _live_book(Target("bitbank", bb_symbol))
+            gm_inst, gm_feed = await _live_book(Target("gmo", gm_symbol))
+        except Exception as exc:  # noqa: BLE001 - one missing book must not stop the rest
+            console.print(f"[yellow]{coin}: 録画できません ({exc})[/yellow]")
+            continue
+        specs = {
+            "bitbank": {**_spec_dict(bb_inst, "spot"), "venue": "bitbank",
+                        "maker_bps": bb_fees[bb_symbol].maker_bps,
+                        "taker_bps": bb_fees[bb_symbol].taker_bps},
+            "gmo": {**_spec_dict(gm_inst, "leverage"), "venue": "gmo",
+                    "maker_bps": gm_fees[gm_symbol].maker_bps,
+                    "taker_bps": gm_fees[gm_symbol].taker_bps,
+                    "min_order": str(gm_min.get(gm_symbol, "0"))},
+        }
+        out = workdir / f"pair-{coin}.jsonl"
+        meta = write_meta(out, specs)
+        sink = RotatingJsonlSink(
+            path=out, target=S3Target(bucket=args.s3_bucket, prefix=args.s3_prefix),
+            symbol=gm_symbol, rotate_seconds=args.rotate_minutes * 60.0,
+        )
+        sink.upload_meta(meta)
+        capture = MultiCapture({"bitbank": bb_feed, "gmo": gm_feed}, out, sink=sink)
+        runs.append(capture.run(duration_s=args.hours * 3600))
+        watched.append((SimpleNamespace(label=f"{bb_symbol} + GMO {gm_symbol}"), capture, sink))
+    if not runs:
+        console.print("[red]録画できる銘柄がありません。[/red]")
+        return 1
+    text = (f":movie_camera: 同時録画を始めました（{args.hours:g}時間、注文は出しません）: "
+            + ", ".join(t.label for t, _, _ in watched))
+    console.print(text)
+    if args.slack:
+        await _post_slack(text)
+    tasks = [_asyncio.create_task(r) for r in runs]
+    pending = set(tasks)
+    while pending:
+        _, pending = await _asyncio.wait(pending, timeout=args.log_every)
+        console.print(_autorecord_status(watched))
+    return 0
+
+
+async def cmd_hedgeedge(args: argparse.Namespace) -> int:
+    """Every pair recording under a folder: bitbank maker fills hedged on GMO."""
+    import re
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.hedgeedge import HEADER, NOTE, analyse, slack_summary
+    from .sim.s3 import exists, list_parts, read_bytes
+
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    symbols: set = set()
+    for uri in list_parts(root):
+        m = re.search(r"symbol=([^/]+)/date=", uri)
+        if m:
+            symbols.add(m[1])
+    if args.only:
+        wanted = {x.strip().upper() for x in args.only.split(",")}
+        symbols = {s for s in symbols if s in wanted}
+    if not symbols:
+        console.print(f"[red]{root} に同時録画がありません。[/red]")
+        return 1
+    print(HEADER, flush=True)
+    results = []
+    for symbol in sorted(symbols):
+        folder = f"{root}symbol={symbol}/"
+        meta = f"{folder}meta.json"
+        specs = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+        if "bitbank" not in specs or "gmo" not in specs:
+            print(f"{symbol}\t両方の板がない録画なので飛ばしました", flush=True)
+            continue
+        maker, hedge = (_instrument_from_spec(specs[k]) for k in ("bitbank", "gmo"))
+
+        def rows(folder=folder):
+            for src, rx, event in iter_tagged_timed(folder):
+                if not isinstance(event, _Status) and src in ("bitbank", "gmo"):
+                    yield src, rx, event
+
+        result = analyse(
+            rows(), maker, hedge, label=f"{maker.symbol}→GMO {hedge.symbol}",
+            rebate_bps=-float(specs["bitbank"].get("maker_bps", -2.0)),
+            hedge_fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
+            hedge_min=float(specs["gmo"].get("min_order", 0) or 0),
+            size_jpy=args.size_jpy, latency_ms=args.latency_ms,
+        )
+        print(result.row(), flush=True)
+        results.append(result)
+    print()
+    print(NOTE)
+    if args.slack and results:
+        await _post_slack(slack_summary(results))
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -7153,6 +7276,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_vd.add_argument("--min-prints", type=int, default=100, help="判定に要る市場の約定数")
     p_vd.add_argument("--min-fills", type=int, default=20, help="判定に要る検証の約定数")
     p_vd.set_defaults(func=cmd_verdict)
+
+    p_pr2 = sub.add_parser("pairrecord", help="bitbank と GMO（レバレッジ）の板を同時に録画する（注文なし）")
+    p_pr2.add_argument("--coins", default="xrp,eth,ltc,bch")
+    p_pr2.add_argument("--hours", type=float, default=24.0)
+    p_pr2.add_argument("--s3-bucket", required=True)
+    p_pr2.add_argument("--s3-prefix", default="raw/pair")
+    p_pr2.add_argument("--rotate-minutes", type=float, default=5.0)
+    p_pr2.add_argument("--workdir", default="/var/lib/jsboard/pairrecord")
+    p_pr2.add_argument("--log-every", type=float, default=60.0)
+    p_pr2.add_argument("--slack", action="store_true")
+    p_pr2.set_defaults(func=cmd_pairrecord)
+
+    p_he = sub.add_parser("hedgeedge", help="bitbank の約定を GMO の実際の板でヘッジした損益（上限）")
+    p_he.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
+    p_he.add_argument("--size-jpy", type=float, default=10_000.0, help="1回の注文の大きさ（円）")
+    p_he.add_argument("--latency-ms", type=float, default=200.0, help="約定からヘッジまでの遅れ")
+    p_he.add_argument("--only", default=None, help="この銘柄だけ（例: XRP_JPY）")
+    p_he.add_argument("--slack", action="store_true")
+    p_he.set_defaults(func=cmd_hedgeedge)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
     p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")
