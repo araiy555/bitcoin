@@ -4201,8 +4201,11 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
     from .sim.s3 import exists, list_parts, read_bytes
 
     root = args.path if args.path.endswith("/") else args.path + "/"
-    symbols = sorted({m[1] for uri in list_parts(root)
-                      if (m := re.search(r"symbol=([^/]+)/date=", uri))})
+    dates: dict[str, set] = {}
+    for uri in list_parts(root):
+        if m := re.search(r"symbol=([^/]+)/date=(\d{4}-\d{2}-\d{2})/", uri):
+            dates.setdefault(m[1], set()).add(m[2])
+    symbols = sorted(dates)
     if args.only:
         wanted = {x.strip().upper() for x in args.only.split(",")}
         symbols = [s for s in symbols if s in wanted]
@@ -4217,28 +4220,34 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
         folder = f"{root}symbol={symbol}/"
         meta = f"{folder}meta.json"
         specs = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
-        if "gmo" not in specs:
+        follower = args.follower
+        if follower not in specs:
             continue
-        gmo = _instrument_from_spec(specs["gmo"])
+        gmo = _instrument_from_spec(specs[follower])
+        fee = (args.fee_bps if args.fee_bps is not None
+               else float(specs[follower].get("taker_bps", 12.0 if follower == "bitbank" else 0.0)))
         for lead_name in [x.strip() for x in args.leads.split(",")]:
             if lead_name not in specs:
                 continue
             lead = _instrument_from_spec(specs[lead_name])
 
-            def rows(folder=folder, lead_name=lead_name):
-                for src, rx, event in iter_tagged_timed(folder):
-                    if isinstance(event, _Status):
-                        continue
-                    if src == "gmo":
-                        yield "gmo", rx, event
-                    elif src == lead_name:
-                        yield "lead", rx, event
+            days = sorted(dates[symbol])[-args.days:] if args.days else sorted(dates[symbol])
+
+            def rows(folder=folder, lead_name=lead_name, days=days, follower=follower):
+                for day in days:
+                    for src, rx, event in iter_tagged_timed(f"{folder}date={day}/"):
+                        if isinstance(event, _Status):
+                            continue
+                        if src == follower:
+                            yield "gmo", rx, event
+                        elif src == lead_name:
+                            yield "lead", rx, event
 
             result = analyse(
                 rows(), gmo, lead, label=f"{symbol}({lead_name})", thresholds=thresholds,
                 holds=holds, window_ms=args.window_ms, latency_ms=args.latency_ms,
-                size_jpy=args.size_jpy, fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
-                min_order=float(specs["gmo"].get("min_order", 0) or 0),
+                size_jpy=args.size_jpy, fee_bps=fee,
+                min_order=float(specs[follower].get("min_order", 0) or 0),
             )
             for line in result.rows(holds):
                 print(line, flush=True)
@@ -7567,6 +7576,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll = sub.add_parser("leadlag", help="先行市場が動いたら GMO で後追いした損益（実際の板・手数料込み）")
     p_ll.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
     p_ll.add_argument("--leads", default="bybit,binance")
+    p_ll.add_argument("--follower", default="gmo", help="遅れて動く側（gmo または bitbank）")
+    p_ll.add_argument("--fee-bps", type=float, default=None,
+                      help="遅れて動く側の成行手数料（省略時は録画の値。bitbank は 12）")
+    p_ll.add_argument("--days", type=int, default=None, help="新しい方から何日分")
     p_ll.add_argument("--thresholds", default="3,5,8,12,20", help="何bps 先に動いたら入るか")
     p_ll.add_argument("--holds", default="5,10,30,60", help="何秒持つか")
     p_ll.add_argument("--window-ms", type=float, default=1000.0)
