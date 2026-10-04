@@ -55,7 +55,13 @@ class RiskLimits:
     max_notional: float = 250_000.0
     max_drawdown: float = 2_000.0
     max_book_age_ms: float = 2_000.0
-    max_spread_ticks: int = 100
+    max_spread_ticks: int = 0
+    """A cap in ticks; 0 leaves only the cap in bps below. A tick is a
+    different share of the price on every book: 100 ticks is 27bps on ADA
+    at 37 yen and 2,500bps on a coin at 4 yen, so a tick cap set on one
+    book stopped another from ever quoting."""
+    max_spread_bps: float = 300.0
+    """Wider than this (3%) the book is dislocated, not merely thin."""
     max_sigma_bps: float = 25.0
     """Per-update realised vol that counts as a dislocation. In bps so the
     limit means the same thing regardless of tick size or price level."""
@@ -108,8 +114,17 @@ class RiskManager:
             return RiskDecision(RiskAction.PULL, "book too thin to quote", frozenset())
 
         spread = snap.spread
-        if spread is None or spread > lim.max_spread_ticks:
-            return RiskDecision(RiskAction.PULL, f"spread {spread} ticks is dislocated", frozenset())
+        mid = market.mid
+        if spread is None or not mid:
+            return RiskDecision(RiskAction.PULL, "no two-sided book", frozenset())
+        spread_bps = spread / mid * 1e4
+        if (lim.max_spread_ticks and spread > lim.max_spread_ticks) or (
+            lim.max_spread_bps and spread_bps > lim.max_spread_bps
+        ):
+            return RiskDecision(
+                RiskAction.PULL, f"spread {spread} ticks ({spread_bps:,.0f}bps) is dislocated",
+                frozenset(),
+            )
 
         sigma_bps = market.vol.bps
         if lim.max_sigma_bps > 0 and sigma_bps > lim.max_sigma_bps:
