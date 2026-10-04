@@ -1,0 +1,13 @@
+[Unit]
+Description=jsboard: check every bitbank pair from its published executions and post the passes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+# Print each line as it is written, so journalctl shows progress live.
+Environment=PYTHONUNBUFFERED=1
+Nice=19
+ExecStart=/opt/jsboard/venv/bin/jsboard tradeedge --days 14 --slack

@@ -1,0 +1,11 @@
+[Unit]
+Description=jsboard: every bitbank pair checked daily at 12:10 JST
+
+[Timer]
+# bitbank publishes a day's executions some hours after it ends (JST), so
+# the check runs at midday rather than just after midnight.
+OnCalendar=*-*-* 03:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

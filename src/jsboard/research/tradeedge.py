@@ -127,3 +127,20 @@ NOTE = (
     "速さも並び順も最高だった場合の上限。ここがマイナスなら、どうやっても勝てない。\n"
     f"合格 = 60秒後がプラス、かつ {PASS_SHARE:.0%} 以上の日でプラス。"
 )
+
+
+def slack_summary(ranked: list[PairEdge], days: int, span: str) -> str:
+    """The day's answer in a few lines: which pairs pass, and by how much."""
+    passed = [e for e in ranked if e.passed]
+    head = f":mag: bitbank 全{len(ranked)}銘柄の毎日チェック（{span}、{days}日分）"
+    if not passed:
+        return f"{head}\n  合格: なし（どの銘柄も、板に注文を置く側がもうかっていません）"
+    lines = [head, f"  合格 {len(passed)}銘柄（上限なので、本番で勝てるとは限りません）:"]
+    for e in passed:
+        n = sum(d.n for d in e.days)
+        hours = sum(d.hours for d in e.days)
+        lines.append(
+            f"  • {e.pair}  60秒後 {e.bps(60):+.1f}bps  プラスの日 {e.good_days}/{e.counted_days}"
+            f"  約定 {n / hours if hours else 0:,.0f}件/時"
+        )
+    return "\n".join(lines)

@@ -3764,7 +3764,7 @@ async def cmd_tradeedge(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime, timedelta, timezone
 
     from .research.jpscan import bitbank_books
-    from .research.tradeedge import HEADER, NOTE, PairEdge, day_edge, parse
+    from .research.tradeedge import HEADER, NOTE, PairEdge, day_edge, parse, slack_summary
 
     jst = timezone(timedelta(hours=9))
     today = datetime.now(UTC).astimezone(jst).date()
@@ -3807,6 +3807,8 @@ async def cmd_tradeedge(args: argparse.Namespace) -> int:
     passed = [e.pair for e in ranked if e.passed]
     print(f"合格: {', '.join(passed) if passed else 'なし'}")
     print(NOTE)
+    if args.slack:
+        await _post_slack(slack_summary(ranked, args.days, f"{days[0]}〜{days[-2]}"))
     return 0
 
 
@@ -7151,6 +7153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")
     p_te.add_argument("--only", default=None, help="この銘柄だけ（例: ada_jpy,xrp_jpy）")
     p_te.add_argument("--pause", type=float, default=0.2, help="取得の間隔（秒）")
+    p_te.add_argument("--slack", action="store_true", help="合格した銘柄だけ Slack に送る")
     p_te.set_defaults(func=cmd_tradeedge)
 
     p_pe = sub.add_parser("printedge", help="すべての約定の反対側にいたら、いくらもうかったか（勝てる上限）")

@@ -55,3 +55,15 @@ async def test_the_command_ranks_every_pair(monkeypatch, capsys):
     assert await args.func(args) == 0
     out = capsys.readouterr().out
     assert "合格: ada_jpy, xrp_jpy" in out and "60秒がプラスの日" in out
+
+
+def test_the_slack_line_names_only_the_passes():
+    from jsboard.research.tradeedge import slack_summary
+
+    good = PairEdge("oas_jpy", 2.0, [day_edge(parse(rows(
+        [(i * 4_000, "sell" if i % 2 else "buy", 99.9 if i % 2 else 100.1) for i in range(2_000)])), [])])
+    bad = PairEdge("btc_jpy", 0.0, [day_edge(parse(rows(
+        [(i * 5_000, "sell", 100.0 - i * 0.01) for i in range(2_000)])), [])])
+    text = slack_summary([good, bad], 14, "2026-09-20〜2026-10-03")
+    assert "全2銘柄" in text and "oas_jpy" in text and "btc_jpy" not in text
+    assert "合格: なし" in slack_summary([bad], 14, "x")
