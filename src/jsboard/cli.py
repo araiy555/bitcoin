@@ -3656,6 +3656,8 @@ async def cmd_livesim(args: argparse.Namespace) -> int:
             print(f"\n=== 損益の中身（{shown or '設定どおり'}） ===")
             print(single([from_trade(t) for t in sim.all_trades], mids,
                          since or mids.ts[0], min(until or mids.ts[-1], mids.ts[-1])))
+            print(f"注文数\t{result.counts.get('orders', 0):,}")
+            print(f"判断の内訳\t{result.decision_text()}")
             print(flush=True)
         if live_fills is not None and mids.ts:
             print(f"\n=== 本番と検証の比較（{shown or '設定どおり'}） ===")
@@ -3911,6 +3913,9 @@ async def cmd_verdict(args: argparse.Namespace) -> int:
            f"\n  約定が少なすぎて判定できません（市場 {args.min_prints}件・検証 {args.min_fills}回は必要）。"
            if not enough else "\n  どちらかがマイナスなので不合格です。")
     )
+    if replay.fills == 0:
+        text += (f"\n  検証で出した注文 {replay.counts.get('orders', 0):,}回。"
+                 f"判断の内訳: {replay.decision_text(3)}")
     console.print(text)
     if args.slack:
         await _post_slack(text)

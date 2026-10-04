@@ -31,6 +31,7 @@ checked against the live result before it is trusted with a new idea.
 from __future__ import annotations
 
 import random
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -312,6 +313,16 @@ class LiveSimResult:
     stopped: str = ""
     start_jpy: Decimal = Decimal(0)
     end_value: float = 0.0
+    decisions: dict = field(default_factory=dict)
+    """Why the maker did what it did at each book update, by count: the
+    first thing to read when a replay places no orders."""
+
+    def decision_text(self, top: int = 4) -> str:
+        total = sum(self.decisions.values())
+        if not total:
+            return "-"
+        rows = sorted(self.decisions.items(), key=lambda kv: -kv[1])[:top]
+        return "  ".join(f"{k} {v / total:.0%}" for k, v in rows)
 
     @property
     def doomed_pct(self) -> float:
@@ -352,6 +363,7 @@ async def run_livesim(
     from ..live.venue import DONE, LiveVenue
 
     venue = LiveVenue(mm.instrument, quote_balance=sim.jpy, base_balance=sim.coin)
+    decisions: dict[str, int] = {}
     mm.venue = venue
     start_coin = sim.coin
     health, breaker = Health(), Breaker(move_pct=breaker_pct)
@@ -421,6 +433,11 @@ async def run_livesim(
         sim.touch(mm.market.book.best_bid(), mm.market.book.best_ask())
         if not venue.blocked:
             mm.requote()
+            # Numbers vary between updates ("toxicity +0.42"); keep the words.
+            key = re.sub(r"[-+]?\d[\d,.]*", "#", mm.stats.last_decision or "-")[:60]
+        else:
+            key = f"停止中: {venue.blocked}"
+        decisions[key] = decisions.get(key, 0) + 1
         venue.forget_done()
         if health.fatal:
             stopped = health.fatal
@@ -438,4 +455,5 @@ async def run_livesim(
         pnl=s["total"], fills=int(s["fills"]), doomed=venue.doomed_fills,
         refused=venue.post_only_refused, volume=s.get("volume", 0.0),
         counts=dict(sim.counts), stopped=stopped, end_value=end_value,
+        decisions=decisions,
     )
