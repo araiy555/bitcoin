@@ -271,6 +271,11 @@ def slack_summary(results: list[HedgeResult], interim: bool = False) -> str:
     for r in results:
         h60 = r.horizons[60]
         verdict = "仮合格" if r.passed else ("判定保留（データ不足）" if r.hedged < 100 else "不合格")
+        if not r.hedged:
+            why = (f"GMO の最小注文より小さい約定 {r.too_small:,}件" if r.too_small
+                   else "約定が届いていません")
+            lines.append(f"  • {r.label}  {verdict}  ヘッジ 0回（{why}）  録画 {r.hours:.1f}時間")
+            continue
         lines.append(
             f"  • {r.label}  {verdict}  60秒 {h60.bps():+.1f}bps（{h60.pnl:+,.0f}円）"
             f"  ヘッジ {r.hedged:,}回  GMO片道 {r.open_cost_bps:.1f}bps  録画 {r.hours:.1f}時間"
