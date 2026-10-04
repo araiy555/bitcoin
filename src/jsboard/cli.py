@@ -4250,6 +4250,53 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_arbedge(args: argparse.Namespace) -> int:
+    """bitbank against GMO on the pair recordings: trade only when they part."""
+    import re
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.arbedge import HEADER, NOTE, analyse
+    from .sim.s3 import exists, list_parts, read_bytes
+
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    symbols = sorted({m[1] for uri in list_parts(root)
+                      if (m := re.search(r"symbol=([^/]+)/date=", uri))})
+    if args.only:
+        wanted = {x.strip().upper() for x in args.only.split(",")}
+        symbols = [s for s in symbols if s in wanted]
+    if not symbols:
+        console.print(f"[red]{root} に同時録画がありません。[/red]")
+        return 1
+    print(HEADER, flush=True)
+    for symbol in symbols:
+        folder = f"{root}symbol={symbol}/"
+        meta = f"{folder}meta.json"
+        specs = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+        if "bitbank" not in specs or "gmo" not in specs:
+            continue
+
+        def rows(folder=folder):
+            for src, rx, event in iter_tagged_timed(folder):
+                if not isinstance(event, _Status):
+                    yield src, rx, event
+
+        result = analyse(
+            rows(), _instrument_from_spec(specs["bitbank"]), _instrument_from_spec(specs["gmo"]),
+            label=symbol, size_jpy=args.size_jpy,
+            bb_fee_bps=float(specs["bitbank"].get("taker_bps", 12.0)),
+            gm_fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
+            gm_min=float(specs["gmo"].get("min_order", 0) or 0),
+            thresholds=[float(x) for x in args.thresholds.split(",")],
+            target_bps=args.target_bps, max_hold_s=args.max_hold_h * 3600,
+        )
+        for line in result.rows():
+            print(line, flush=True)
+    print()
+    print(NOTE)
+    return 0
+
+
 BITBANK_PAIRS_URL = "https://api.bitbank.cc/v1/spot/pairs"
 GMO_SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols"
 
@@ -7529,6 +7576,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll.add_argument("--slack", action="store_true")
     p_ll.add_argument("--interim", action="store_true")
     p_ll.set_defaults(func=cmd_leadlag)
+
+    p_ar = sub.add_parser("arbedge", help="bitbank と GMO の値段の差が手数料を超えたときだけ取引した損益")
+    p_ar.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
+    p_ar.add_argument("--thresholds", default="5,10,20", help="差が何bps 以上で開くか（手数料込み）")
+    p_ar.add_argument("--target-bps", type=float, default=2.0, help="往復で何bps 取れたら閉じるか")
+    p_ar.add_argument("--max-hold-h", type=float, default=4.0, help="何時間で強制的に閉じるか")
+    p_ar.add_argument("--size-jpy", type=float, default=10_000.0)
+    p_ar.add_argument("--only", default=None)
+    p_ar.set_defaults(func=cmd_arbedge)
 
     p_te = sub.add_parser("tradeedge", help="bitbank の全銘柄を、公開されている約定履歴で調べる（勝てる上限）")
     p_te.add_argument("--days", type=int, default=14, help="何日分（日本時間、昨日まで）")
