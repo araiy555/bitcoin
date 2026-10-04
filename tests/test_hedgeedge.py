@@ -109,5 +109,36 @@ async def test_the_command_reads_a_pair_recording(monkeypatch, capsys):
         ["hedgeedge", "s3://b/raw/pair/", "--size-jpy", "1000", "--slack"])
     assert await args.func(args) == 0
     out = capsys.readouterr().out
-    assert "xrp_jpy→GMO XRP_JPY" in out and "60秒bps" in out
+    assert "xrp_jpy→GMO 全約定" in out and "板連動3bps" in out and "60秒bps" in out
     assert "判定保留" in posted[0]  # one hedge is far too few to judge
+
+
+def quoted(gmo_bid, print_price, moved=None, margin=0.0):
+    """GMO bid at 100.00 from t=0; bitbank 99.9/100.1; a seller prints at
+    `print_price` at t=10s. `moved` replaces GMO's bid at 9.5s."""
+    rows = [("bitbank", 0, book([(99_900, 10**6)], [(100_100, 10**6)], 0)),
+            ("gmo", 0, book([(gmo_bid, 50)], [(gmo_bid + 100, 50)], 0))]
+    after = (99_900, 100_100)
+    if moved:  # both venues fall; bitbank's book follows GMO's
+        t = 9_500_000_000
+        rows.append(("gmo", t, book([(moved, 50)], [(moved + 100, 50)], t)))
+        after = (moved - 100, moved + 100)
+        rows.append(("bitbank", t, book([(after[0], 10**6)], [(after[1], 10**6)], t)))
+    rows.append(("bitbank", 10 * NS, TradeTick(print_price, 100_000, Side.SELL, 1, 10 * NS)))
+    for t in range(11, 400):
+        rows.append(("bitbank", t * NS, book([(after[0], 10**6)], [(after[1], 10**6)], t * NS)))
+    return run(rows, quote_margin_bps=margin)
+
+
+def test_quoting_from_gmo_fills_only_prints_that_reach_the_quote():
+    # GMO bid 99.80 -> our bitbank bid 99.80; a print at 99.90 never reaches it.
+    assert quoted(99_800, 99_900).hedged == 0
+    assert quoted(99_800, 99_800).hedged == 1
+
+
+def test_a_stale_quote_is_picked_off_when_gmo_moves_first():
+    calm = quoted(100_000, 99_900)
+    # GMO drops at 9.5s; our bid, set from GMO a second earlier, is still 100.0.
+    picked = quoted(100_000, 98_900, moved=99_000)
+    assert picked.hedged == 1
+    assert picked.horizons[60].pnl < calm.horizons[60].pnl

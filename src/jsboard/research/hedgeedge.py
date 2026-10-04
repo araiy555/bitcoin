@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import math
+from collections import deque
 from dataclasses import dataclass, field
 
 from ..core.market import MarketView
@@ -91,7 +93,7 @@ HEADER = "\t".join([
 NOTE = (
     "bitbank の全約定で自分がメイカーだった場合の上限（並び順・速さは最高）。\n"
     "ヘッジは GMO の録画した実際の板を、指定量ぶん上から食った値段（中値・最終値は使わない）。\n"
-    "bps と円は、bitbank リベート・GMO 手数料・GMO の板食い込み・ヘッジまでの遅れ込みの最終損益。"
+    "bps と円は、bitbank リベート・GMO 手数料・GMO の板食い込み・ヘッジまでの遅れ込みの最終損益。\n「板連動」は GMO の1秒前の板から bitbank の値段を決めた場合（古い値段で当たる分も込み）。"
 )
 
 
@@ -118,14 +120,51 @@ class _Fill:
 
 def analyse(rows, maker: Instrument, hedge: Instrument, *, label: str,
             rebate_bps: float, hedge_fee_bps: float, size_jpy: float,
-            hedge_min: float = 0.0, latency_ms: float = 200.0, depth: int = 100) -> HedgeResult:
-    """`rows` yields (source, receive_ns, event), source "bitbank" or "gmo"."""
+            hedge_min: float = 0.0, latency_ms: float = 200.0, depth: int = 100,
+            quote_margin_bps: float | None = None, quote_delay_ms: float = 1000.0) -> HedgeResult:
+    """`rows` yields (source, receive_ns, event), source "bitbank" or "gmo".
+
+    With `quote_margin_bps` the maker no longer takes every print at its
+    price. It quotes on bitbank from GMO's book: a bid `margin` below GMO's
+    best bid, an ask `margin` above GMO's best ask, so a fill can be sold
+    back on GMO at a known profit. The quote follows GMO only as fast as
+    orders can be replaced, so it is set from GMO's book `quote_delay_ms`
+    earlier (bitbank's cancels took about a second): when GMO moves, the
+    old quote stays out and gets picked off, as it would. A bid at or
+    above bitbank's best ask could not rest (post-only), so it is pulled
+    back one tick inside. A print fills the quote when it trades at or
+    through its price, at the quote's price.
+    """
     bb, gm = MarketView(instrument=maker, depth=depth), MarketView(instrument=hedge, depth=depth)
     out = HedgeResult(label)
     tasks: list = []
     seq = itertools.count()
     first = last = None
     lat = int(latency_ms * 1e6)
+    delay = int(quote_delay_ms * 1e6)
+    gmo_tops: deque = deque()  # (receive_ns, best bid yen, best ask yen)
+    bb_tops: deque = deque()   # (receive_ns, best bid tick, best ask tick)
+    tick = float(maker.tick_size)
+
+    def as_of(tops: deque, t: int):
+        while len(tops) >= 2 and tops[1][0] <= t:
+            tops.popleft()
+        return tops[0] if tops and tops[0][0] <= t else None
+
+    def quote_at(t: int):
+        """Our bitbank (bid, ask) in yen, as set `delay` before `t` from
+        GMO's book and kept post-only against bitbank's book of then."""
+        g, b = as_of(gmo_tops, t - delay), as_of(bb_tops, t - delay)
+        if g is None or b is None:
+            return None
+        _, gb, ga = g
+        _, best_bid, best_ask = b
+        m = quote_margin_bps / 1e4
+        bid = math.floor(gb * (1 - m) / tick + 1e-9) * tick
+        ask = math.ceil(ga * (1 + m) / tick - 1e-9) * tick
+        bid = min(bid, (best_ask - 1) * tick)
+        ask = max(ask, (best_bid + 1) * tick)
+        return bid, ask
 
     def run_due(now: int) -> None:
         while tasks and tasks[0][0] <= now:
@@ -187,20 +226,36 @@ def analyse(rows, maker: Instrument, hedge: Instrument, *, label: str,
         if src == "gmo":
             if isinstance(event, (DepthSnapshot, DepthDelta)):
                 gm.apply(event)
+                gb, ga = gm.book.best_bid(), gm.book.best_ask()
+                if quote_margin_bps is not None and gb is not None and ga is not None:
+                    htick = float(hedge.tick_size)
+                    gmo_tops.append((rx, gb * htick, ga * htick))
             continue
         if isinstance(event, TradeTick):
             out.prints += 1
             price = maker.price_f(event.price)
+            sign = 1 if event.aggressor is Side.SELL else -1  # a seller hit our bid
+            if quote_margin_bps is not None:
+                quote = quote_at(rx)
+                if quote is None:
+                    out.no_book += 1
+                    continue
+                ours = quote[0] if sign > 0 else quote[1]
+                if (price > ours + 1e-12) if sign > 0 else (price < ours - 1e-12):
+                    continue  # the print did not reach our quote
+                price = ours
             qty = min(maker.qty_f(event.qty), size_jpy / price)
             step = float(hedge.lot_size)
             qty = int(qty / step + 1e-9) * step
             if qty <= 0 or qty < hedge_min:
                 out.too_small += 1
                 continue
-            sign = 1 if event.aggressor is Side.SELL else -1  # a seller hit our bid
             heapq.heappush(tasks, (rx + lat, next(seq), "open", _Fill(sign, price, qty), 0))
         elif isinstance(event, (DepthSnapshot, DepthDelta)):
             bb.apply(event)
+            bb_bid, bb_ask = bb.book.best_bid(), bb.book.best_ask()
+            if quote_margin_bps is not None and bb_bid is not None and bb_ask is not None:
+                bb_tops.append((rx, bb_bid, bb_ask))
     if out._open_notional:
         out.open_cost_bps /= out._open_notional
     if out._close_notional:

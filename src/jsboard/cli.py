@@ -4029,15 +4029,20 @@ async def cmd_hedgeedge(args: argparse.Namespace) -> int:
                 if not isinstance(event, _Status) and src in ("bitbank", "gmo"):
                     yield src, rx, event
 
-        result = analyse(
-            rows(), maker, hedge, label=f"{maker.symbol}→GMO {hedge.symbol}",
-            rebate_bps=-float(specs["bitbank"].get("maker_bps", -2.0)),
-            hedge_fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
-            hedge_min=float(specs["gmo"].get("min_order", 0) or 0),
-            size_jpy=args.size_jpy, latency_ms=args.latency_ms,
-        )
-        print(result.row(), flush=True)
-        results.append(result)
+        modes = [None] + [float(m) for m in (args.quote_margins or "").split(",") if m.strip()]
+        for margin in modes:
+            name = (f"{maker.symbol}→GMO 全約定" if margin is None
+                    else f"{maker.symbol}→GMO 板連動{margin:g}bps")
+            result = analyse(
+                rows(), maker, hedge, label=name,
+                rebate_bps=-float(specs["bitbank"].get("maker_bps", -2.0)),
+                hedge_fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
+                hedge_min=float(specs["gmo"].get("min_order", 0) or 0),
+                size_jpy=args.size_jpy, latency_ms=args.latency_ms,
+                quote_margin_bps=margin, quote_delay_ms=args.quote_delay_ms,
+            )
+            print(result.row(), flush=True)
+            results.append(result)
     print()
     print(NOTE)
     if args.slack and results:
@@ -7293,6 +7298,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_he.add_argument("--size-jpy", type=float, default=10_000.0, help="1回の注文の大きさ（円）")
     p_he.add_argument("--latency-ms", type=float, default=200.0, help="約定からヘッジまでの遅れ")
     p_he.add_argument("--only", default=None, help="この銘柄だけ（例: XRP_JPY）")
+    p_he.add_argument("--quote-margins", default="0,3",
+                      help="GMO の板から bitbank の値段を決める型も試す（GMO より何bps 有利に置くか）")
+    p_he.add_argument("--quote-delay-ms", type=float, default=1000.0,
+                      help="bitbank の注文が GMO に追いつくまでの遅れ（取消しが約1秒）")
     p_he.add_argument("--slack", action="store_true")
     p_he.add_argument("--interim", action="store_true", help="Slack の見出しを「途中経過」にする")
     p_he.set_defaults(func=cmd_hedgeedge)
