@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 User=jsboard
 EnvironmentFile=/etc/jsboard.env
+# Print each line as it is written, so journalctl shows progress live.
+Environment=PYTHONUNBUFFERED=1
 StateDirectory=jsboard
 ExecStart=/opt/jsboard/capture.sh %i
 Restart=always

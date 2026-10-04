@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 User=jsboard
 EnvironmentFile=/etc/jsboard.env
+# Print each line as it is written, so journalctl shows progress live.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/jsboard/venv/bin/jsboard paper --target %i --slack --log-every 300 --s3-bucket ${JSBOARD_BUCKET}
 Restart=always
 RestartSec=30
