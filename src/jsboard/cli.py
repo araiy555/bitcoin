@@ -3822,10 +3822,21 @@ async def _printedge_chances(args, root: str, dates: dict) -> int:
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
     from .research.daily import MAKER_BPS
-    from .research.printedge import CHANCE_HEADER, CHANCE_NOTE, ChanceSummary, collect
+    from .research.printedge import (
+        CHANCE_HEADER,
+        CHANCE_NOTE,
+        ROUNDTRIP_HEADER,
+        ROUNDTRIP_NOTE,
+        ChanceSummary,
+        RoundTrip,
+        collect,
+        roundtrips,
+    )
     from .sim.s3 import exists, read_bytes
 
     levels = tuple(float(x) for x in args.chance.split(","))
+    waits = [float(x) for x in args.roundtrip.split(",")] if args.roundtrip else []
+    trip_lines: list[str] = []
     print(CHANCE_HEADER, flush=True)
     for symbol in sorted(dates):
         meta = f"{root}symbol={symbol}/meta.json"
@@ -3836,6 +3847,7 @@ async def _printedge_chances(args, root: str, dates: dict) -> int:
         inst = _instrument_from_spec(sources[maker])
         lead_inst = _instrument_from_spec(sources[args.lead_source])
         summary = ChanceSummary(f"{maker}:{inst.symbol}", -MAKER_BPS[maker], levels)
+        trips = [RoundTrip(x, w) for x in levels for w in waits]
         for day in sorted(dates[symbol])[-args.days:]:
             def rows(folder=f"{root}symbol={symbol}/date={day}/", maker=maker):
                 for src, rx, event in iter_tagged_timed(folder):
@@ -3847,14 +3859,27 @@ async def _printedge_chances(args, root: str, dates: dict) -> int:
                         yield "book", rx, event
 
             try:
-                prints, mids, _ = collect(rows(), inst, lead_inst)
+                tops: list = []
+                prints, mids, _ = collect(rows(), inst, lead_inst, tops=tops if waits else None)
                 summary.add_day(prints, mids)
+                if waits:
+                    roundtrips(prints, tops, trips, rebate_bps=-MAKER_BPS[maker],
+                               taker_bps=args.taker_bps)
             except Exception as exc:  # noqa: BLE001 - one bad day must not stop the table
                 console.print(f"[yellow]{symbol} {day}: 読めませんでした ({exc})[/yellow]")
         for line in summary.rows():
             print(line, flush=True)
+        trip_lines += [t.row(summary.label, args.order_jpy, summary.days) for t in trips]
     print()
     print(CHANCE_NOTE)
+    if waits:
+        print()
+        print("売り切るところまで（中値ではなく、実際の板の値段で）:")
+        print(ROUNDTRIP_HEADER)
+        for line in trip_lines:
+            print(line)
+        print()
+        print(ROUNDTRIP_NOTE)
     return 0
 
 
@@ -7522,6 +7547,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="path の下の全銘柄を調べて1行ずつ並べる（例: s3://jsboard-capture/raw/live/）")
     p_pe.add_argument("--days", type=int, default=7, help="--all のとき、各銘柄の新しい方から何日分")
     p_pe.add_argument("--only", default=None, help="--all のとき、この銘柄だけ（例: ETH,SUI_JPY,XRP）")
+    p_pe.add_argument("--roundtrip", default=None,
+                      help="--chance のとき、反対側に置いて何秒待つか（例: 10,30）。来なければ成行で逃げる")
+    p_pe.add_argument("--taker-bps", type=float, default=12.0, help="成行で逃げるときの手数料")
     p_pe.add_argument("--chance", default=None,
                       help="--all のとき、先物が逆に動いた直後の約定だけを、動きの大きさ別に出す（例: 2,5,10,20）")
     p_pe.set_defaults(func=cmd_printedge)

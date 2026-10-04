@@ -105,3 +105,25 @@ def test_chances_keep_only_prints_against_the_lead_and_split_by_size():
     s = ChanceSummary("bitbank:ada_jpy", 2.0, (5, 20))
     s.add_day([against, along], mids)
     assert s.rows()[0].endswith("1/1") and s.rows()[1].endswith("\t0")
+
+
+def test_a_chance_fill_is_taken_out_at_book_prices_not_the_mid():
+    from jsboard.research.printedge import Print, RoundTrip, roundtrips
+
+    buy = Print(ts_ns=1 * NS, sign=1, price=99.95, yen=10_000, mid=100.0,
+                spread_bps=10, lead_bps=-10.0)
+    tops = [(0, 99.95, 100.05), (5 * NS, 99.90, 100.00)]
+    taker_buy = Print(ts_ns=3 * NS, sign=-1, price=100.05, yen=5_000, mid=100.0,
+                      spread_bps=10, lead_bps=0.0)
+
+    sold = [RoundTrip(5, 10)]
+    roundtrips([buy, taker_buy], tops, sold, rebate_bps=2.0, taker_bps=12.0)
+    assert sold[0].maker_exits == 1
+    assert abs(sold[0].bps_sum - ((100.05 - 99.95) / 99.95 * 1e4 + 4.0)) < 1e-9
+
+    stuck = [RoundTrip(5, 10)]
+    roundtrips([buy], tops, stuck, rebate_bps=2.0, taker_bps=12.0)
+    # Nobody bought: out at the best bid ten seconds on, paying the taker fee.
+    assert stuck[0].maker_exits == 0
+    assert abs(stuck[0].bps_sum - ((99.90 - 99.95) / 99.95 * 1e4 + 2.0 - 12.0)) < 1e-9
+    assert stuck[0].good_days == 0 and stuck[0].days == 1

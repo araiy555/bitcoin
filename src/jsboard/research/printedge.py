@@ -14,6 +14,7 @@ maker's side, with bitbank's 2bps maker rebate added.
 
 from __future__ import annotations
 
+import bisect
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
@@ -128,7 +129,8 @@ class _Top:
         return self.best_ask - self.best_bid
 
 
-def collect(rows, instrument, lead_instrument) -> tuple[list[Print], MidLine, list[float]]:
+def collect(rows, instrument, lead_instrument,
+            tops: list | None = None) -> tuple[list[Print], MidLine, list[float]]:
     """Every bitbank print with the book and lead state it met.
 
     `rows` yields (source, receive_ns, event) with source "bitbank" or
@@ -167,6 +169,9 @@ def collect(rows, instrument, lead_instrument) -> tuple[list[Print], MidLine, li
             book.apply(event)
             if book.mid is not None:
                 mids.add(rx, book.mid * tick)
+                if tops is not None and (not tops or tops[-1][1:] != (
+                        book.best_bid * tick, book.best_ask * tick)):
+                    tops.append((rx, book.best_bid * tick, book.best_ask * tick))
                 if book.spread_ticks:
                     spreads.append(book.spread_ticks / book.mid * 1e4)
     return prints, mids, spreads
@@ -369,3 +374,102 @@ CHANCE_NOTE = (
     "＝ 先物が動いた直後に、有利な側だけ注文を出す「チャンスだけ」のマーケットメイクの上限。\n"
     "bps はリベート込み、約定額あたり。並び順と速さは最高の場合。"
 )
+
+
+@dataclass
+class RoundTrip:
+    """Chance fills taken all the way out, at prices the book offered."""
+
+    level: float
+    wait_s: float
+    n: int = 0
+    maker_exits: int = 0
+    bps_sum: float = 0.0
+    days: int = 0
+    good_days: int = 0
+    _day_sum: float = 0.0
+    _day_n: int = 0
+
+    def end_day(self) -> None:
+        if self._day_n:
+            self.days += 1
+            self.good_days += self._day_sum > 0
+        self._day_sum, self._day_n = 0.0, 0
+
+    def row(self, label: str, order_jpy: float, day_count: int) -> str:
+        if not self.n:
+            return f"{label}\t{self.level:g}\t{self.wait_s:g}\t0"
+        avg = self.bps_sum / self.n
+        per_day = self.bps_sum * order_jpy / 1e4 / max(1, day_count)
+        return "\t".join([
+            label, f"{self.level:g}", f"{self.wait_s:g}", f"{self.n:,}",
+            f"{self.maker_exits / self.n:.0%}", f"{avg:+.1f}", f"{per_day:+,.0f}",
+            f"{self.good_days}/{self.days}",
+        ])
+
+
+ROUNDTRIP_HEADER = "\t".join([
+    "銘柄", "先物の逆向きbps以上", "待つ秒", "取引", "板で売れた割合", "1回あたりbps",
+    "1日あたり円(1回1万円)", "プラスの日",
+])
+ROUNDTRIP_NOTE = (
+    "買えたら（売れたら）0.2秒後に反対側の一番良い値段へ注文を置き、待つ秒以内にそこで約定すれば\n"
+    "リベート2回込みの差益。来なければ成行で一番良い値段に逃げて、スプレッドとテイカー手数料を払う。\n"
+    "中値では売れない前提。並び順は先頭（上限）。"
+)
+
+
+def roundtrips(prints: list[Print], tops: list, results: list[RoundTrip], *,
+               rebate_bps: float, taker_bps: float, latency_ms: float = 200.0) -> None:
+    """Add one day's chance fills, each taken out of the market, to `results`.
+
+    Bought on a chance: 200ms later an ask goes up at the best ask then. A
+    buyer who trades at or above it within the wait takes it (maker exit,
+    a second rebate). Otherwise the coin is sold at the best bid when the
+    wait ends, paying the taker fee. A chance sale is the mirror image.
+    """
+    if not tops:
+        for r in results:
+            r.end_day()
+        return
+    times = [t for t, _, _ in tops]
+    lat = int(latency_ms * 1e6)
+
+    def top_at(t: int):
+        i = bisect.bisect_right(times, t) - 1
+        return tops[i] if i >= 0 else None
+
+    order = sorted(range(len(prints)), key=lambda i: prints[i].ts_ns)
+    ordered = [prints[i] for i in order]
+    for i, p in enumerate(ordered):
+        for r in results:
+            if p.lead_bps > -r.level:
+                continue
+            start = top_at(p.ts_ns + lat)
+            end_ns = p.ts_ns + int(r.wait_s * NS)
+            end = top_at(end_ns)
+            if start is None or end is None:
+                continue
+            exit_price = start[2] if p.sign > 0 else start[1]
+            filled = False
+            for q in ordered[i + 1:]:
+                if q.ts_ns > end_ns:
+                    break
+                if q.ts_ns <= p.ts_ns + lat or q.sign == p.sign:
+                    continue
+                # A buyer took the offer (maker sold) at or above our ask.
+                if (q.price >= exit_price) if p.sign > 0 else (q.price <= exit_price):
+                    filled = True
+                    break
+            if filled:
+                bps = p.sign * (exit_price - p.price) / p.price * 1e4 + 2 * rebate_bps
+                r.maker_exits += 1
+            else:
+                out = end[1] if p.sign > 0 else end[2]
+                bps = p.sign * (out - p.price) / p.price * 1e4 + rebate_bps - taker_bps
+            r.n += 1
+            r.bps_sum += bps
+            r._day_sum += bps
+            r._day_n += 1
+    for r in results:
+        r.end_day()
