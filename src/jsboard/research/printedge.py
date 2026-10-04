@@ -77,6 +77,57 @@ class Bucket:
         return f"{self.name}\t{self.n:,}\t{avg:,.0f}\t{edge:+.1f}\t" + "\t".join(cols)
 
 
+class _Top:
+    """The best bid and ask of an L2 book, and nothing else.
+
+    `collect` needs only the touch of each book, and keeping a full
+    `MarketView` (sorted levels, volatility, flow) for every update of two
+    books made a day of one book take over ten minutes.
+    """
+
+    __slots__ = ("asks", "best_ask", "best_bid", "bids")
+
+    def __init__(self) -> None:
+        self.bids: dict[int, int] = {}
+        self.asks: dict[int, int] = {}
+        self.best_bid: int | None = None
+        self.best_ask: int | None = None
+
+    def apply(self, event) -> None:
+        if isinstance(event, DepthSnapshot):
+            self.bids = {p: q for p, q in event.bids if q > 0}
+            self.asks = {p: q for p, q in event.asks if q > 0}
+            self.best_bid = max(self.bids) if self.bids else None
+            self.best_ask = min(self.asks) if self.asks else None
+            return
+        for price, qty in event.bids:
+            if qty > 0:
+                self.bids[price] = qty
+                if self.best_bid is None or price > self.best_bid:
+                    self.best_bid = price
+            elif self.bids.pop(price, None) is not None and price == self.best_bid:
+                self.best_bid = max(self.bids) if self.bids else None
+        for price, qty in event.asks:
+            if qty > 0:
+                self.asks[price] = qty
+                if self.best_ask is None or price < self.best_ask:
+                    self.best_ask = price
+            elif self.asks.pop(price, None) is not None and price == self.best_ask:
+                self.best_ask = min(self.asks) if self.asks else None
+
+    @property
+    def mid(self) -> float | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return (self.best_bid + self.best_ask) / 2.0
+
+    @property
+    def spread_ticks(self) -> int | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return self.best_ask - self.best_bid
+
+
 def collect(rows, instrument, lead_instrument) -> tuple[list[Print], MidLine, list[float]]:
     """Every bitbank print with the book and lead state it met.
 
@@ -84,15 +135,14 @@ def collect(rows, instrument, lead_instrument) -> tuple[list[Print], MidLine, li
     "lead". Returns the prints, the bitbank mid line and the spread (bps)
     sampled at each book update.
     """
-    from ..core.market import MarketView
-
     tick = float(instrument.tick_size)
-    book = MarketView(instrument=instrument)
-    lead = MarketView(instrument=lead_instrument)
+    book, lead = _Top(), _Top()
     lead_hist: deque = deque()
     mids, prints, spreads = MidLine(), [], []
     for src, rx, event in rows:
         if src == "lead":
+            if not isinstance(event, (DepthSnapshot, DepthDelta)):
+                continue
             lead.apply(event)
             if lead.mid is not None:
                 lead_hist.append((rx, lead.mid))
