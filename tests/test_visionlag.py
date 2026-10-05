@@ -60,3 +60,17 @@ def test_follower_that_lags_pays_and_one_that_led_shows_before():
     scan.sources[("X", "d")] = "book"
     every, best = report(scan, ["X"], [5], ["d"], min_signals=1)
     assert len(every) == 7 and best[0].split("\t")[2] == "0.5秒"
+
+
+def test_structure_lists_the_mid_path_by_horizon():
+    from jsboard.research.visionlag import structure
+
+    sig = [Signal(1000, 1, 5, 6.0)]
+    tops = [(0, 99.995, 100, 100.005, 100), (1300, 100.195, 100, 100.205, 100),
+            (20000, 100.195, 100, 100.205, 100)]
+    scan = Scan()
+    evaluate(iter(tops), sig, scan, follower="X", day="d")
+    scan.sources[("X", "d")] = "book"
+    lines = structure(scan, ["X"], 5, ["d"])
+    cols = lines[1].split("\t")
+    assert cols[0] == "X" and cols[3] == "+0.0" and cols[-2] == "+20.0"

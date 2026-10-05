@@ -4289,6 +4289,7 @@ async def cmd_visionlag(args: argparse.Namespace) -> int:
         lead_prints,
         report,
         signals,
+        structure,
         tape_tops,
         url,
     )
@@ -4351,6 +4352,12 @@ async def cmd_visionlag(args: argparse.Namespace) -> int:
     if args.out:
         with open(args.out, "w") as fh:
             fh.write(HEADER + "\n" + "\n".join(every) + "\n")
+    for t in thresholds:
+        print(f"【{args.lead} が {args.window_ms}ms で {t:g}bps 以上動いたあと、各銘柄の中値が同じ向きに何bps 動いたか"
+              f"（手数料なし、{days[0]}〜{days[-1]}）】")
+        for line in structure(scan, followers, t, days):
+            print(line)
+        print()
     print(f"先行 {args.lead}、窓 {args.window_ms}ms、遅れ {args.latency_ms}ms、"
           f"手数料 片道{args.fee_bps:g}bps、注文 {args.size_usd:,.0f}ドル、{days[0]}〜{days[-1]}")
     print(f"手数料込みの良い順 上位{len(best)}（合図{args.min_signals}回以上）")

@@ -325,6 +325,25 @@ def report(scan: Scan, followers, thresholds, days, *, min_signals: int = 30, to
     return every, best
 
 
+def structure(scan: Scan, followers, threshold: float, days) -> list[str]:
+    """For one threshold: how far each follower's mid had gone, in the
+    signal's direction, by each horizon after the lead moved (no costs)."""
+    head = "\t".join(["銘柄", "合図", "合図の時点で既に"] + [f"{h / 1000:g}秒後" for h in HORIZONS_MS]
+                     + ["1秒後に同じ向き"])
+    out = [head]
+    for f in followers:
+        used = [d for d in days if (f, d) in scan.sources]
+        cells = [total(scan, f, threshold, h, used)[0] for h in HORIZONS_MS]
+        if not cells[0].n:
+            continue
+        one = cells[HORIZONS_MS.index(1000)]
+        out.append("\t".join(
+            [f, f"{cells[0].n:,}", f"{cells[0].before_bps / cells[0].n:+.1f}"]
+            + [f"{c.mid_bps / c.n:+.1f}" if c.n else "-" for c in cells]
+            + [f"{one.same / one.n:.0%}" if one.n else "-"]))
+    return out
+
+
 async def download(link: str, path: str, *, keep_free: int = 500 * 2**20) -> int | None:
     """Save `link` to `path`; None if the archive does not exist.
 
