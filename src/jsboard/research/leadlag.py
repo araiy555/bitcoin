@@ -12,8 +12,10 @@ ways. Every price here is taken from the recorded books:
 - exit `h` seconds after entry, walking the other side of the book;
 - GMO's taker fee on both legs.
 
-One trade at a time per threshold: after a signal, the next is taken only
-once the longest hold has ended, so trades never overlap or stack.
+One move of the lead is one signal: a threshold re-arms only after the
+gap has closed below it. One trade at a time per threshold and hold: a
+10 s trade frees its slot after 10 s, not after the longest hold, so short
+holds are counted as often as they could really be traded.
 Results are kept per UTC day, so a threshold chosen on one day can be
 checked on the next.
 """
@@ -110,10 +112,12 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
     window, lat = int(window_ms * 1e6), int(latency_ms * 1e6)
     lead_hist: deque = deque()   # (rx, mid)
     gmo_hist: deque = deque()
-    busy_until = {t: -1 for t in thresholds}
+    busy_until = {(t, h): -1 for t in thresholds for h in holds}
+    # A threshold re-arms only once the gap has closed below it, so one move
+    # of the lead is one signal, however long it takes GMO to catch up.
+    armed = {t: True for t in thresholds}
     tasks: list = []
     seq = itertools.count()
-    longest = int(max(holds) * NS)
 
     def ago(hist: deque, now: int):
         while len(hist) >= 2 and hist[1][0] <= now - window:
@@ -158,7 +162,7 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
                     out.no_book += 1
                     continue
                 trade.update(qty=qty, entry=price, day=day_of(due))
-                for h in holds:
+                for h in trade["holds"]:
                     heapq.heappush(tasks, (due + int(h * NS), next(seq), ("exit", h), trade))
             else:
                 h = kind[1]
@@ -188,18 +192,29 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
         lead_then, gmo_then = ago(lead_hist, rx), ago(gmo_hist, rx)
         if not lead_then or not gmo_then:
             continue
-        gap = (math.log(lead_mid / lead_then) - math.log(gmo_mid / gmo_then)) * 1e4
+        lead_move = math.log(lead_mid / lead_then) * 1e4
+        gap = lead_move - math.log(gmo_mid / gmo_then) * 1e4
         for t in thresholds:
-            if abs(gap) < t:
+            # The lead itself must have moved that far, that way: when GMO
+            # catches up after the lead's move has left the window, the gap
+            # flips sign with no move of the lead at all.
+            if abs(gap) < t or lead_move * gap <= 0 or abs(lead_move) < t:
+                armed[t] = True
                 continue
+            if not armed[t]:
+                continue
+            armed[t] = False
             out.signals[t] = out.signals.get(t, 0) + 1
-            if rx < busy_until[t]:
+            free = [h for h in holds if rx >= busy_until[(t, h)]]
+            if not free:
                 continue
-            busy_until[t] = rx + lat + longest
+            for h in free:
+                busy_until[(t, h)] = rx + lat + int(h * NS)
             side = 1 if gap > 0 else -1  # the lead rose further: buy GMO
-            trade = {"side": side, "threshold": t, "mid0": gmo_mid, "day0": day_of(rx)}
+            trade = {"side": side, "threshold": t, "mid0": gmo_mid, "day0": day_of(rx),
+                     "holds": free}
             heapq.heappush(tasks, (rx + lat, next(seq), "enter", trade))
-            for h in holds:
+            for h in free:
                 heapq.heappush(tasks, (rx + int(h * NS), next(seq), ("mid", h), trade))
     return out
 
