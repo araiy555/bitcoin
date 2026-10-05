@@ -40,6 +40,13 @@ class Cell:
     wins: int = 0
     notional: float = 0.0
     pnl: float = 0.0
+    mid_n: int = 0
+    mid_bps: float = 0.0
+    """GMO's mid `h` after the signal, in the signal's direction, before any
+    cost: whether GMO follows at all, apart from whether the spread is paid."""
+
+    def mid(self) -> float:
+        return self.mid_bps / self.mid_n if self.mid_n else float("nan")
 
     def bps(self) -> float:
         return self.pnl / self.notional * 1e4 if self.notional else float("nan")
@@ -124,6 +131,13 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
     def run_due(now: int) -> None:
         while tasks and tasks[0][0] <= now:
             due, _, kind, trade = heapq.heappop(tasks)
+            if isinstance(kind, tuple) and kind[0] == "mid":
+                m = mid_of(gm)
+                if m is not None:
+                    c = out.cell(trade["day0"], trade["threshold"], kind[1])
+                    c.mid_n += 1
+                    c.mid_bps += trade["side"] * math.log(m / trade["mid0"]) * 1e4
+                continue
             if kind == "enter":
                 m = mid_of(gm)
                 if m is None:
@@ -179,8 +193,10 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
                 continue
             busy_until[t] = rx + lat + longest
             side = 1 if gap > 0 else -1  # the lead rose further: buy GMO
-            heapq.heappush(tasks, (rx + lat, next(seq), "enter",
-                                   {"side": side, "threshold": t}))
+            trade = {"side": side, "threshold": t, "mid0": gmo_mid, "day0": day_of(rx)}
+            heapq.heappush(tasks, (rx + lat, next(seq), "enter", trade))
+            for h in holds:
+                heapq.heappush(tasks, (rx + int(h * NS), next(seq), ("mid", h), trade))
     return out
 
 
@@ -196,6 +212,8 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) ->
             p.wins += c.wins
             p.notional += c.notional
             p.pnl += c.pnl
+            p.mid_n += c.mid_n
+            p.mid_bps += c.mid_bps
         ranked = sorted(((k, c) for k, c in pooled.items() if c.n >= 20), key=lambda kc: -kc[1].bps())
         if not ranked:
             lines.append(f"  • {r.label}  取引がまだ少なく判定できません")
@@ -204,10 +222,14 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) ->
         by_hold = " / ".join(
             f"{x:g}秒 {pooled[(t, x)].bps():+.1f}" for x in holds if pooled.get((t, x), Cell()).n
         )
+        moved = " / ".join(
+            f"{x:g}秒 {pooled[(t, x)].mid():+.1f}" for x in holds if pooled.get((t, x), Cell()).mid_n
+        )
         lines.append(
             f"  • {r.label}  一番良い: しきい {t:g}bps・{h:g}秒持つ → {c.bps():+.1f}bps"
             f"  {c.pnl:+,.0f}円  {c.n}回  勝率 {c.wins / c.n:.0%}"
-            f"\n      （しきい {t:g}bps の持つ時間ごと: {by_hold}）"
+            f"\n      損益（入ってから）: {by_hold}"
+            f"\n      GMO の値段の動き（合図から、手数料・スプレッド前）: {moved}"
         )
     lines.append("  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
     return "\n".join(lines)

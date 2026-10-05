@@ -1,5 +1,6 @@
 """Follow a jump in the lead market on GMO's real book."""
 
+import math
 from decimal import Decimal
 
 from jsboard.core.types import Instrument
@@ -117,7 +118,18 @@ def test_slack_summary_picks_the_best_hold_not_the_longest():
     from jsboard.research.leadlag import Cell, LeadLagResult, slack_summary
 
     r = LeadLagResult("XRP_JPY(binance)")
-    r.cells[("2026-10-05", 3.0, 1.0)] = Cell(n=30, wins=20, notional=300_000, pnl=60)
+    r.cells[("2026-10-05", 3.0, 1.0)] = Cell(n=30, wins=20, notional=300_000, pnl=60,
+                                             mid_n=30, mid_bps=45.0)
     r.cells[("2026-10-05", 3.0, 60.0)] = Cell(n=30, wins=10, notional=300_000, pnl=-90)
     text = slack_summary([r], [1.0, 60.0])
     assert "1秒持つ → +2.0bps" in text and "60秒 -3.0" in text
+    assert "手数料・スプレッド前）: 1秒 +1.5" in text
+
+
+def test_gmo_mid_path_is_kept_from_the_signal_before_costs():
+    r = analyse(iter(tape(gmo_follows_at=105)), GMO, LEAD, label="xrp", thresholds=[10],
+                holds=[0.1, 5], size_jpy=10_000)
+    early = next(c for (_, _, h), c in r.cells.items() if h == 0.1)
+    late = next(c for (_, _, h), c in r.cells.items() if h == 5)
+    assert early.mid_n == 1 and abs(early.mid()) < 1e-9  # GMO has not moved yet
+    assert abs(late.mid() - math.log(100.21 / 100.01) * 1e4) < 0.01
