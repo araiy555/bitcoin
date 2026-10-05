@@ -260,6 +260,10 @@ def evaluate(tops, sigs: list[Signal], scan: Scan, *, follower: str, day: str,
         m = (b + a) / 2
         if not hist or hist[-1][1] != m:
             hist.append((ms, m))
+            # Trim as it grows, not only when a signal asks: between rare
+            # signals a whole day of mids would otherwise pile up in memory.
+            while len(hist) >= 2 and hist[1][0] <= ms - window_ms:
+                hist.popleft()
     # Trades still open when the file ends are dropped, not closed at a stale price.
 
 

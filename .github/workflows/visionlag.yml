@@ -1,0 +1,46 @@
+# BTC moves first: which Binance perps follow late enough to trade, from the
+# public archives. Runs on GitHub's machine so the small EC2 box is not used.
+# Started by a push that changes research/visionlag.args (one line of
+# `jsboard visionlag` options), or by hand.
+name: visionlag
+
+on:
+  push:
+    paths:
+      - research/visionlag.args
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Scan
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p out
+          jsboard visionlag $(cat research/visionlag.args) --work-dir "$RUNNER_TEMP/vision" --out out/visionlag.tsv | tee out/visionlag.txt
+          { echo '```'; cat out/visionlag.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visionlag-${{ github.run_id }}
+          path: out/
+          retention-days: 90
+          if-no-files-found: ignore
