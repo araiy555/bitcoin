@@ -4273,6 +4273,95 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_visionlag(args: argparse.Namespace) -> int:
+    """BTC moves first: which Binance perps follow late, from the public archives."""
+    import os
+    from datetime import UTC, datetime, timedelta
+
+    from .research.visionlag import (
+        FOLLOWERS,
+        HEADER,
+        NOTE,
+        Scan,
+        book_tops,
+        download,
+        evaluate,
+        lead_prints,
+        report,
+        signals,
+        tape_tops,
+        url,
+    )
+
+    end = (datetime.strptime(args.end, "%Y-%m-%d").date() if args.end
+           else datetime.now(UTC).date() - timedelta(days=1))
+    days = [(end - timedelta(days=k)).isoformat() for k in range(args.days - 1, -1, -1)]
+    followers = ([x.strip().upper() for x in args.followers.split(",")] if args.followers
+                 else list(FOLLOWERS))
+    thresholds = [float(x) for x in args.thresholds.split(",")]
+    os.makedirs(args.work_dir, exist_ok=True)
+    scan = Scan()
+
+    def say(text: str) -> None:
+        print(f"[{datetime.now():%H:%M:%S}] {text}", file=sys.stderr, flush=True)
+
+    async def fetch(datatype: str, symbol: str, day: str) -> str | None:
+        path = os.path.join(args.work_dir, f"{symbol}-{datatype}-{day}.zip")
+        size = await download(url(datatype, symbol, day), path)
+        if size is None:
+            return None
+        say(f"{symbol} {day} {datatype} {size / 2**20:,.0f}MB 取得")
+        return path
+
+    started = time.monotonic()
+    for day in days:
+        path = await fetch("aggTrades", args.lead, day)
+        if path is None:
+            say(f"{args.lead} {day} のデータがありません（まだ公開されていない日かも）")
+            continue
+        try:
+            sigs = signals(lead_prints(path), thresholds,
+                           window_ms=args.window_ms, cooldown_ms=args.cooldown_ms)
+        finally:
+            os.remove(path)
+        sigs.sort(key=lambda s: s.ms)
+        counts = {t: sum(s.threshold == t for s in sigs) for t in thresholds}
+        say(f"{args.lead} {day} 合図 " + " / ".join(f"{t:g}bps {n:,}回" for t, n in counts.items()))
+        for symbol in followers:
+            source = "book"
+            path = None if args.tape_only else await fetch("bookTicker", symbol, day)
+            if path is None:
+                source = "tape"
+                path = await fetch("aggTrades", symbol, day)
+            if path is None:
+                say(f"{symbol} {day} データなし、飛ばします")
+                continue
+            t0 = time.monotonic()
+            try:
+                tops = book_tops(path) if source == "book" else tape_tops(path)
+                evaluate(tops, sigs, scan, follower=symbol, day=day, latency_ms=args.latency_ms,
+                         window_ms=args.window_ms, fee_bps=args.fee_bps, size_usd=args.size_usd)
+            finally:
+                os.remove(path)
+            scan.sources[(symbol, day)] = source
+            say(f"{symbol} {day} 済み（{'板' if source == 'book' else '約定推定'}、"
+                f"{time.monotonic() - t0:.0f}秒、通算 {(time.monotonic() - started) / 60:.0f}分）")
+
+    every, best = report(scan, followers, thresholds, days, min_signals=args.min_signals)
+    if args.out:
+        with open(args.out, "w") as fh:
+            fh.write(HEADER + "\n" + "\n".join(every) + "\n")
+    print(f"先行 {args.lead}、窓 {args.window_ms}ms、遅れ {args.latency_ms}ms、"
+          f"手数料 片道{args.fee_bps:g}bps、注文 {args.size_usd:,.0f}ドル、{days[0]}〜{days[-1]}")
+    print(f"手数料込みの良い順 上位{len(best)}（合図{args.min_signals}回以上）")
+    print(HEADER)
+    for line in best:
+        print(line)
+    print()
+    print(NOTE)
+    return 0
+
+
 async def cmd_arbedge(args: argparse.Namespace) -> int:
     """bitbank against GMO on the pair recordings: trade only when they part."""
     import re
@@ -7605,6 +7694,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll.add_argument("--slack", action="store_true")
     p_ll.add_argument("--interim", action="store_true")
     p_ll.set_defaults(func=cmd_leadlag)
+
+    p_vl = sub.add_parser("visionlag", help="BTC が動いた後に遅れて動く Binance 先物を、公開データで全部調べる")
+    p_vl.add_argument("--lead", default="BTCUSDT", help="先に動く銘柄")
+    p_vl.add_argument("--followers", default=None, help="調べる銘柄（省略で主要20銘柄）")
+    p_vl.add_argument("--days", type=int, default=1, help="何日分（--end まで）")
+    p_vl.add_argument("--end", default=None, help="最後の日 YYYY-MM-DD（省略で昨日、UTC）")
+    p_vl.add_argument("--thresholds", default="2,5,10", help="先行銘柄が窓の間に何bps 動いたら合図か")
+    p_vl.add_argument("--window-ms", type=int, default=100)
+    p_vl.add_argument("--cooldown-ms", type=int, default=1000, help="同じしきいの合図の最短間隔")
+    p_vl.add_argument("--latency-ms", type=int, default=50, help="合図から注文が届くまで")
+    p_vl.add_argument("--fee-bps", type=float, default=5.0, help="片道の手数料")
+    p_vl.add_argument("--size-usd", type=float, default=1000.0)
+    p_vl.add_argument("--min-signals", type=int, default=30)
+    p_vl.add_argument("--tape-only", action="store_true", help="板（bookTicker）を取らず約定だけで見る")
+    p_vl.add_argument("--work-dir", default="/var/tmp/jsboard-vision", help="一時ファイルの置き場（使ったら消す）")
+    p_vl.add_argument("--out", default=None, help="全部の行をこのファイルに保存")
+    p_vl.set_defaults(func=cmd_visionlag)
 
     p_ar = sub.add_parser("arbedge", help="bitbank と GMO の値段の差が手数料を超えたときだけ取引した損益")
     p_ar.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
