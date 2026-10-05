@@ -111,3 +111,13 @@ def test_direction_counts_whether_the_slow_market_followed():
     # lagging GMO, a second signal after which nothing moves.
     assert d5.same >= 1 and d5.opposite == 0 and d5.total_bps > 0
     assert stayed.cells[(10, 5)].flat == stayed.cells[(10, 5)].n
+
+
+def test_slack_summary_picks_the_best_hold_not_the_longest():
+    from jsboard.research.leadlag import Cell, LeadLagResult, slack_summary
+
+    r = LeadLagResult("XRP_JPY(binance)")
+    r.cells[("2026-10-05", 3.0, 1.0)] = Cell(n=30, wins=20, notional=300_000, pnl=60)
+    r.cells[("2026-10-05", 3.0, 60.0)] = Cell(n=30, wins=10, notional=300_000, pnl=-90)
+    text = slack_summary([r], [1.0, 60.0])
+    assert "1秒持つ → +2.0bps" in text and "60秒 -3.0" in text

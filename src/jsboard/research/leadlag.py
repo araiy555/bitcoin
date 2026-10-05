@@ -75,7 +75,7 @@ class LeadLagResult:
 def header(holds) -> str:
     cols = ["銘柄(先行)", "日(UTC)", "しきいbps", "取引数"]
     for h in holds:
-        cols += [f"{h}秒bps", f"{h}秒円", f"{h}秒勝率"]
+        cols += [f"{h:g}秒bps", f"{h:g}秒円", f"{h:g}秒勝率"]
     return "\t".join(cols)
 
 
@@ -106,7 +106,7 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
     busy_until = {t: -1 for t in thresholds}
     tasks: list = []
     seq = itertools.count()
-    longest = max(holds) * NS
+    longest = int(max(holds) * NS)
 
     def ago(hist: deque, now: int):
         while len(hist) >= 2 and hist[1][0] <= now - window:
@@ -141,7 +141,7 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
                     continue
                 trade.update(qty=qty, entry=price, day=day_of(due))
                 for h in holds:
-                    heapq.heappush(tasks, (due + h * NS, next(seq), ("exit", h), trade))
+                    heapq.heappush(tasks, (due + int(h * NS), next(seq), ("exit", h), trade))
             else:
                 h = kind[1]
                 back = gmo_price(-trade["side"], trade["qty"])
@@ -188,19 +188,26 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) ->
     title = "途中経過" if interim else "結果"
     lines = [f":zap: 後追い取引の{title}（先行市場が動いた → GMO で成行、実際の板・手数料込み）"]
     for r in results:
-        best = None
-        for (day, t, h), c in r.cells.items():
-            if h != holds[-1] or c.n < 20:
-                continue
-            if best is None or c.pnl > best[1].pnl:
-                best = ((day, t, h), c)
-        if best is None:
+        # The best threshold and hold over the whole recording, every day pooled.
+        pooled: dict = {}
+        for (_, t, h), c in r.cells.items():
+            p = pooled.setdefault((t, h), Cell())
+            p.n += c.n
+            p.wins += c.wins
+            p.notional += c.notional
+            p.pnl += c.pnl
+        ranked = sorted(((k, c) for k, c in pooled.items() if c.n >= 20), key=lambda kc: -kc[1].bps())
+        if not ranked:
             lines.append(f"  • {r.label}  取引がまだ少なく判定できません")
             continue
-        (day, t, h), c = best
+        (t, h), c = ranked[0]
+        by_hold = " / ".join(
+            f"{x:g}秒 {pooled[(t, x)].bps():+.1f}" for x in holds if pooled.get((t, x), Cell()).n
+        )
         lines.append(
-            f"  • {r.label}  一番良いしきい {t:g}bps（{day}）: {h}秒で {c.bps():+.1f}bps"
+            f"  • {r.label}  一番良い: しきい {t:g}bps・{h:g}秒持つ → {c.bps():+.1f}bps"
             f"  {c.pnl:+,.0f}円  {c.n}回  勝率 {c.wins / c.n:.0%}"
+            f"\n      （しきい {t:g}bps の持つ時間ごと: {by_hold}）"
         )
     lines.append("  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
     return "\n".join(lines)

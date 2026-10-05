@@ -4221,7 +4221,7 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
         console.print(f"[red]{root} に録画がありません。[/red]")
         return 1
     thresholds = [float(x) for x in args.thresholds.split(",")]
-    holds = [int(x) for x in args.holds.split(",")]
+    holds = [float(x) for x in args.holds.split(",")]
     print(direction_header() if args.direction else header(holds), flush=True)
     results = []
     for symbol in symbols:
@@ -7693,7 +7693,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll.add_argument("--direction", action="store_true",
                       help="損益ではなく、合図のあと遅い側が同じ向き・逆向きのどちらに動いたかを数える")
     p_ll.add_argument("--thresholds", default="3,5,8,12,20", help="何bps 先に動いたら入るか")
-    p_ll.add_argument("--holds", default="5,10,30,60", help="何秒持つか")
+    p_ll.add_argument("--holds", default="0.5,1,2,5,10,30", help="何秒持つか")
     p_ll.add_argument("--window-ms", type=float, default=1000.0)
     p_ll.add_argument("--latency-ms", type=float, default=200.0)
     p_ll.add_argument("--size-jpy", type=float, default=10_000.0)
