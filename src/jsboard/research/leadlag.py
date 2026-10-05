@@ -146,7 +146,11 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
                 mid = m * float(gmo.tick_size)
                 step = float(gmo.lot_size)
                 qty = math.floor(size_jpy / mid / step + 1e-9) * step
-                if qty <= 0 or qty < min_order:
+                if qty < min_order:
+                    # BTC's minimum (0.01) is far above a 10,000 yen order:
+                    # trade the minimum rather than skip the coin entirely.
+                    qty = math.ceil(min_order / step - 1e-9) * step
+                if qty <= 0:
                     out.no_book += 1
                     continue
                 price = gmo_price(trade["side"], qty)

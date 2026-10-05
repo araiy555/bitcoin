@@ -133,3 +133,10 @@ def test_gmo_mid_path_is_kept_from_the_signal_before_costs():
     late = next(c for (_, _, h), c in r.cells.items() if h == 5)
     assert early.mid_n == 1 and abs(early.mid()) < 1e-9  # GMO has not moved yet
     assert abs(late.mid() - math.log(100.21 / 100.01) * 1e4) < 0.01
+
+
+def test_an_order_below_the_minimum_trades_the_minimum():
+    r = analyse(iter(tape(gmo_follows_at=105)), GMO, LEAD, label="xrp", thresholds=[10],
+                holds=[5], size_jpy=10_000, min_order=500)
+    [cell] = r.cells.values()
+    assert cell.n == 1 and abs(cell.notional - 500 * 100.02) < 1e-6
