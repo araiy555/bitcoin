@@ -4381,6 +4381,98 @@ async def cmd_visionlag(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_fairprice(args: argparse.Namespace) -> int:
+    """GMO's fair price from many inputs, fitted on one period, traded on the next."""
+    import heapq
+    from datetime import UTC, datetime, timedelta
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.fairprice import HEADER, report, run, slack_summary, weights_text
+    from .sim.s3 import exists, read_bytes
+
+    def when(text: str) -> datetime:
+        t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=UTC)
+
+    def span(text: str) -> tuple[datetime, datetime]:
+        a, b = (when(x.strip()) for x in text.split(","))
+        return a, b
+
+    train, test = span(args.train), span(args.test)
+    if test[0] < train[1]:
+        console.print("[red]--test は --train が終わった後にしてください（学習に使ったデータで試さない）。[/red]")
+        return 1
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    days = []
+    d = train[0].date()
+    while d <= test[1].date():
+        days.append(d.isoformat())
+        d += timedelta(days=1)
+
+    def specs_of(symbol: str) -> dict:
+        meta = f"{root}symbol={symbol}/meta.json"
+        return json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+
+    def stream(symbol: str, rename):
+        folder = f"{root}symbol={symbol}/"
+        for day in days:
+            for src, rx, event in iter_tagged_timed(f"{folder}date={day}/"):
+                if isinstance(event, _Status):
+                    continue
+                name = rename(src)
+                if name:
+                    yield name, rx, event
+
+    cross = [c.strip().upper() for c in (args.cross or "").split(",") if c.strip()]
+    holds = tuple(float(x) for x in args.holds.split(","))
+
+    def ns(t: datetime) -> int:
+        return int(t.timestamp() * 1e9)
+
+    print(HEADER, flush=True)
+    results = []
+    for symbol in [x.strip().upper() for x in args.only.split(",")]:
+        specs = specs_of(symbol)
+        if "gmo" not in specs:
+            console.print(f"[yellow]{symbol}: 録画がありません[/yellow]")
+            continue
+        gmo = _instrument_from_spec(specs["gmo"])
+        leads = {k: _instrument_from_spec(specs[k]) for k in ("bybit", "binance") if k in specs}
+        streams = [stream(symbol, lambda s: s if s in ("gmo", "bybit", "binance") else None)]
+        used = []
+        for c in cross:
+            if c == symbol:
+                continue
+            cs = specs_of(c)
+            pick = "binance" if "binance" in cs else ("bybit" if "bybit" in cs else None)
+            if pick is None:
+                continue
+            leads[f"x:{c}"] = _instrument_from_spec(cs[pick])
+            streams.append(stream(c, lambda s, c=c, pick=pick: f"x:{c}" if s == pick else None))
+            used.append(c)
+        rows = heapq.merge(*streams, key=lambda r: r[1])
+        r = run(rows, gmo, leads, label=symbol, train=(ns(train[0]), ns(train[1])),
+                test=(ns(test[0]), ns(test[1])), holds=holds, cross=tuple(used),
+                latency_ms=args.latency_ms, size_jpy=args.size_jpy,
+                fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
+                min_order=float(specs["gmo"].get("min_order", 0) or 0),
+                margin_bps=args.margin_bps, rule_bps=args.rule_bps)
+        for line in report(r):
+            print(line, flush=True)
+        print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
+        for line in weights_text(r, holds[-1]):
+            print(line)
+        results.append(r)
+    print()
+    print("モデルは --train の時間帯だけで作り、--test の時間帯で売買した結果です。"
+          "値段は録画した実際の板を注文量ぶん食った値、0.2秒遅れ・手数料込み。")
+    print("モデルが取引するのは「予想した値動き > その瞬間の往復コスト（スプレッド・板の食い込み・手数料）」のときだけ。")
+    if args.slack and results:
+        await _post_slack(slack_summary(results))
+    return 0
+
+
 async def cmd_arbedge(args: argparse.Namespace) -> int:
     """bitbank against GMO on the pair recordings: trade only when they part."""
     import re
@@ -7732,6 +7824,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_vl.add_argument("--work-dir", default="/var/tmp/jsboard-vision", help="一時ファイルの置き場（使ったら消す）")
     p_vl.add_argument("--out", default=None, help="全部の行をこのファイルに保存")
     p_vl.set_defaults(func=cmd_visionlag)
+
+    p_fp = sub.add_parser("fairprice", help="いろいろな材料から GMO の本来の値段を出すモデルを、前の時間帯で作って次の時間帯で試す")
+    p_fp.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
+    p_fp.add_argument("--only", default="XRP_JPY", help="調べる銘柄（例: XRP_JPY,ETH_JPY）")
+    p_fp.add_argument("--cross", default="BTC_JPY,ETH_JPY", help="材料に使う他の銘柄の先物")
+    p_fp.add_argument("--train", required=True, help="学習する時間帯（UTC）例: 2026-10-06T09:31,2026-10-06T21:31")
+    p_fp.add_argument("--test", required=True, help="試す時間帯（UTC）。学習より後")
+    p_fp.add_argument("--holds", default="2,5,10", help="何秒持つか")
+    p_fp.add_argument("--latency-ms", type=int, default=200)
+    p_fp.add_argument("--size-jpy", type=float, default=10_000.0)
+    p_fp.add_argument("--margin-bps", type=float, default=0.0, help="往復コストにさらに上乗せする分")
+    p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
+    p_fp.add_argument("--slack", action="store_true")
+    p_fp.set_defaults(func=cmd_fairprice)
 
     p_ar = sub.add_parser("arbedge", help="bitbank と GMO の値段の差が手数料を超えたときだけ取引した損益")
     p_ar.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
