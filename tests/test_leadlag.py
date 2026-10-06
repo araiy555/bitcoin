@@ -140,3 +140,12 @@ def test_an_order_below_the_minimum_trades_the_minimum():
                 holds=[5], size_jpy=10_000, min_order=500)
     [cell] = r.cells.values()
     assert cell.n == 1 and abs(cell.notional - 500 * 100.02) < 1e-6
+
+
+def test_a_fixed_condition_reports_even_a_few_trades():
+    from jsboard.research.leadlag import Cell, LeadLagResult, slack_summary
+
+    r = LeadLagResult("XRP_JPY(bybit)")
+    r.cells[("2026-10-06", 8.0, 10.0)] = Cell(n=5, wins=3, notional=50_000, pnl=10)
+    text = slack_summary([r], [10.0], min_trades=1, since="2026-10-06T03:00")
+    assert "10秒持つ → +2.0bps" in text and "2026-10-06T03:00" in text

@@ -4222,6 +4222,14 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
         return 1
     thresholds = [float(x) for x in args.thresholds.split(",")]
     holds = [float(x) for x in args.holds.split(",")]
+    since_ns, since_day = 0, ""
+    if args.since:
+        from datetime import UTC, datetime
+
+        when = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        when = when if when.tzinfo else when.replace(tzinfo=UTC)
+        since_ns = int(when.timestamp() * 1e9)
+        since_day = when.astimezone(UTC).strftime("%Y-%m-%d")
     print(direction_header() if args.direction else header(holds), flush=True)
     results = []
     for symbol in symbols:
@@ -4243,8 +4251,10 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
 
             def rows(folder=folder, lead_name=lead_name, days=days, follower=follower):
                 for day in days:
+                    if since_ns and day < since_day:
+                        continue
                     for src, rx, event in iter_tagged_timed(f"{folder}date={day}/"):
-                        if isinstance(event, _Status):
+                        if isinstance(event, _Status) or rx < since_ns:
                             continue
                         if src == follower:
                             yield "gmo", rx, event
@@ -4269,7 +4279,9 @@ async def cmd_leadlag(args: argparse.Namespace) -> int:
     print()
     print(DIRECTION_NOTE if args.direction else NOTE)
     if args.slack and results:
-        await _post_slack(slack_summary(results, holds, interim=args.interim))
+        fixed = len(thresholds) == 1 and len(holds) == 1
+        await _post_slack(slack_summary(results, holds, interim=args.interim,
+                                        min_trades=1 if fixed else 20, since=args.since))
     return 0
 
 
@@ -7700,6 +7712,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll.add_argument("--only", default=None)
     p_ll.add_argument("--slack", action="store_true")
     p_ll.add_argument("--interim", action="store_true")
+    p_ll.add_argument("--since", default=None,
+                      help="この時刻（UTC、例 2026-10-06T03:00）より後の録画だけ使う。条件を決めた後のデータで確かめるとき")
     p_ll.set_defaults(func=cmd_leadlag)
 
     p_vl = sub.add_parser("visionlag", help="BTC が動いた後に遅れて動く Binance 先物を、公開データで全部調べる")

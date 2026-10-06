@@ -219,9 +219,12 @@ def analyse(rows, gmo: Instrument, lead: Instrument, *, label: str, thresholds, 
     return out
 
 
-def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) -> str:
+def slack_summary(results: list[LeadLagResult], holds, interim: bool = False,
+                  min_trades: int = 20, since: str | None = None) -> str:
     title = "途中経過" if interim else "結果"
     lines = [f":zap: 後追い取引の{title}（先行市場が動いた → GMO で成行、実際の板・手数料込み）"]
+    if since:
+        lines.append(f"  {since}（UTC）より後の録画だけで計算")
     for r in results:
         # The best threshold and hold over the whole recording, every day pooled.
         pooled: dict = {}
@@ -233,7 +236,7 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False) ->
             p.pnl += c.pnl
             p.mid_n += c.mid_n
             p.mid_bps += c.mid_bps
-        ranked = sorted(((k, c) for k, c in pooled.items() if c.n >= 20), key=lambda kc: -kc[1].bps())
+        ranked = sorted(((k, c) for k, c in pooled.items() if c.n >= min_trades), key=lambda kc: -kc[1].bps())
         if not ranked:
             lines.append(f"  • {r.label}  取引がまだ少なく判定できません")
             continue
