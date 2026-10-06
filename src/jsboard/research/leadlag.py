@@ -236,6 +236,22 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False,
             p.pnl += c.pnl
             p.mid_n += c.mid_n
             p.mid_bps += c.mid_bps
+        if not pooled:
+            lines.append(f"  • {r.label}  まだ取引なし")
+            continue
+        if len(pooled) <= 4:
+            # A few fixed conditions, set before the data: list every one,
+            # not just the best, so nothing is picked after the fact.
+            for (t, h), c in sorted(pooled.items()):
+                if not c.n:
+                    lines.append(f"  • {r.label}  しきい {t:g}bps・{h:g}秒: まだ取引なし")
+                    continue
+                lines.append(
+                    f"  • {r.label}  しきい {t:g}bps・{h:g}秒持つ → {c.bps():+.1f}bps"
+                    f"  {c.pnl:+,.0f}円  {c.n}回  勝率 {c.wins / c.n:.0%}"
+                    f"  （GMO の値段の動き {c.mid():+.1f}）"
+                )
+            continue
         ranked = sorted(((k, c) for k, c in pooled.items() if c.n >= min_trades), key=lambda kc: -kc[1].bps())
         if not ranked:
             lines.append(f"  • {r.label}  取引がまだ少なく判定できません")
@@ -253,7 +269,9 @@ def slack_summary(results: list[LeadLagResult], holds, interim: bool = False,
             f"\n      損益（入ってから）: {by_hold}"
             f"\n      GMO の値段の動き（合図から、手数料・スプレッド前）: {moved}"
         )
-    lines.append("  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
+    fixed = all(len({k[1:] for k in r.cells}) <= 4 for r in results)
+    lines.append("  （先に決めた条件の数字です。選び直していません）" if fixed
+                 else "  （一番良いものを選んだ数字です。別の日で確かめるまで信用しないでください）")
     return "\n".join(lines)
 
 

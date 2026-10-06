@@ -121,7 +121,9 @@ def test_slack_summary_picks_the_best_hold_not_the_longest():
     r.cells[("2026-10-05", 3.0, 1.0)] = Cell(n=30, wins=20, notional=300_000, pnl=60,
                                              mid_n=30, mid_bps=45.0)
     r.cells[("2026-10-05", 3.0, 60.0)] = Cell(n=30, wins=10, notional=300_000, pnl=-90)
-    text = slack_summary([r], [1.0, 60.0])
+    for h in (2.0, 5.0, 10.0):  # more conditions than are listed one by one
+        r.cells[("2026-10-05", 3.0, h)] = Cell(n=30, wins=10, notional=300_000, pnl=-30)
+    text = slack_summary([r], [1.0, 2.0, 5.0, 10.0, 60.0])
     assert "1秒持つ → +2.0bps" in text and "60秒 -3.0" in text
     assert "手数料・スプレッド前）: 1秒 +1.5" in text
 
@@ -148,4 +150,15 @@ def test_a_fixed_condition_reports_even_a_few_trades():
     r = LeadLagResult("XRP_JPY(bybit)")
     r.cells[("2026-10-06", 8.0, 10.0)] = Cell(n=5, wins=3, notional=50_000, pnl=10)
     text = slack_summary([r], [10.0], min_trades=1, since="2026-10-06T03:00")
-    assert "10秒持つ → +2.0bps" in text and "2026-10-06T03:00" in text
+    assert "しきい 8bps・10秒持つ → +2.0bps" in text and "2026-10-06T03:00" in text
+    assert "選び直していません" in text
+
+
+def test_a_few_conditions_are_all_listed_not_just_the_best():
+    from jsboard.research.leadlag import Cell, LeadLagResult, slack_summary
+
+    r = LeadLagResult("XRP_JPY(bybit)")
+    r.cells[("d", 5.0, 10.0)] = Cell(n=40, wins=10, notional=400_000, pnl=-80)
+    r.cells[("d", 8.0, 10.0)] = Cell(n=20, wins=14, notional=200_000, pnl=100)
+    text = slack_summary([r], [10.0])
+    assert "しきい 5bps・10秒持つ → -2.0bps" in text and "しきい 8bps・10秒持つ → +5.0bps" in text
