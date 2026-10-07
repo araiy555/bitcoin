@@ -4389,7 +4389,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
     from .research.fairprice import HEADER, report, run, slack_summary, weights_text
-    from .sim.s3 import exists, read_bytes
+    from .sim.s3 import exists, list_parts, read_bytes
 
     def when(text: str) -> datetime:
         t = datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -4417,6 +4417,10 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     def stream(symbol: str, rename):
         folder = f"{root}symbol={symbol}/"
         for day in days:
+            # A coin recorded on fewer days (BTC started later) has gaps:
+            # skip the missing day rather than stop the whole run.
+            if not list_parts(f"{folder}date={day}/"):
+                continue
             for src, rx, event in iter_tagged_timed(f"{folder}date={day}/"):
                 if isinstance(event, _Status):
                     continue

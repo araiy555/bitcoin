@@ -94,6 +94,10 @@ async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys):
                     "taker_bps": 0.0, "min_order": "1"},
             "bybit": {**spec, "symbol": "XRPUSDT", "tick_size": "0.0001", "lot_size": "1"},
         }}).encode(),
+        # BTC has a spec but no recording on this day: it must be skipped, not fatal.
+        target.meta_key("BTC_JPY"): json.dumps({"sources": {
+            "binance": {"symbol": "BTCUSDT", "tick_size": "0.1", "lot_size": "0.001"},
+        }}).encode(),
     }
 
     class Bucket:
@@ -113,7 +117,7 @@ async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys):
 
     monkeypatch.setattr(s3, "default_client", Bucket)
     args = cli.build_parser().parse_args([
-        "fairprice", "s3://b/raw/lead/", "--only", "XRP_JPY", "--cross", "",
+        "fairprice", "s3://b/raw/lead/", "--only", "XRP_JPY", "--cross", "BTC_JPY",
         "--train", f"{iso(T0)},{iso(mid)}", "--test", f"{iso(mid)},{iso(end)}", "--holds", "2"])
     assert await args.func(args) == 0
     out = capsys.readouterr().out.splitlines()
