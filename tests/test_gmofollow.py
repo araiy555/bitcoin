@@ -242,3 +242,19 @@ def test_the_command_trades_on_a_fair_price_model(monkeypatch, tmp_path):
     assert asyncio.run(args.func(args)) == 0
     recs = [json.loads(x) for x in log.read_text().splitlines()]
     assert recs and recs[0]["lead"] == "フェア価格" and recs[0]["side"] == "BUY"
+
+
+def test_signals_while_busy_are_counted_and_the_log_summarised():
+    from jsboard.live.gmofollow import summary
+
+    clock = Clock()
+    venue = Venue([100.0, 100.05])
+    f, records, _ = follower(venue, clock)
+    f.busy = True
+    assert f.saw_signal("bybit", 1, 9.0, clock()) is False
+    f.busy = False
+    assert f.saw_signal("bybit", 1, 9.0, clock()) is True
+    asyncio.run(f.trade("bybit", 1, 9.0, clock(), {"predicted_bps": 7.0, "cost_bps": 4.0}))
+    assert f.tally.signals == 2 and f.tally.skipped == 1
+    text = "\n".join(summary(records))
+    assert "見送り 1" in text and "約定率 100%" in text and "+7.00" in text

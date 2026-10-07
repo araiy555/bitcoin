@@ -121,13 +121,17 @@ class Tally:
     slip_bps: float = 0.0
     send_to_ack_ms: float = 0.0
     errors: int = 0
+    signals: int = 0
+    skipped: int = 0
+    """Signals that came while a trade was already open, so were not taken."""
 
     def text(self) -> str:
+        head = f"合図 {self.signals}回（取引中で見送り {self.skipped}回）  "
         if not self.n:
-            return f"取引 0回（エラー {self.errors}回）"
+            return head + f"取引 0回（エラー {self.errors}回）"
         bps = self.pnl / self.notional * 1e4
         exp = self.expected_pnl / self.notional * 1e4
-        return (f"取引 {self.n}回  勝率 {self.wins / self.n:.0%}  損益 {self.pnl:+,.1f}円（{bps:+.1f}bps）"
+        return head + (f"取引 {self.n}回  勝率 {self.wins / self.n:.0%}  損益 {self.pnl:+,.1f}円（{bps:+.1f}bps）"
                 f"  検証の計算なら {exp:+.1f}bps  入りの値段のずれ 平均 {self.slip_bps / self.n:+.1f}bps"
                 f"  注文→受付 平均 {self.send_to_ack_ms / self.n:.0f}ms  エラー {self.errors}回")
 
@@ -159,6 +163,20 @@ class Follower:
 
     def ready(self) -> bool:
         return not self.busy and self.stopped is None
+
+    def saw_signal(self, lead: str, side: int, gap: float, signal_ns: int, extra=None) -> bool:
+        """Count a signal; record it if a trade in hand means it is passed
+        over. True when it can be taken now."""
+        if self.stopped is not None:
+            return False
+        self.tally.signals += 1
+        if self.busy:
+            self.tally.skipped += 1
+            self._record({"skipped": True, "signal_ns": signal_ns, "lead": lead,
+                          "side": "BUY" if side > 0 else "SELL", "gap_bps": round(gap, 2),
+                          **(extra or {})})
+            return False
+        return True
 
     async def _say(self, text: str) -> None:
         if self.notify:
@@ -192,22 +210,24 @@ class Follower:
         exit_ = self.walk(-side, size)
         return {"expected_entry": entry, "expected_exit": exit_}
 
-    async def trade(self, lead: str, side: int, gap: float, signal_ns: int) -> dict | None:
+    async def trade(self, lead: str, side: int, gap: float, signal_ns: int,
+                    extra: dict | None = None) -> dict | None:
         if not self.ready():
             return None
         self.busy = True
         try:
-            return await self._trade(lead, side, gap, signal_ns)
+            return await self._trade(lead, side, gap, signal_ns, extra or {})
         finally:
             self.busy = False
 
-    async def _trade(self, lead: str, side: int, gap: float, signal_ns: int) -> dict | None:
+    async def _trade(self, lead: str, side: int, gap: float, signal_ns: int,
+                     extra: dict) -> dict | None:
         size = float(self.size)
         word, back = ("BUY", "SELL") if side > 0 else ("SELL", "BUY")
         self.open_back = back
         bid, ask = self.touch()
         rec: dict = {"signal_ns": signal_ns, "lead": lead, "gap_bps": round(gap, 2), "side": word,
-                     "size": self.size, "bid_at_signal": bid, "ask_at_signal": ask}
+                     "size": self.size, "bid_at_signal": bid, "ask_at_signal": ask, **extra}
         expected = asyncio.ensure_future(self._expected(side, signal_ns, size))
         t_send = self.clock()
         try:
@@ -310,3 +330,35 @@ class Follower:
         if fatal or self._consecutive_errors >= 3:
             await self.stop(rec["error"])
         return rec
+
+
+def summary(records: list[dict]) -> list[str]:
+    """The numbers the live run is judged by, from its log."""
+    import statistics
+
+    done = [r for r in records if "pnl_jpy" in r]
+    skipped = [r for r in records if r.get("skipped")]
+    failed = [r for r in records if r.get("error") and "pnl_jpy" not in r]
+    tried = len(done) + len(failed)
+
+    def mean(key: str, rows=done) -> str:
+        vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
+        return f"{statistics.fmean(vals):+.2f}" if vals else "-"
+
+    def ms(key: str) -> str:
+        vals = [r[key] for r in done if isinstance(r.get(key), (int, float))]
+        return f"{statistics.median(vals):.0f}" if vals else "-"
+
+    yen = sum(r["pnl_jpy"] for r in done)
+    wins = sum(r["pnl_jpy"] > 0 for r in done)
+    lines = [
+        f"合図 {len(done) + len(failed) + len(skipped)}回（取引 {len(done)}・失敗 {len(failed)}・取引中で見送り {len(skipped)}）",
+        f"約定率 {len(done) / tried:.0%}" if tried else "約定率 -",
+        f"勝率 {wins / len(done):.0%}" if done else "勝率 -",
+        f"実質の損益 {yen:+,.1f}円  1回あたり {mean('pnl_bps')}bps",
+        f"検証の計算なら 1回あたり {mean('expected_pnl_bps')}bps",
+        f"予想した値動き（フェア価格）平均 {mean('predicted_bps')}bps  その時の往復コスト 平均 {mean('cost_bps')}bps",
+        f"入りの値段のずれ 平均 {mean('entry_slip_bps')}bps  出の値段のずれ 平均 {mean('exit_slip_bps')}bps（プラスは不利）",
+        f"合図→注文 {ms('signal_to_send_ms')}ms  注文→受付 {ms('send_to_ack_ms')}ms  受付→約定確認 {ms('ack_to_fill_seen_ms')}ms（中央値）",
+    ]
+    return lines

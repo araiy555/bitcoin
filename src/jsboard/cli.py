@@ -4641,6 +4641,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
         trade when the predicted move clears the round trip by the margin."""
         step = int(model.get("step_ms", 100)) / 1000
         size = float(args.size)
+        armed = [True]
         while True:
             await _asyncio.sleep(step - (time.time() % step))
             grid.push()
@@ -4649,15 +4650,25 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             gm = grid.mid("gmo")
             x = grid.features(gm)
             p = sum(w * v for w, v in zip(weights, x, strict=True))
-            if abs(p) <= margin or not follower.ready():
+            if abs(p) <= margin or follower.stopped is not None:
                 continue
             buy, sell = walk(1, size), walk(-1, size)
             if buy is None or sell is None:
                 continue
             cost = (buy - sell) / gm * 1e4
-            if abs(p) > cost + margin:
-                task = _asyncio.create_task(
-                    follower.trade("フェア価格", 1 if p > 0 else -1, p, time.time_ns()))
+            if abs(p) <= cost + margin:
+                armed[0] = True
+                continue
+            # Trade whenever free, as the replay does; but count a run of
+            # steps above the line as one signal, so a skip is one move missed.
+            fresh, armed[0] = armed[0], False
+            if not (fresh or follower.ready()):
+                continue
+            now, side = time.time_ns(), 1 if p > 0 else -1
+            extra = {"predicted_bps": round(abs(p), 3), "cost_bps": round(cost, 3),
+                     "margin_bps": margin}
+            if follower.saw_signal("フェア価格", side, p, now, extra):
+                task = _asyncio.create_task(follower.trade("フェア価格", side, p, now, extra))
                 trades.add(task)
                 task.add_done_callback(trades.discard)
 
@@ -4690,7 +4701,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 continue
             books[src].apply(event)
             signal = None if model else detector.update(src, rx, mid(src))
-            if signal and follower.ready():
+            if signal and follower.saw_signal(*signal, rx):
                 lead, side, gap = signal
                 task = _asyncio.create_task(follower.trade(lead, side, gap, rx))
                 trades.add(task)
@@ -4713,6 +4724,28 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                                                  else "予定の時間が終わりました"))
         if session is not None:
             await session.close()
+    return 0
+
+
+async def cmd_gmofollow_report(args: argparse.Namespace) -> int:
+    """The live (or shadow) follow run's numbers, from its log."""
+    from .live.gmofollow import summary
+
+    rows = []
+    for line in Path(args.log).read_text().splitlines():
+        with contextlib.suppress(ValueError):
+            rows.append(json.loads(line))
+    if args.since:
+        from datetime import UTC, datetime
+
+        t = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        t = t if t.tzinfo else t.replace(tzinfo=UTC)
+        cut = int(t.timestamp() * 1e9)
+        rows = [r for r in rows if int(r.get("signal_ns", 0)) >= cut]
+    for line in summary(rows):
+        print(line)
+    if args.slack:
+        await _post_slack(":clipboard: GMO 後追いの記録のまとめ\n  " + "\n  ".join(summary(rows)))
     return 0
 
 
@@ -8102,6 +8135,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")
     p_gf.add_argument("--slack", action="store_true")
     p_gf.set_defaults(func=cmd_gmofollow)
+
+    p_gr = sub.add_parser("gmofollow-report", help="gmofollow の記録をまとめる（約定率・ずれ・遅れ・損益）")
+    p_gr.add_argument("log", help="gmofollow --log のファイル")
+    p_gr.add_argument("--since", default=None, help="この時刻（UTC）以降の合図だけ")
+    p_gr.add_argument("--slack", action="store_true")
+    p_gr.set_defaults(func=cmd_gmofollow_report)
 
     p_ar = sub.add_parser("arbedge", help="bitbank と GMO の値段の差が手数料を超えたときだけ取引した損益")
     p_ar.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
