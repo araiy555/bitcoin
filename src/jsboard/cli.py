@@ -4391,6 +4391,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     from .research.fairprice import (
         HEADER,
         calibration_text,
+        model_dict,
         report,
         run,
         slack_summary,
@@ -4474,6 +4475,14 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             print(line, flush=True)
         for line in calibration_text(r):
             print(line, flush=True)
+        if args.save_model:
+            folder = Path(args.save_model)
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{symbol}.json"
+            path.write_text(json.dumps(model_dict(
+                r, cross=used, step_ms=100, latency_ms=args.latency_ms,
+                train=[args.train]), ensure_ascii=False, indent=1))
+            print(f"  式と入る基準を保存しました: {path}", flush=True)
         print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
         for line in weights_text(r, holds[-1]):
             print(line)
@@ -4521,7 +4530,32 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
     if len(feeds) < 2:
         console.print("[red]先行市場がありません。[/red]")
         return 1
-    books = {k: _Book() for k in feeds}
+    model = None
+    if args.model:
+        from .research.fairprice import Grid, feature_names
+
+        model = json.loads(Path(args.model).read_text())
+        hold = f"{args.hold_s:g}"
+        if hold not in model["weights"]:
+            console.print(f"[red]式に {hold}秒 の分がありません（あるのは {', '.join(model['weights'])}秒）。[/red]")
+            return 1
+        weights, margin = model["weights"][hold], float(model["margin_bps"].get(hold, 0.0))
+        for c in model.get("cross", []):
+            cperp = f"{c.split('_')[0]}USDT"
+            try:
+                ci = await fetch_futures_instrument(cperp)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[yellow]{cperp}: 使えません ({exc})。この材料は 0 として計算します[/yellow]")
+                continue
+            feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
+        grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
+                    model.get("cross", []), int(model.get("step_ms", 100)))
+        if len(weights) != len(feature_names(model.get("cross", []))):
+            console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
+            return 1
+        books = grid.books
+    else:
+        books = {k: _Book() for k in feeds}
 
     def walk(side: int, qty: float) -> float | None:
         b = books["gmo"]
@@ -4585,10 +4619,12 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                         log=record, notify=notify)
     detector = Detector(threshold_bps=args.threshold_bps)
     mode = "本番（実際に注文します）" if args.live else "シャドー（注文は出しません）"
+    rule = (f"フェア価格の式（{Path(args.model).name}）で、予想が往復コスト＋{margin:g}bps を超えたとき"
+            if model else f"先行が {args.threshold_bps:g}bps 以上先に動いたとき")
     await notify(
         f":rocket: GMO 後追いを始めました: {mode}\n"
         f"  {symbol} 1回 {args.size}枚・{args.hold_s:g}秒で決済・同時に1つまで・"
-        f"先行が {args.threshold_bps:g}bps 以上先に動いたとき（{'/'.join(k for k in feeds if k != 'gmo')}）\n"
+        f"{rule}（{'/'.join(k for k in feeds if k != 'gmo')}）\n"
         f"  損失の上限 {args.max_loss_jpy:,.0f}円・最大 {args.max_trades}回・{args.hours:g}時間")
 
     queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
@@ -4598,6 +4634,35 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             await queue.put((src, time.time_ns(), event))
 
     pumps = [_asyncio.create_task(pump(src, feed)) for src, feed in feeds.items()]
+    trades: set = set()
+
+    async def fair_price() -> None:
+        """Every grid step, as in the replay: take the mids, price GMO, and
+        trade when the predicted move clears the round trip by the margin."""
+        step = int(model.get("step_ms", 100)) / 1000
+        size = float(args.size)
+        while True:
+            await _asyncio.sleep(step - (time.time() % step))
+            grid.push()
+            if not grid.ready():
+                continue
+            gm = grid.mid("gmo")
+            x = grid.features(gm)
+            p = sum(w * v for w, v in zip(weights, x, strict=True))
+            if abs(p) <= margin or not follower.ready():
+                continue
+            buy, sell = walk(1, size), walk(-1, size)
+            if buy is None or sell is None:
+                continue
+            cost = (buy - sell) / gm * 1e4
+            if abs(p) > cost + margin:
+                task = _asyncio.create_task(
+                    follower.trade("フェア価格", 1 if p > 0 else -1, p, time.time_ns()))
+                trades.add(task)
+                task.add_done_callback(trades.discard)
+
+    if model:
+        pumps.append(_asyncio.create_task(fair_price()))
     halt = _asyncio.Event()
     import signal as _signal
 
@@ -4607,7 +4672,6 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
         # what is open instead of dying with a position on.
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, halt.set)
-    trades: set = set()
     end = time.monotonic() + args.hours * 3600
     next_summary = time.monotonic() + 3600
     try:
@@ -4622,8 +4686,10 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 continue
             if not isinstance(event, (DepthSnapshot, DepthDelta)):
                 continue
+            if src not in books:
+                continue
             books[src].apply(event)
-            signal = detector.update(src, rx, mid(src))
+            signal = None if model else detector.update(src, rx, mid(src))
             if signal and follower.ready():
                 lead, side, gap = signal
                 task = _asyncio.create_task(follower.trade(lead, side, gap, rx))
@@ -8016,6 +8082,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--margins", default="0,1,2,3,4,6,8,12", help="学習期間で試す上乗せ幅")
     p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
     p_fp.add_argument("--slack", action="store_true")
+    p_fp.add_argument("--save-model", default=None,
+                      help="式と入る基準をこのフォルダに銘柄ごとに保存する（本番の gmofollow --model で使う）")
     p_fp.set_defaults(func=cmd_fairprice)
 
     p_gf = sub.add_parser("gmofollow", help="海外が先に動いたら GMO で後追い（--live で実際に注文。無しなら注文を出さない）")
@@ -8027,6 +8095,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--max-loss-jpy", type=float, default=500.0)
     p_gf.add_argument("--max-trades", type=int, default=1000)
     p_gf.add_argument("--hours", type=float, default=24.0)
+    p_gf.add_argument("--model", default=None,
+                      help="フェア価格の式（fairprice --save-model で作った JSON）。指定すると後追いの代わりにこれで入る")
     p_gf.add_argument("--live", action="store_true", help="実際に注文する")
     p_gf.add_argument("--env-file", default="/etc/jsboard.env")
     p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")

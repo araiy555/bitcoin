@@ -178,6 +178,71 @@ class _Series:
         return math.log(now / then) * 1e4
 
 
+class Grid:
+    """The model's inputs, kept current from the books and read every grid
+    step. Shared by the replay and the live run, so both compute the very
+    same features."""
+
+    def __init__(self, gmo: Instrument, leads: dict, cross=(), step_ms: int = 100) -> None:
+        self.gmo = gmo
+        self.cross = tuple(cross)
+        self.books = {"gmo": _Book(), "bybit": _Book(), "binance": _Book()}
+        self.books.update({f"x:{c}": _Book() for c in self.cross})
+        self.series = {k: _Series(max(LAGS) + 1) for k in self.books}
+        self.insts = {"gmo": gmo, **leads}
+        self.basis_avg: dict = {}
+        self.alpha = step_ms / 60_000  # one-minute average of the premium
+
+    def apply(self, src: str, event) -> None:
+        if src in self.books:
+            self.books[src].apply(event)
+
+    def mid(self, key: str) -> float | None:
+        b, inst = self.books[key], self.insts.get(key)
+        if b.best_bid is None or b.best_ask is None or inst is None:
+            return None
+        return (b.best_bid + b.best_ask) / 2 * float(inst.tick_size)
+
+    def imbalance(self, levels: int) -> float:
+        b = self.books["gmo"]
+        bids = heapq.nlargest(levels, b.bids.items())
+        asks = heapq.nsmallest(levels, b.asks.items())
+        bq, aq = sum(q for _, q in bids), sum(q for _, q in asks)
+        return (bq - aq) / (bq + aq) if bq + aq else 0.0
+
+    def push(self) -> None:
+        """Take this grid step's mids."""
+        for key, s in self.series.items():
+            s.push(self.mid(key))
+
+    def ready(self) -> bool:
+        return self.mid("gmo") is not None and (
+            self.mid("bybit") is not None or self.mid("binance") is not None)
+
+    def features(self, gmo_mid: float) -> list[float]:
+        x = [1.0]
+        for lead in ("bybit", "binance"):
+            s = self.series[lead]
+            x += [s.ret(lag) for lag in LAGS]
+            lm = self.mid(lead)
+            if lm:
+                basis = math.log(gmo_mid / lm) * 1e4
+                avg = self.basis_avg.get(lead)
+                self.basis_avg[lead] = basis if avg is None else avg + self.alpha * (basis - avg)
+                x.append(basis - self.basis_avg[lead])
+            else:
+                x.append(0.0)
+        x += [self.series["gmo"].ret(lag) for lag in LAGS]
+        b = self.books["gmo"]
+        gmo = self.gmo
+        spread = (gmo.price_f(b.best_ask) - gmo.price_f(b.best_bid)) / gmo_mid * 1e4
+        x += [self.imbalance(1), self.imbalance(5), spread]
+        for c in self.cross:
+            s = self.series[f"x:{c}"]
+            x += [s.ret(5), s.ret(10)]
+        return x
+
+
 def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int],
         test: tuple[int, int],
         holds=(2.0, 5.0, 10.0), cross=(), step_ms: int = 100, latency_ms: int = 200,
@@ -204,14 +269,8 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     lat = max(1, round(latency_ms / step_ms))
     hsteps = {h: max(1, round(h * 1000 / step_ms)) for h in holds}
     longest = lat + max(hsteps.values())
-    keep = max(LAGS) + 1
-    alpha = step_ms / 60_000  # one-minute average of the premium
-
-    books = {"gmo": _Book(), "bybit": _Book(), "binance": _Book()}
-    books.update({f"x:{c}": _Book() for c in cross})
-    series = {k: _Series(keep) for k in books}
-    insts = {"gmo": gmo, **leads}
-    basis_avg: dict = {}
+    grid = Grid(gmo, leads, cross, step_ms)
+    books, series, mid = grid.books, grid.series, grid.mid
 
     fit = Fit(len(names), tuple(holds))
     weights: dict | None = None
@@ -232,41 +291,6 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     busy.update({("cal", m, h): -1 for m in margins for h in holds})
     grid_t = None
     g = 0
-
-    def mid(key: str) -> float | None:
-        b, inst = books[key], insts.get(key)
-        if b.best_bid is None or b.best_ask is None or inst is None:
-            return None
-        return (b.best_bid + b.best_ask) / 2 * float(inst.tick_size)
-
-    def imbalance(levels: int) -> float:
-        b = books["gmo"]
-        bids = heapq.nlargest(levels, b.bids.items())
-        asks = heapq.nsmallest(levels, b.asks.items())
-        bq, aq = sum(q for _, q in bids), sum(q for _, q in asks)
-        return (bq - aq) / (bq + aq) if bq + aq else 0.0
-
-    def features(gmo_mid: float) -> list[float]:
-        x = [1.0]
-        for lead in ("bybit", "binance"):
-            s = series[lead]
-            x += [s.ret(lag) for lag in LAGS]
-            lm = mid(lead)
-            if lm:
-                basis = math.log(gmo_mid / lm) * 1e4
-                avg = basis_avg.get(lead)
-                basis_avg[lead] = basis if avg is None else avg + alpha * (basis - avg)
-                x.append(basis - basis_avg[lead])
-            else:
-                x.append(0.0)
-        x += [series["gmo"].ret(lag) for lag in LAGS]
-        b = books["gmo"]
-        spread = (gmo.price_f(b.best_ask) - gmo.price_f(b.best_bid)) / gmo_mid * 1e4
-        x += [imbalance(1), imbalance(5), spread]
-        for c in cross:
-            s = series[f"x:{c}"]
-            x += [s.ret(5), s.ret(10)]
-        return x
 
     def qty_for(price: float) -> float:
         lot = float(gmo.lot_size)
@@ -324,8 +348,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         nonlocal weights, armed, cal_start
         for action in tasks.pop(g, ()):
             action()
-        for key, s in series.items():
-            s.push(mid(key))
+        grid.push()
         gm = mid("gmo")
         gmo_mids.append(gm)
         while len(gmo_mids) > longest + 2:
@@ -363,7 +386,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                         sc.hit += (p > 0) == (y > 0)
         if gm is None or mid("bybit") is None and mid("binance") is None:
             return
-        x = features(gm)
+        x = grid.features(gm)
         if calibrate and not out.train_n and train[0] <= t < train[1]:
             cal_start = t + int((train[1] - t) * (1 - cal_frac))
         if train[0] <= t < cal_start:
@@ -420,7 +443,25 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         books[src].apply(event)
     if weights is None:
         out.weights = fit.weights(ridge)
+    if calibrate and not out.chosen and out.cal:
+        # No test period seen (fitting a model to use live): pick the margin
+        # from the training period all the same.
+        for h in holds:
+            enough = [(m, out.cal[(m, h)]) for m in margins if out.cal[(m, h)].n >= min_cal_trades]
+            out.chosen[h] = (max(enough, key=lambda mb: (mb[1].pnl, mb[0]))[0]
+                             if enough else max(margins))
     return out
+
+
+def model_dict(r: FairResult, *, cross, step_ms: int, latency_ms: int, train) -> dict:
+    """What the live run needs to price GMO exactly as the replay did."""
+    return {
+        "symbol": r.label, "names": r.names, "cross": list(cross), "step_ms": step_ms,
+        "latency_ms": latency_ms, "train": list(train),
+        "weights": {f"{h:g}": w for h, w in r.weights.items()},
+        "margin_bps": {f"{h:g}": m for h, m in r.chosen.items()},
+        "calibration": {f"{m:g}/{h:g}": [b.n, round(b.pnl, 2)] for (m, h), b in r.cal.items()},
+    }
 
 
 HEADER = "\t".join(["銘柄", "持つ秒", "未知データでの説明力 R²", "向きの的中", "やり方",

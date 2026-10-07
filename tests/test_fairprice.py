@@ -68,7 +68,7 @@ def test_no_lag_no_trades():
     assert r.model[2.0].n == 0
 
 
-async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys):
+async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys, tmp_path):
     import gzip
     import io
     import json
@@ -118,12 +118,15 @@ async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys):
     monkeypatch.setattr(s3, "default_client", Bucket)
     args = cli.build_parser().parse_args([
         "fairprice", "s3://b/raw/lead/", "--only", "XRP_JPY", "--cross", "BTC_JPY",
-        "--train", f"{iso(T0)},{iso(mid)}", "--test", f"{iso(mid)},{iso(end)}", "--holds", "2"])
+        "--train", f"{iso(T0)},{iso(mid)}", "--test", f"{iso(mid)},{iso(end)}", "--holds", "2",
+        "--save-model", str(tmp_path)])
     assert await args.func(args) == 0
     out = capsys.readouterr().out.splitlines()
     model = next(x for x in out if "フェア価格モデル" in x).split("\t")
     assert int(model[5]) > 5 and model[6].startswith("+")
     assert any("単純な後追い" in x for x in out)
+    saved = json.loads((tmp_path / "XRP_JPY.json").read_text())
+    assert len(saved["weights"]["2"]) == len(saved["names"]) and "2" in saved["margin_bps"]
 
 
 def test_the_entry_margin_is_chosen_on_training_data_only():

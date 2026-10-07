@@ -191,3 +191,54 @@ def test_live_without_keys_refuses_before_connecting(monkeypatch, tmp_path):
     args = cli.build_parser().parse_args([
         "gmofollow", "--live", "--env-file", str(tmp_path / "none.env")])
     assert asyncio.run(args.func(args)) == 1
+
+
+def test_the_command_trades_on_a_fair_price_model(monkeypatch, tmp_path):
+    import json
+    from decimal import Decimal
+
+    import jsboard.cli as cli
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import DepthSnapshot
+    from jsboard.research.fairprice import feature_names
+
+    gmo = Instrument("XRP_JPY", Decimal("0.001"), Decimal("1"), "XRP", "JPY")
+    perp = Instrument("XRPUSDT", Decimal("0.0001"), Decimal("1"), "XRP", "USDT")
+
+    class Script:
+        def __init__(self, prices, tick, delay):
+            self.prices, self.tick, self.delay = prices, tick, delay
+
+        async def __aiter__(self):
+            for p in self.prices:
+                await asyncio.sleep(self.delay)
+                b = round(p / self.tick)
+                yield DepthSnapshot(((b, 10_000),), ((b + 2, 10_000),), 1)
+            await asyncio.sleep(3600)
+
+    async def live_book(target):
+        return gmo, Script([150.0] * 40, 0.001, 0.05)
+
+    async def bybit_inst(sym, cat="linear"):
+        return perp
+
+    async def no_binance(sym):
+        raise RuntimeError("off")
+
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_bybit_instrument", bybit_inst)
+    monkeypatch.setattr(cli, "BybitFeed", lambda inst, **kw: Script([1.0] * 15 + [1.002] * 25,
+                                                                     0.0001, 0.05))
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_binance)
+    names = feature_names(())
+    w = [0.0] * len(names)
+    w[names.index("bybit 1秒")] = 1.0  # predict GMO follows Bybit's last second one for one
+    model = tmp_path / "XRP_JPY.json"
+    model.write_text(json.dumps({"symbol": "XRP_JPY", "names": names, "cross": [], "step_ms": 100,
+                                 "weights": {"0.3": w}, "margin_bps": {"0.3": 1.0}}))
+    log = tmp_path / "t.jsonl"
+    args = cli.build_parser().parse_args([
+        "gmofollow", "--model", str(model), "--hold-s", "0.3", "--hours", "0.0007", "--log", str(log)])
+    assert asyncio.run(args.func(args)) == 0
+    recs = [json.loads(x) for x in log.read_text().splitlines()]
+    assert recs and recs[0]["lead"] == "フェア価格" and recs[0]["side"] == "BUY"
