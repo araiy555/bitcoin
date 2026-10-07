@@ -4487,6 +4487,169 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_gmofollow(args: argparse.Namespace) -> int:
+    """Follow Bybit/Binance on GMO's leverage book: real orders with --live,
+    the same run against the live book without them. Every trade is logged."""
+    import asyncio as _asyncio
+
+    from .feed.base import FeedStatus as _Status
+    from .live.gmo import GmoPrivate, load_keys
+    from .live.gmofollow import Detector, Follower, ShadowApi
+    from .research.arbedge import _Book
+    from .research.daily import Target
+
+    coin = args.coin.upper()
+    symbol, perp = f"{coin}_JPY", f"{coin}USDT"
+    keys = load_keys(args.env_file) if args.live else None
+    if args.live and keys is None:
+        console.print("[red]GMO_API_KEY と GMO_API_SECRET を /etc/jsboard.env に入れてください"
+                      "（キーはここには表示しません）。[/red]")
+        return 1
+    gm_inst, gm_feed = await _live_book(Target("gmo", symbol))
+    feeds = {"gmo": gm_feed}
+    insts = {"gmo": gm_inst}
+    try:
+        bybit = await fetch_bybit_instrument(perp, "linear")
+        feeds["bybit"], insts["bybit"] = BybitFeed(bybit, category="linear", depth=50), bybit
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Bybit {perp}: 使えません ({exc})[/yellow]")
+    try:
+        binance = await fetch_futures_instrument(perp)
+        feeds["binance"], insts["binance"] = _binance_lead(binance, 100), binance
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Binance {perp}: 使えません ({exc})[/yellow]")
+    if len(feeds) < 2:
+        console.print("[red]先行市場がありません。[/red]")
+        return 1
+    books = {k: _Book() for k in feeds}
+
+    def walk(side: int, qty: float) -> float | None:
+        b = books["gmo"]
+        return b.take(side, qty, gm_inst) if b.best_bid is not None and b.best_ask is not None else None
+
+    def touch():
+        b = books["gmo"]
+        if b.best_bid is None or b.best_ask is None:
+            return None, None
+        return gm_inst.price_f(b.best_bid), gm_inst.price_f(b.best_ask)
+
+    def mid(src: str) -> float | None:
+        b = books[src]
+        if b.best_bid is None or b.best_ask is None:
+            return None
+        return (b.best_bid + b.best_ask) / 2 * float(insts[src].tick_size)
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(rec: dict) -> None:
+        rec = {"live": bool(args.live), **rec}
+        with log_path.open("a") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        bits = [rec.get("side", ""), rec.get("lead", "")]
+        if "pnl_jpy" in rec:
+            bits += [f"入 {rec['entry_price']:g}", f"出 {rec['exit_price']:g}",
+                     f"{rec['pnl_jpy']:+.2f}円", f"({rec['pnl_bps']:+.1f}bps",
+                     f"検証なら {rec.get('expected_pnl_bps', float('nan')):+.1f}bps)",
+                     f"注文→受付 {rec['send_to_ack_ms']:.0f}ms"]
+        else:
+            bits.append(rec.get("error") or rec.get("exit_error") or "")
+        print("  ".join(str(b) for b in bits), flush=True)
+
+    async def notify(text: str) -> None:
+        print(text, flush=True)
+        if args.slack:
+            await _post_slack(text)
+
+    session = None
+    if args.live:
+        session = make_session()
+        api = GmoPrivate(*keys, session=session)
+        try:
+            held = await api.open_positions(symbol)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]GMO の口座を確認できません: {exc}[/red]")
+            await session.close()
+            return 1
+        if held:
+            console.print(f"[red]{symbol} にポジションが {len(held)} 件あります。"
+                          "自分のポジションに触らないよう、決済してから始めてください。[/red]")
+            await session.close()
+            return 1
+    else:
+        api = ShadowApi(walk)
+
+    follower = Follower(api=api, symbol=symbol, size=args.size, walk=walk, touch=touch,
+                        hold_s=args.hold_s, latency_ms=args.latency_ms,
+                        max_loss_jpy=args.max_loss_jpy, max_trades=args.max_trades,
+                        log=record, notify=notify)
+    detector = Detector(threshold_bps=args.threshold_bps)
+    mode = "本番（実際に注文します）" if args.live else "シャドー（注文は出しません）"
+    await notify(
+        f":rocket: GMO 後追いを始めました: {mode}\n"
+        f"  {symbol} 1回 {args.size}枚・{args.hold_s:g}秒で決済・同時に1つまで・"
+        f"先行が {args.threshold_bps:g}bps 以上先に動いたとき（{'/'.join(k for k in feeds if k != 'gmo')}）\n"
+        f"  損失の上限 {args.max_loss_jpy:,.0f}円・最大 {args.max_trades}回・{args.hours:g}時間")
+
+    queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
+
+    async def pump(src: str, feed) -> None:
+        async for event in feed:
+            await queue.put((src, time.time_ns(), event))
+
+    pumps = [_asyncio.create_task(pump(src, feed)) for src, feed in feeds.items()]
+    halt = _asyncio.Event()
+    import signal as _signal
+
+    loop = _asyncio.get_running_loop()
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        # systemctl stop sends SIGTERM: finish the trade in hand and close
+        # what is open instead of dying with a position on.
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, halt.set)
+    trades: set = set()
+    end = time.monotonic() + args.hours * 3600
+    next_summary = time.monotonic() + 3600
+    try:
+        while follower.stopped is None and time.monotonic() < end and not halt.is_set():
+            try:
+                src, rx, event = await _asyncio.wait_for(queue.get(), timeout=5)
+            except TimeoutError:
+                continue
+            if isinstance(event, _Status):
+                if event.state != "live":
+                    detector.reset(src)
+                continue
+            if not isinstance(event, (DepthSnapshot, DepthDelta)):
+                continue
+            books[src].apply(event)
+            signal = detector.update(src, rx, mid(src))
+            if signal and follower.ready():
+                lead, side, gap = signal
+                task = _asyncio.create_task(follower.trade(lead, side, gap, rx))
+                trades.add(task)
+                task.add_done_callback(trades.discard)
+            if time.monotonic() >= next_summary:
+                next_summary += 3600
+                await notify(f":bar_chart: GMO 後追い（{mode}）1時間ごとの集計: {follower.tally.text()}")
+    finally:
+        if trades:
+            await _asyncio.gather(*trades, return_exceptions=True)
+        if follower.open_positions:
+            # Never leave a position of ours behind.
+            fills, _ = await follower.close(follower.open_back)
+            if not fills:
+                await notify(":warning: GMO 後追い: 決済できなかったポジションがあります。GMO の画面で確認してください")
+        for p in pumps:
+            p.cancel()
+        await _asyncio.gather(*pumps, return_exceptions=True)
+        await follower.stop(follower.stopped or ("止める指示を受けました" if halt.is_set()
+                                                 else "予定の時間が終わりました"))
+        if session is not None:
+            await session.close()
+    return 0
+
+
 async def cmd_arbedge(args: argparse.Namespace) -> int:
     """bitbank against GMO on the pair recordings: trade only when they part."""
     import re
@@ -7854,6 +8017,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
     p_fp.add_argument("--slack", action="store_true")
     p_fp.set_defaults(func=cmd_fairprice)
+
+    p_gf = sub.add_parser("gmofollow", help="海外が先に動いたら GMO で後追い（--live で実際に注文。無しなら注文を出さない）")
+    p_gf.add_argument("--coin", default="xrp")
+    p_gf.add_argument("--size", default="10", help="1回の注文（枚）")
+    p_gf.add_argument("--threshold-bps", type=float, default=8.0)
+    p_gf.add_argument("--hold-s", type=float, default=10.0)
+    p_gf.add_argument("--latency-ms", type=float, default=200.0, help="検証で置いた遅れ（比べる用）")
+    p_gf.add_argument("--max-loss-jpy", type=float, default=500.0)
+    p_gf.add_argument("--max-trades", type=int, default=1000)
+    p_gf.add_argument("--hours", type=float, default=24.0)
+    p_gf.add_argument("--live", action="store_true", help="実際に注文する")
+    p_gf.add_argument("--env-file", default="/etc/jsboard.env")
+    p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")
+    p_gf.add_argument("--slack", action="store_true")
+    p_gf.set_defaults(func=cmd_gmofollow)
 
     p_ar = sub.add_parser("arbedge", help="bitbank と GMO の値段の差が手数料を超えたときだけ取引した損益")
     p_ar.add_argument("path", help="同時録画のフォルダ（例: s3://jsboard-capture/raw/pair/）")
