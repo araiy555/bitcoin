@@ -153,6 +153,11 @@ class FairResult:
     score: dict = field(default_factory=dict)
     model: dict = field(default_factory=dict)
     rule: dict = field(default_factory=dict)
+    cal: dict = field(default_factory=dict)
+    """(margin, hold) -> Book, traded on the last part of the training period."""
+    chosen: dict = field(default_factory=dict)
+    """hold -> the margin picked on that part and used on the test."""
+    cal_n: int = 0
 
 
 class _Series:
@@ -177,12 +182,22 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         test: tuple[int, int],
         holds=(2.0, 5.0, 10.0), cross=(), step_ms: int = 100, latency_ms: int = 200,
         size_jpy: float = 10_000.0, fee_bps: float = 0.0, min_order: float = 0.0,
-        margin_bps: float = 0.0, rule_bps: float = 8.0, ridge: float = 1e-3) -> FairResult:
+        margin_bps: float | None = None, rule_bps: float = 8.0, ridge: float = 1e-3,
+        margins=(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0), cal_frac: float = 0.3,
+        min_cal_trades: int = 20) -> FairResult:
     """`rows` yields (source, receive_ns, event) in time order. Sources:
     "gmo" (GMO's book), "bybit" and "binance" (the same coin's perps), and
     "x:<name>" for another coin's perp; `leads` maps each of those sources
     to its Instrument. `train` and `test` are
-    [start, end) receive times in ns; test must start after train ends."""
+    [start, end) receive times in ns; test must start after train ends.
+
+    How far the prediction must clear the round trip before a trade is
+    taken (the margin) is chosen inside `train`, never on `test`: the
+    model is fitted on the first part of `train`, traded at every margin
+    in `margins` on its last `cal_frac`, and the margin that made the most
+    there (with at least `min_cal_trades` trades; else the largest) is the
+    one used on `test`. A fixed `margin_bps` skips that and fits on all
+    of `train`."""
     names = feature_names(cross)
     out = FairResult(label, names, tuple(holds))
     step = step_ms * 1_000_000
@@ -208,6 +223,13 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     out.score = {h: Score() for h in holds}
     out.model = {h: Book() for h in holds}
     out.rule = {h: Book() for h in holds}
+    calibrate = margin_bps is None
+    # Set from the first sample actually inside `train`: a window opened
+    # before the recording starts would otherwise leave nothing to fit on.
+    cal_start = train[1]
+    out.cal = {(m, h): Book() for m in margins for h in holds} if calibrate else {}
+    out.chosen = {h: margin_bps for h in holds} if not calibrate else {}
+    busy.update({("cal", m, h): -1 for m in margins for h in holds})
     grid_t = None
     g = 0
 
@@ -263,7 +285,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     def schedule(at: int, action) -> None:
         tasks.setdefault(at, []).append(action)
 
-    def open_trade(kind: str, h: float, side: int, qty: float) -> None:
+    def open_trade(book: Book, h: float, side: int, qty: float) -> None:
         def enter() -> None:
             price = books["gmo"].take(side, qty, gmo)
             if price is None:
@@ -274,7 +296,6 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                 if back is None:
                     return
                 pnl = side * qty * (back - price) - (price + back) * qty * fee_bps / 1e4
-                book = (out.model if kind == "model" else out.rule)[h]
                 book.n += 1
                 book.wins += pnl > 0
                 book.notional += price * qty
@@ -283,8 +304,24 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             schedule(g + hsteps[h], leave)
         schedule(g + lat, enter)
 
+    def trade(x: list[float], gm: float, slots) -> None:
+        """Take each (margin, hold) slot whose prediction clears the round
+        trip by the margin; `slots` are (margin, hold, busy key, book)."""
+        qty = qty_for(gm)
+        cost = None
+        preds = {h: sum(w * v for w, v in zip(weights[h], x, strict=True)) for h in holds}
+        for m, h, key, book in slots:
+            p = preds[h]
+            if g < busy[key] or abs(p) <= m:
+                continue
+            # Walking the book costs a sort, so only when a trade is in reach.
+            cost = round_trip_bps(gm, qty) if cost is None else cost
+            if cost is not None and abs(p) > cost + m:
+                busy[key] = g + lat + hsteps[h]
+                open_trade(book, h, 1 if p > 0 else -1, qty)
+
     def on_grid(t: int) -> None:
-        nonlocal weights, armed
+        nonlocal weights, armed, cal_start
         for action in tasks.pop(g, ()):
             action()
         for key, s in series.items():
@@ -311,6 +348,8 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                 continue
             if phase == "train":
                 fit.add(x, ys)
+            elif phase == "cal":
+                continue
             elif weights is not None:
                 for h, y in ys.items():
                     p = sum(w * v for w, v in zip(weights[h], x, strict=True))
@@ -325,30 +364,32 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         if gm is None or mid("bybit") is None and mid("binance") is None:
             return
         x = features(gm)
-        if train[0] <= t < train[1]:
+        if calibrate and not out.train_n and train[0] <= t < train[1]:
+            cal_start = t + int((train[1] - t) * (1 - cal_frac))
+        if train[0] <= t < cal_start:
             pending.append((g, x, "train"))
             out.train_n += 1
             return
-        if not test[0] <= t < test[1]:
-            return
-        if weights is None:
+        if weights is None and (cal_start <= t < train[1] or test[0] <= t < test[1]):
             weights = fit.weights(ridge)
             out.weights = weights
+        if cal_start <= t < train[1]:
+            out.cal_n += 1
+            trade(x, gm, [(m, h, ("cal", m, h), out.cal[(m, h)]) for m in margins for h in holds])
+            return
+        if not test[0] <= t < test[1]:
+            return
+        if not out.chosen:
+            for h in holds:
+                tried = [(m, out.cal[(m, h)]) for m in margins]
+                enough = [(m, b) for m, b in tried if b.n >= min_cal_trades]
+                # A tie goes to the larger margin: fewer trades for the same money.
+                out.chosen[h] = (max(enough, key=lambda mb: (mb[1].pnl, mb[0]))[0]
+                                 if enough else max(margins))
         pending.append((g, x, "test"))
         out.test_n += 1
+        trade(x, gm, [(out.chosen[h], h, ("model", h), out.model[h]) for h in holds])
         qty = qty_for(gm)
-        cost = None
-        for h in holds:
-            if g < busy[("model", h)]:
-                continue
-            p = sum(w * v for w, v in zip(weights[h], x, strict=True))
-            if abs(p) <= margin_bps:
-                continue
-            # Walking the book costs a sort, so only when a trade is in reach.
-            cost = round_trip_bps(gm, qty) if cost is None else cost
-            if cost is not None and abs(p) > cost + margin_bps:
-                busy[("model", h)] = g + lat + hsteps[h]
-                open_trade("model", h, 1 if p > 0 else -1, qty)
         # The one-signal rule on the same grid: a lead moved `rule_bps`
         # more than GMO over the last second, the lead itself that far.
         leads = [series[k].ret(10) for k in ("bybit", "binance") if mid(k)]
@@ -365,7 +406,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         for h in holds:
             if g >= busy[("rule", h)]:
                 busy[("rule", h)] = g + lat + hsteps[h]
-                open_trade("rule", h, 1 if gap > 0 else -1, qty)
+                open_trade(out.rule[h], h, 1 if gap > 0 else -1, qty)
 
     for src, rx, event in rows:
         if src not in books or not isinstance(event, (DepthSnapshot, DepthDelta)):
@@ -401,6 +442,21 @@ def report(r: FairResult) -> list[str]:
     return lines
 
 
+def calibration_text(r: FairResult) -> list[str]:
+    """What each margin made on the end of the training period, and the pick."""
+    if not r.cal:
+        return [f"  入る基準（固定）: 往復コスト + {r.chosen.get(h, 0):g}bps" for h in r.holds[:1]]
+    margins = sorted({m for m, _ in r.cal})
+    out = [f"  入る基準の決め方: 学習期間の最後の部分（{r.cal_n:,} 点）で、上乗せ幅ごとに売買した結果"]
+    for h in r.holds:
+        cells = []
+        for m in margins:
+            b = r.cal[(m, h)]
+            cells.append(f"+{m:g}bps: {b.n}回 {b.pnl:+,.0f}円" if b.n else f"+{m:g}bps: 0回")
+        out.append(f"   {h:g}秒  " + " / ".join(cells) + f"  → 選んだのは +{r.chosen.get(h, 0):g}bps")
+    return out
+
+
 def weights_text(r: FairResult, h: float) -> list[str]:
     w = r.weights.get(h) or []
     return [f"  {name}: {v:+.4f}" for name, v in zip(r.names, w, strict=False)]
@@ -415,6 +471,7 @@ def slack_summary(results: list[FairResult]) -> str:
             def cell(b: Book) -> str:
                 return "取引なし" if not b.n else f"{b.bps():+.1f}bps {b.n}回 勝率{b.wins / b.n:.0%} {b.pnl:+,.0f}円"
 
-            lines.append(f"  • {r.label} {h:g}秒  モデル: {cell(m)}  /  後追い: {cell(s)}  （R² {sc.r2():+.3f}）")
-    lines.append("  （モデルは前の時間帯で作り、この時間帯では一度も調整していません）")
+            lines.append(f"  • {r.label} {h:g}秒  モデル（コスト+{r.chosen.get(h, 0):g}bps で入る）: {cell(m)}"
+                         f"  /  後追い: {cell(s)}  （R² {sc.r2():+.3f}）")
+    lines.append("  （モデルと入る基準は前の時間帯だけで決め、この時間帯では一度も調整していません）")
     return "\n".join(lines)

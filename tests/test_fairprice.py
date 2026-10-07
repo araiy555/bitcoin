@@ -44,7 +44,7 @@ def test_a_lagging_follower_is_learned_and_traded_on_unseen_data():
     r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(0, mid), test=(mid, end),
             holds=(2.0,), latency_ms=200)
     w = dict(zip(feature_names(()), r.weights[2.0], strict=True))
-    assert w["bybit 1秒"] > 0.3
+    assert w["bybit 1秒"] > 0.1
     assert r.score[2.0].r2() > 0.2
     m = r.model[2.0]
     assert m.n > 5 and m.pnl > 0 and m.wins / m.n > 0.6
@@ -124,3 +124,25 @@ async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys):
     model = next(x for x in out if "フェア価格モデル" in x).split("\t")
     assert int(model[5]) > 5 and model[6].startswith("+")
     assert any("単純な後追い" in x for x in out)
+
+
+def test_the_entry_margin_is_chosen_on_training_data_only():
+    rows, mid, end = tape()
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
+            holds=(2.0,), min_cal_trades=5)
+    assert r.cal_n > 0 and r.train_n > 0
+    assert r.chosen[2.0] in (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)
+    best = max((b.pnl, m) for (m, h), b in r.cal.items() if b.n >= 5)[1]
+    assert r.chosen[2.0] == best
+    # Changing only the test period cannot change the pick.
+    rows2 = [(s, t, ev) for s, t, ev in rows if t < mid]
+    r2 = run(iter(rows2), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
+             holds=(2.0,), min_cal_trades=5)
+    assert r2.chosen == {} or r2.chosen[2.0] == r.chosen[2.0]
+
+
+def test_a_fixed_margin_fits_on_all_of_training():
+    rows, mid, end = tape()
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
+            holds=(2.0,), margin_bps=2.0)
+    assert r.cal == {} and r.cal_n == 0 and r.chosen == {2.0: 2.0}

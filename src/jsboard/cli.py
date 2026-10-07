@@ -4388,7 +4388,14 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
 
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
-    from .research.fairprice import HEADER, report, run, slack_summary, weights_text
+    from .research.fairprice import (
+        HEADER,
+        calibration_text,
+        report,
+        run,
+        slack_summary,
+        weights_text,
+    )
     from .sim.s3 import exists, list_parts, read_bytes
 
     def when(text: str) -> datetime:
@@ -4461,8 +4468,11 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
                 latency_ms=args.latency_ms, size_jpy=args.size_jpy,
                 fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
                 min_order=float(specs["gmo"].get("min_order", 0) or 0),
-                margin_bps=args.margin_bps, rule_bps=args.rule_bps)
+                margin_bps=args.margin_bps, rule_bps=args.rule_bps,
+                margins=tuple(float(m) for m in args.margins.split(",")))
         for line in report(r):
+            print(line, flush=True)
+        for line in calibration_text(r):
             print(line, flush=True)
         print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
         for line in weights_text(r, holds[-1]):
@@ -7838,7 +7848,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--holds", default="2,5,10", help="何秒持つか")
     p_fp.add_argument("--latency-ms", type=int, default=200)
     p_fp.add_argument("--size-jpy", type=float, default=10_000.0)
-    p_fp.add_argument("--margin-bps", type=float, default=0.0, help="往復コストにさらに上乗せする分")
+    p_fp.add_argument("--margin-bps", type=float, default=None,
+                      help="往復コストにさらに上乗せする分。省略すると学習期間の最後の3割で決める")
+    p_fp.add_argument("--margins", default="0,1,2,3,4,6,8,12", help="学習期間で試す上乗せ幅")
     p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
     p_fp.add_argument("--slack", action="store_true")
     p_fp.set_defaults(func=cmd_fairprice)
