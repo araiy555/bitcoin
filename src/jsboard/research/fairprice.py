@@ -47,10 +47,11 @@ NS = 1_000_000_000
 LAGS = (1, 5, 10)  # grid steps: 0.1, 0.5, 1 s at the default step
 
 
-def feature_names(cross) -> list[str]:
+def feature_names(cross, hinge_bps: float = 8.0) -> list[str]:
     names = ["定数"]
     for lead in ("bybit", "binance"):
         names += [f"{lead} {x / 10:g}秒" for x in LAGS] + [f"{lead} との乖離"]
+        names.append(f"{lead} が GMO より1秒で先に動いた分の {hinge_bps:g}bps 超え")
     names += [f"GMO {x / 10:g}秒" for x in LAGS]
     names += ["GMO 板の偏り(最良)", "GMO 板の偏り(5段)", "GMO スプレッド"]
     for c in cross:
@@ -156,8 +157,13 @@ class FairResult:
     cal: dict = field(default_factory=dict)
     """(margin, hold) -> Book, traded on the last part of the training period."""
     chosen: dict = field(default_factory=dict)
-    """hold -> the margin picked on that part and used on the test."""
+    """hold -> the margin picked on that part and used on the test; None
+    when no margin made money there, and then the model does not trade."""
     cal_n: int = 0
+    min_gap: float = 0.0
+    """Fitted and traded only where a lead was this far ahead of GMO."""
+    variants: dict = field(default_factory=dict)
+    """min_gap -> FairResult, for every subset fitted; this one is the pick."""
 
 
 class _Series:
@@ -183,8 +189,12 @@ class Grid:
     step. Shared by the replay and the live run, so both compute the very
     same features."""
 
-    def __init__(self, gmo: Instrument, leads: dict, cross=(), step_ms: int = 100) -> None:
+    def __init__(self, gmo: Instrument, leads: dict, cross=(), step_ms: int = 100,
+                 hinge_bps: float = 8.0) -> None:
         self.gmo = gmo
+        self.hinge = hinge_bps
+        self.gap = 0.0
+        """The largest |lead 1 s move - GMO 1 s move| at the last features() call."""
         self.cross = tuple(cross)
         self.books = {"gmo": _Book(), "bybit": _Book(), "binance": _Book()}
         self.books.update({f"x:{c}": _Book() for c in self.cross})
@@ -221,6 +231,8 @@ class Grid:
 
     def features(self, gmo_mid: float) -> list[float]:
         x = [1.0]
+        gmo_1s = self.series["gmo"].ret(10)
+        self.gap = 0.0
         for lead in ("bybit", "binance"):
             s = self.series[lead]
             x += [s.ret(lag) for lag in LAGS]
@@ -232,6 +244,13 @@ class Grid:
                 x.append(basis - self.basis_avg[lead])
             else:
                 x.append(0.0)
+            # How far the lead got ahead of GMO over the last second is
+            # already in the two 1 s returns, linearly. What a straight line
+            # cannot say is "only beyond 8bps does it really pay": this is
+            # the part of the lead beyond the hinge, signed, zero below it.
+            gap = s.ret(10) - gmo_1s if lm else 0.0
+            self.gap = max(self.gap, abs(gap))
+            x.append(math.copysign(max(abs(gap) - self.hinge, 0.0), gap))
         x += [self.series["gmo"].ret(lag) for lag in LAGS]
         b = self.books["gmo"]
         gmo = self.gmo
@@ -243,6 +262,28 @@ class Grid:
         return x
 
 
+class _Variant:
+    """One training subset: its fit, its weights, its trades."""
+
+    def __init__(self, gap: float, out: FairResult, k: int, holds: tuple) -> None:
+        self.gap = gap
+        self.out = out
+        self.fit = Fit(k, holds)
+        self.weights: dict | None = None
+
+
+def _pick_margins(cal: dict, margins, holds, min_trades: int) -> dict:
+    """hold -> the margin that made the most on the calibration part, with
+    at least `min_trades` trades (a tie to the larger margin); None when
+    none made money, so the model stands aside rather than lose least."""
+    chosen = {}
+    for h in holds:
+        enough = [(m, cal[(m, h)]) for m in margins if cal[(m, h)].n >= min_trades]
+        best = max(enough, key=lambda mb: (mb[1].pnl, mb[0])) if enough else None
+        chosen[h] = best[0] if best and best[1].pnl > 0 else None
+    return chosen
+
+
 def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int],
         test: tuple[int, int],
         holds=(2.0, 5.0, 10.0), cross=(), step_ms: int = 100, latency_ms: int = 200,
@@ -250,7 +291,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         margin_bps: float | None = None, rule_bps: float = 8.0, ridge: float = 1e-3,
         margins=(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0), cal_frac: float = 0.3,
         min_cal_trades: int = 20, cal_start_ns: int | None = None,
-        stale_s: float = 10.0) -> FairResult:
+        stale_s: float = 10.0, min_gaps=(0.0,), hinge_bps: float = 8.0) -> FairResult:
     """`rows` yields (source, receive_ns, event) in time order. Sources:
     "gmo" (GMO's book), "bybit" and "binance" (the same coin's perps), and
     "x:<name>" for another coin's perp; `leads` maps each of those sources
@@ -261,43 +302,54 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     taken (the margin) is chosen inside `train`, never on `test`: the
     model is fitted on the first part of `train`, traded at every margin
     in `margins` on its last `cal_frac`, and the margin that made the most
-    there (with at least `min_cal_trades` trades; else the largest) is the
-    one used on `test`. A fixed `margin_bps` skips that and fits on all
-    of `train`. `cal_start_ns` sets where that last part begins; the caller
-    knows when the recording was actually running, and a split by clock time
-    alone put the whole calibration inside a two-day gap once.
+    there (with at least `min_cal_trades` trades) is the one used on
+    `test`; if none made money, the model does not trade at that hold. A
+    fixed `margin_bps` skips that and fits on all of `train`.
+    `cal_start_ns` sets where that last part begins; the caller knows when
+    the recording was actually running, and a split by clock time alone put
+    the whole calibration inside a two-day gap once.
+
+    `min_gaps` fits one model per value, each on (and trading only at) the
+    moments a lead was at least that many bps ahead of GMO over the last
+    second; 0 is every moment. Which one is returned is decided on the
+    calibration part alone: the most money there at the longest hold. The
+    others are in `variants`.
 
     Grid steps where GMO, or every lead, has sent nothing for `stale_s`
     are not sampled: a stopped recording is not a still market. Across a
     gap longer than a minute the grid jumps ahead and starts afresh."""
-    names = feature_names(cross)
-    out = FairResult(label, names, tuple(holds))
+    names = feature_names(cross, hinge_bps)
+    rule_out = {h: Book() for h in holds}
+    variants = []
+    for v in min_gaps:
+        o = FairResult(label, names, tuple(holds), min_gap=float(v))
+        o.score = {h: Score() for h in holds}
+        o.model = {h: Book() for h in holds}
+        o.rule = rule_out
+        variants.append(_Variant(float(v), o, len(names), tuple(holds)))
     step = step_ms * 1_000_000
     lat = max(1, round(latency_ms / step_ms))
     hsteps = {h: max(1, round(h * 1000 / step_ms)) for h in holds}
     longest = lat + max(hsteps.values())
-    grid = Grid(gmo, leads, cross, step_ms)
+    grid = Grid(gmo, leads, cross, step_ms, hinge_bps)
     books, series, mid = grid.books, grid.series, grid.mid
 
-    fit = Fit(len(names), tuple(holds))
-    weights: dict | None = None
-    pending: deque = deque()   # (grid index, features, phase) awaiting their target
+    pending: deque = deque()   # (grid index, features, gap, phase) awaiting their target
     gmo_mids: deque = deque()  # GMO's mid at each grid index, oldest first
     tasks: dict = {}           # grid index -> list of actions to run then
-    busy = {(kind, h): -1 for kind in ("model", "rule") for h in holds}
+    busy: dict = {("rule", h): -1 for h in holds}
     armed = True
-    out.score = {h: Score() for h in holds}
-    out.model = {h: Book() for h in holds}
-    out.rule = {h: Book() for h in holds}
     calibrate = margin_bps is None
-    # Set from the first sample actually inside `train`: a window opened
-    # before the recording starts would otherwise leave nothing to fit on.
     cal_start = cal_start_ns if (calibrate and cal_start_ns is not None) else train[1]
     last_rx: dict = {}
     stale = int(stale_s * NS)
-    out.cal = {(m, h): Book() for m in margins for h in holds} if calibrate else {}
-    out.chosen = {h: margin_bps for h in holds} if not calibrate else {}
-    busy.update({("cal", m, h): -1 for m in margins for h in holds})
+    for var in variants:
+        var.out.cal = {(m, h): Book() for m in margins for h in holds} if calibrate else {}
+        var.out.chosen = {h: margin_bps for h in holds} if not calibrate else {}
+        busy.update({(var.gap, "cal", m, h): -1 for m in margins for h in holds})
+        busy.update({(var.gap, "model", h): -1 for h in holds})
+    train_n = 0
+    picked = False
     grid_t = None
     g = 0
 
@@ -337,31 +389,38 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             schedule(g + hsteps[h], leave)
         schedule(g + lat, enter)
 
-    def trade(x: list[float], gm: float, slots) -> None:
+    def trade(x: list[float], gm: float, var: _Variant, slots, cost: list) -> None:
         """Take each (margin, hold) slot whose prediction clears the round
         trip by the margin; `slots` are (margin, hold, busy key, book)."""
         qty = qty_for(gm)
-        cost = None
-        preds = {h: sum(w * v for w, v in zip(weights[h], x, strict=True)) for h in holds}
+        preds = {h: sum(w * v for w, v in zip(var.weights[h], x, strict=True)) for h in holds}
         for m, h, key, book in slots:
             p = preds[h]
-            if g < busy[key] or abs(p) <= m:
+            if m is None or g < busy[key] or abs(p) <= m:
                 continue
             # Walking the book costs a sort, so only when a trade is in reach.
-            cost = round_trip_bps(gm, qty) if cost is None else cost
-            if cost is not None and abs(p) > cost + m:
+            if not cost:
+                cost.append(round_trip_bps(gm, qty))
+            if cost[0] is not None and abs(p) > cost[0] + m:
                 busy[key] = g + lat + hsteps[h]
                 open_trade(book, h, 1 if p > 0 else -1, qty)
 
+    def pick_variant() -> None:
+        nonlocal picked
+        picked = True
+        for var in variants:
+            if not var.out.chosen:
+                var.out.chosen = _pick_margins(var.out.cal, margins, holds, min_cal_trades)
+
     def on_grid(t: int) -> None:
-        nonlocal weights, armed, cal_start
+        nonlocal armed, cal_start, train_n
         for action in tasks.pop(g, ()):
             action()
         live_leads = [k for k in ("bybit", "binance") if t - last_rx.get(k, -stale - 1) <= stale]
         if t - last_rx.get("gmo", -stale - 1) > stale or not live_leads:
             # The recording stopped, or a feed did: nothing to learn here.
-            for s in series.values():
-                s.push(None)
+            for ser in series.values():
+                ser.push(None)
             gmo_mids.append(None)
             while len(gmo_mids) > longest + 2:
                 gmo_mids.popleft()
@@ -378,7 +437,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
 
         # Targets that have come due, from the grid kept so far.
         while pending and pending[0][0] + longest <= g:
-            g0, x, phase = pending.popleft()
+            g0, x, gap, phase = pending.popleft()
             start = mid_at(g0 + lat)
             ys = {}
             for h, hs in hsteps.items():
@@ -387,58 +446,67 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                     ys[h] = math.log(end / start) * 1e4
             if len(ys) != len(hsteps):
                 continue
-            if phase == "train":
-                fit.add(x, ys)
-            elif phase == "cal":
-                continue
-            elif weights is not None:
-                for h, y in ys.items():
-                    p = sum(w * v for w, v in zip(weights[h], x, strict=True))
-                    sc = out.score[h]
-                    sc.n += 1
-                    sc.sse += (y - p) ** 2
-                    sc.sst += y * y
-                    sc.ysum += y
-                    if abs(p) > 1e-9 and abs(y) > 1e-9:
-                        sc.called += 1
-                        sc.hit += (p > 0) == (y > 0)
+            for var in variants:
+                if gap < var.gap:
+                    continue
+                if phase == "train":
+                    var.fit.add(x, ys)
+                elif phase == "test" and var.weights is not None:
+                    for h, y in ys.items():
+                        p = sum(w * v for w, v in zip(var.weights[h], x, strict=True))
+                        sc = var.out.score[h]
+                        sc.n += 1
+                        sc.sse += (y - p) ** 2
+                        sc.sst += y * y
+                        sc.ysum += y
+                        if abs(p) > 1e-9 and abs(y) > 1e-9:
+                            sc.called += 1
+                            sc.hit += (p > 0) == (y > 0)
         if gm is None or mid("bybit") is None and mid("binance") is None:
             return
         x = grid.features(gm)
-        if calibrate and cal_start_ns is None and not out.train_n and train[0] <= t < train[1]:
+        gap = grid.gap
+        if calibrate and cal_start_ns is None and not train_n and train[0] <= t < train[1]:
             cal_start = t + int((train[1] - t) * (1 - cal_frac))
         if train[0] <= t < cal_start:
-            pending.append((g, x, "train"))
-            out.train_n += 1
+            pending.append((g, x, gap, "train"))
+            train_n += 1
+            for var in variants:
+                var.out.train_n += gap >= var.gap
             return
-        if weights is None and (cal_start <= t < train[1] or test[0] <= t < test[1]):
-            weights = fit.weights(ridge)
-            out.weights = weights
-        if cal_start <= t < train[1]:
-            out.cal_n += 1
-            trade(x, gm, [(m, h, ("cal", m, h), out.cal[(m, h)]) for m in margins for h in holds])
+        in_cal = cal_start <= t < train[1]
+        in_test = test[0] <= t < test[1]
+        if not (in_cal or in_test):
             return
-        if not test[0] <= t < test[1]:
+        for var in variants:
+            if var.weights is None:
+                var.weights = var.fit.weights(ridge)
+                var.out.weights = var.weights
+        cost: list = []
+        if in_cal:
+            for var in variants:
+                var.out.cal_n += 1
+                if gap >= var.gap:
+                    trade(x, gm, var, [(m, h, (var.gap, "cal", m, h), var.out.cal[(m, h)])
+                                       for m in margins for h in holds], cost)
             return
-        if not out.chosen:
-            for h in holds:
-                tried = [(m, out.cal[(m, h)]) for m in margins]
-                enough = [(m, b) for m, b in tried if b.n >= min_cal_trades]
-                # A tie goes to the larger margin: fewer trades for the same money.
-                out.chosen[h] = (max(enough, key=lambda mb: (mb[1].pnl, mb[0]))[0]
-                                 if enough else max(margins))
-        pending.append((g, x, "test"))
-        out.test_n += 1
-        trade(x, gm, [(out.chosen[h], h, ("model", h), out.model[h]) for h in holds])
+        if not picked:
+            pick_variant()
+        pending.append((g, x, gap, "test"))
+        for var in variants:
+            var.out.test_n += 1
+            if gap >= var.gap:
+                trade(x, gm, var, [(var.out.chosen[h], h, (var.gap, "model", h), var.out.model[h])
+                                   for h in holds], cost)
         qty = qty_for(gm)
         # The one-signal rule on the same grid: a lead moved `rule_bps`
         # more than GMO over the last second, the lead itself that far.
-        leads = [series[k].ret(10) for k in ("bybit", "binance") if mid(k)]
-        if not leads:
+        lead_moves = [series[k].ret(10) for k in ("bybit", "binance") if mid(k)]
+        if not lead_moves:
             return
-        lead_move = sum(leads) / len(leads)
-        gap = lead_move - series["gmo"].ret(10)
-        if abs(gap) < rule_bps or abs(lead_move) < rule_bps or lead_move * gap <= 0:
+        lead_move = sum(lead_moves) / len(lead_moves)
+        rgap = lead_move - series["gmo"].ret(10)
+        if abs(rgap) < rule_bps or abs(lead_move) < rule_bps or lead_move * rgap <= 0:
             armed = True
             return
         if not armed:
@@ -447,7 +515,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         for h in holds:
             if g >= busy[("rule", h)]:
                 busy[("rule", h)] = g + lat + hsteps[h]
-                open_trade(out.rule[h], h, 1 if gap > 0 else -1, qty)
+                open_trade(rule_out[h], h, 1 if rgap > 0 else -1, qty)
 
     for src, rx, event in rows:
         if src not in books or not isinstance(event, (DepthSnapshot, DepthDelta)):
@@ -463,24 +531,30 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             pending.clear()
             gmo_mids.clear()
             grid.basis_avg.clear()
-            for s in series.values():
-                s.vals.clear()
+            for ser in series.values():
+                ser.vals.clear()
         while grid_t <= rx:
             on_grid(grid_t)
             grid_t += step
             g += 1
         books[src].apply(event)
         last_rx[src] = rx
-    if weights is None:
-        out.weights = fit.weights(ridge)
-    if calibrate and not out.chosen and out.cal:
-        # No test period seen (fitting a model to use live): pick the margin
-        # from the training period all the same.
-        for h in holds:
-            enough = [(m, out.cal[(m, h)]) for m in margins if out.cal[(m, h)].n >= min_cal_trades]
-            out.chosen[h] = (max(enough, key=lambda mb: (mb[1].pnl, mb[0]))[0]
-                             if enough else max(margins))
-    return out
+    for var in variants:
+        if var.weights is None:
+            var.weights = var.fit.weights(ridge)
+            var.out.weights = var.weights
+    if not picked and calibrate:
+        # No test period seen (fitting a model to use live): pick all the same.
+        pick_variant()
+
+    def cal_money(var: _Variant) -> float:
+        h = max(holds)
+        m = var.out.chosen.get(h)
+        return var.out.cal[(m, h)].pnl if calibrate and m is not None else float("-inf")
+
+    best = max(variants, key=cal_money) if calibrate else variants[0]
+    best.out.variants = {var.gap: var.out for var in variants}
+    return best.out
 
 
 def active_split(starts_ns: list[int], window: tuple[int, int], frac: float = 0.7,
@@ -514,48 +588,70 @@ def active_split(starts_ns: list[int], window: tuple[int, int], frac: float = 0.
     return spans[-1][1], total / NS / 3600
 
 
-def model_dict(r: FairResult, *, cross, step_ms: int, latency_ms: int, train) -> dict:
+def _margin_text(m) -> str:
+    return "入らない（どの基準でも儲からなかった）" if m is None else f"+{m:g}bps"
+
+
+def model_dict(r: FairResult, *, cross, step_ms: int, latency_ms: int, train,
+               hinge_bps: float = 8.0) -> dict:
     """What the live run needs to price GMO exactly as the replay did."""
     return {
         "symbol": r.label, "names": r.names, "cross": list(cross), "step_ms": step_ms,
         "latency_ms": latency_ms, "train": list(train),
+        "hinge_bps": hinge_bps, "min_gap_bps": r.min_gap,
         "weights": {f"{h:g}": w for h, w in r.weights.items()},
         "margin_bps": {f"{h:g}": m for h, m in r.chosen.items()},
         "calibration": {f"{m:g}/{h:g}": [b.n, round(b.pnl, 2)] for (m, h), b in r.cal.items()},
     }
 
 
-HEADER = "\t".join(["銘柄", "持つ秒", "未知データでの説明力 R²", "向きの的中", "やり方",
+HEADER = "\t".join(["銘柄", "学習した場面", "持つ秒", "未知データでの説明力 R²", "向きの的中", "やり方",
                     "取引数", "1回あたり bps", "勝率", "合計円"])
 
 
+def _scene(r: FairResult) -> str:
+    return "全部" if not r.min_gap else f"乖離{r.min_gap:g}bps以上"
+
+
 def report(r: FairResult) -> list[str]:
+    """Every fitted subset on the test, the chosen one marked, then the rule."""
     lines = []
+    subsets = list(r.variants.values()) or [r]
     for h in r.holds:
-        sc = r.score[h]
-        hit = f"{sc.hit / sc.called:.0%}" if sc.called else "-"
-        for kind, books in (("フェア価格モデル", r.model), ("単純な後追い", r.rule)):
-            b = books[h]
+        for v in subsets:
+            sc, b = v.score[h], v.model[h]
+            hit = f"{sc.hit / sc.called:.0%}" if sc.called else "-"
+            kind = "フェア価格モデル" + ("（採用）" if v is r else "")
             lines.append("\t".join([
-                r.label, f"{h:g}", f"{sc.r2():+.3f}", hit, kind, f"{b.n:,}",
+                r.label, _scene(v), f"{h:g}", f"{sc.r2():+.3f}", hit, kind, f"{b.n:,}",
                 "-" if not b.n else f"{b.bps():+.2f}",
                 "-" if not b.n else f"{b.wins / b.n:.0%}", f"{b.pnl:+,.0f}",
             ]))
+        b = r.rule[h]
+        lines.append("\t".join([
+            r.label, "-", f"{h:g}", "-", "-", "単純な後追い", f"{b.n:,}",
+            "-" if not b.n else f"{b.bps():+.2f}",
+            "-" if not b.n else f"{b.wins / b.n:.0%}", f"{b.pnl:+,.0f}",
+        ]))
     return lines
 
 
 def calibration_text(r: FairResult) -> list[str]:
-    """What each margin made on the end of the training period, and the pick."""
+    """For each fitted subset: how many samples it learned from, what each
+    margin made on the end of the training period, and the pick."""
     if not r.cal:
-        return [f"  入る基準（固定）: 往復コスト + {r.chosen.get(h, 0):g}bps" for h in r.holds[:1]]
-    margins = sorted({m for m, _ in r.cal})
-    out = [f"  入る基準の決め方: 学習期間の最後の部分（{r.cal_n:,} 点）で、上乗せ幅ごとに売買した結果"]
-    for h in r.holds:
-        cells = []
-        for m in margins:
-            b = r.cal[(m, h)]
-            cells.append(f"+{m:g}bps: {b.n}回 {b.pnl:+,.0f}円" if b.n else f"+{m:g}bps: 0回")
-        out.append(f"   {h:g}秒  " + " / ".join(cells) + f"  → 選んだのは +{r.chosen.get(h, 0):g}bps")
+        return [f"  入る基準（固定）: 往復コスト {_margin_text(r.chosen.get(h))}" for h in r.holds[:1]]
+    out = []
+    for v in (list(r.variants.values()) or [r]):
+        margins = sorted({m for m, _ in v.cal})
+        mark = "  ← 採用（入る基準を決める部分で一番儲かった）" if v is r else ""
+        out.append(f"  学習した場面: {_scene(v)}（学習 {v.train_n:,} 点）{mark}")
+        for h in v.holds:
+            cells = []
+            for m in margins:
+                b = v.cal[(m, h)]
+                cells.append(f"+{m:g}bps: {b.n}回 {b.pnl:+,.0f}円" if b.n else f"+{m:g}bps: 0回")
+            out.append(f"   {h:g}秒  " + " / ".join(cells) + f"  → 選んだのは {_margin_text(v.chosen.get(h))}")
     return out
 
 
@@ -573,7 +669,7 @@ def slack_summary(results: list[FairResult]) -> str:
             def cell(b: Book) -> str:
                 return "取引なし" if not b.n else f"{b.bps():+.1f}bps {b.n}回 勝率{b.wins / b.n:.0%} {b.pnl:+,.0f}円"
 
-            lines.append(f"  • {r.label} {h:g}秒  モデル（コスト+{r.chosen.get(h, 0):g}bps で入る）: {cell(m)}"
-                         f"  /  後追い: {cell(s)}  （R² {sc.r2():+.3f}）")
-    lines.append("  （モデルと入る基準は前の時間帯だけで決め、この時間帯では一度も調整していません）")
+            lines.append(f"  • {r.label} {h:g}秒  モデル（{_scene(r)}・コスト{_margin_text(r.chosen.get(h))}）: "
+                         f"{cell(m)}  /  後追い: {cell(s)}  （R² {sc.r2():+.3f}）")
+    lines.append("  （モデル・学習する場面・入る基準は前の時間帯だけで決め、この時間帯では一度も調整していません）")
     return "\n".join(lines)

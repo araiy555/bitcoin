@@ -4484,7 +4484,9 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
                 min_order=float(specs["gmo"].get("min_order", 0) or 0),
                 margin_bps=args.margin_bps, rule_bps=args.rule_bps,
                 margins=tuple(float(m) for m in args.margins.split(",")),
-                cal_start_ns=cal_start)
+                cal_start_ns=cal_start,
+                min_gaps=tuple(float(x) for x in args.min_gaps.split(",")),
+                hinge_bps=args.hinge_bps)
         for line in report(r):
             print(line, flush=True)
         for line in calibration_text(r):
@@ -4495,7 +4497,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             path = folder / f"{symbol}.json"
             path.write_text(json.dumps(model_dict(
                 r, cross=used, step_ms=100, latency_ms=args.latency_ms,
-                train=[args.train]), ensure_ascii=False, indent=1))
+                train=[args.train], hinge_bps=args.hinge_bps), ensure_ascii=False, indent=1))
             print(f"  式と入る基準を保存しました: {path}", flush=True)
         print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
         for line in weights_text(r, holds[-1]):
@@ -4553,7 +4555,11 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
         if hold not in model["weights"]:
             console.print(f"[red]式に {hold}秒 の分がありません（あるのは {', '.join(model['weights'])}秒）。[/red]")
             return 1
-        weights, margin = model["weights"][hold], float(model["margin_bps"].get(hold, 0.0))
+        weights = model["weights"][hold]
+        margin = model["margin_bps"].get(hold)
+        margin = None if margin is None else float(margin)
+        min_gap = float(model.get("min_gap_bps", 0.0))
+        hinge = float(model.get("hinge_bps", 8.0))
         for c in model.get("cross", []):
             cperp = f"{c.split('_')[0]}USDT"
             try:
@@ -4563,8 +4569,8 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 continue
             feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
         grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
-                    model.get("cross", []), int(model.get("step_ms", 100)))
-        if len(weights) != len(feature_names(model.get("cross", []))):
+                    model.get("cross", []), int(model.get("step_ms", 100)), hinge)
+        if len(weights) != len(feature_names(model.get("cross", []), hinge)):
             console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
             return 1
         books = grid.books
@@ -4633,8 +4639,13 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                         log=record, notify=notify)
     detector = Detector(threshold_bps=args.threshold_bps)
     mode = "本番（実際に注文します）" if args.live else "シャドー（注文は出しません）"
-    rule = (f"フェア価格の式（{Path(args.model).name}）で、予想が往復コスト＋{margin:g}bps を超えたとき"
-            if model else f"先行が {args.threshold_bps:g}bps 以上先に動いたとき")
+    if model and margin is None:
+        rule = f"フェア価格の式（{Path(args.model).name}）は、学習期間でどの基準でも儲からなかったので入りません"
+    elif model:
+        scene = f"海外が {min_gap:g}bps 以上先に動いた場面で、" if min_gap else ""
+        rule = f"フェア価格の式（{Path(args.model).name}）で、{scene}予想が往復コスト＋{margin:g}bps を超えたとき"
+    else:
+        rule = f"先行が {args.threshold_bps:g}bps 以上先に動いたとき"
     await notify(
         f":rocket: GMO 後追いを始めました: {mode}\n"
         f"  {symbol} 1回 {args.size}枚・{args.hold_s:g}秒で決済・同時に1つまで・"
@@ -4670,6 +4681,9 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 continue  # a feed has gone quiet: its prices are not current
             gm = grid.mid("gmo")
             x = grid.features(gm)
+            if margin is None or grid.gap < min_gap:
+                armed[0] = True
+                continue  # standing aside, or not a moment the model was fitted on
             p = sum(w * v for w, v in zip(weights, x, strict=True))
             if abs(p) <= margin or follower.stopped is not None:
                 continue
@@ -8135,6 +8149,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--margin-bps", type=float, default=None,
                       help="往復コストにさらに上乗せする分。省略すると学習期間の最後の3割で決める")
     p_fp.add_argument("--margins", default="0,1,2,3,4,6,8,12", help="学習期間で試す上乗せ幅")
+    p_fp.add_argument("--min-gaps", default="0,4,6,8,10",
+                      help="この bps 以上、海外が GMO より先に動いた場面だけで学習する（複数を同時に作り、学習期間で選ぶ）")
+    p_fp.add_argument("--hinge-bps", type=float, default=8.0, help="「先に動いた分の〇bps超え」の〇")
     p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
     p_fp.add_argument("--slack", action="store_true")
     p_fp.add_argument("--save-model", default=None,

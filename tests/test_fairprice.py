@@ -122,8 +122,8 @@ async def test_the_command_reads_a_recording_and_compares(monkeypatch, capsys, t
         "--save-model", str(tmp_path)])
     assert await args.func(args) == 0
     out = capsys.readouterr().out.splitlines()
-    model = next(x for x in out if "フェア価格モデル" in x).split("\t")
-    assert int(model[5]) > 5 and model[6].startswith("+")
+    model = next(x for x in out if "（採用）" in x).split("\t")
+    assert int(model[6]) > 5 and model[7].startswith("+")
     assert any("単純な後追い" in x for x in out)
     saved = json.loads((tmp_path / "XRP_JPY.json").read_text())
     assert len(saved["weights"]["2"]) == len(saved["names"]) and "2" in saved["margin_bps"]
@@ -174,3 +174,43 @@ def test_a_stopped_recording_is_not_learned_from():
                 holds=(2.0,), margin_bps=0.0)
     # The ten silent minutes add no samples.
     assert holed.train_n <= full.train_n - 5 * 600
+
+
+def test_the_hinge_is_signed_and_zero_below_it():
+    from jsboard.research.fairprice import Grid
+
+    grid = Grid(GMO, {"bybit": PERP}, hinge_bps=8.0)
+    names = feature_names((), 8.0)
+    i = names.index("bybit が GMO より1秒で先に動いた分の 8bps 超え")
+    for lead_move_bps, want in ((12.0, 4.0), (3.0, 0.0), (-12.0, -4.0)):
+        grid = Grid(GMO, {"bybit": PERP}, hinge_bps=8.0)
+        t = T0
+        for k in range(11):
+            p = 1.0 if k < 10 else 1.0 * (1 + lead_move_bps / 1e4)
+            lb = p / 0.0001
+            grid.apply("bybit", DepthSnapshot(((round(lb), 1),), ((round(lb) + 1, 1),), 1, t))
+            grid.apply("gmo", DepthSnapshot(((150_000, 1),), ((150_002, 1),), 1, t))
+            grid.push()
+            t += NS // 10
+        x = grid.features(150.001)
+        assert abs(x[i] - want) < 0.6 and abs(grid.gap - abs(lead_move_bps)) < 0.6
+
+
+def test_subsets_are_fitted_together_and_picked_on_calibration():
+    rows, mid, end = tape()
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
+            holds=(2.0,), min_gaps=(0.0, 4.0), min_cal_trades=5)
+    assert set(r.variants) == {0.0, 4.0}
+    assert r.variants[4.0].train_n < r.variants[0.0].train_n
+    money = {g: v.cal[(v.chosen[2.0], 2.0)].pnl if v.chosen[2.0] is not None else float("-inf")
+             for g, v in r.variants.items()}
+    assert money[r.min_gap] == max(money.values())
+
+
+def test_no_margin_that_made_money_means_no_trades():
+    from jsboard.research.fairprice import Book, _pick_margins
+
+    cal = {(m, 10.0): Book(n=30, wins=5, notional=300_000, pnl=-5.0 - m) for m in (0.0, 2.0)}
+    assert _pick_margins(cal, (0.0, 2.0), (10.0,), 20) == {10.0: None}
+    cal[(2.0, 10.0)] = Book(n=25, wins=15, notional=250_000, pnl=8.0)
+    assert _pick_margins(cal, (0.0, 2.0), (10.0,), 20) == {10.0: 2.0}
