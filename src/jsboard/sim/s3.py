@@ -498,12 +498,9 @@ class RotatingJsonlSink:
                 last = exc
                 if attempt + 1 < self.upload_tries and self.retry_wait:
                     time.sleep(min(self.retry_wait * 2 ** attempt, 30))
+        # Every try failed. Nothing is kept on disk (the disk is not for
+        # recordings); the loss is reported instead.
         self.failed.append(f"{key}: {last}")
-        if not on_disk and not self.keep_local:
-            # Every try failed: this is the only copy, so it goes to disk,
-            # where the next run's sweep will send it.
-            part.parent.mkdir(parents=True, exist_ok=True)
-            part.write_bytes(gzip.decompress(data))
 
     def upload_meta(self, meta: Path) -> str | None:
         """Put the spec file beside the parts; return its key, or None on failure."""
@@ -513,6 +510,8 @@ class RotatingJsonlSink:
         except Exception as exc:  # noqa: BLE001 - the recording itself must go on
             self.failed.append(f"{key}: {exc}")
             return None
+        if not self.keep_local:
+            Path(meta).unlink(missing_ok=True)  # it lives in the bucket now
         return key
 
     # ---------------------------------------------------------------- status

@@ -135,13 +135,14 @@ class TestLocalCopies:
             fh.write("x\n")
         assert len(list(tmp_path.glob("*.jsonl"))) == 1
 
-    def test_a_failed_upload_never_deletes_the_evidence(self, tmp_path):
+    def test_a_failed_upload_leaves_nothing_on_disk(self, tmp_path):
         client = FakeS3(fail_on=["*"])
-        with sink(tmp_path, client) as fh:
+        s = sink(tmp_path, client)
+        with s as fh:
             fh.write("x\n")
-        # The bucket has nothing, so the only copy is the one on disk.
-        assert client.objects == {}
-        assert len(list(tmp_path.glob("*.jsonl"))) == 1
+        # The disk is not for recordings: the loss is reported, not stored.
+        assert client.objects == {} and s.summary()["failed"]
+        assert not list(tmp_path.iterdir())
 
     def test_a_failure_is_reported_rather_than_swallowed(self, tmp_path):
         s = sink(tmp_path, FakeS3(fail_on=["*"]))
