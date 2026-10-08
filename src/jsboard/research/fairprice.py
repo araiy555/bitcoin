@@ -249,7 +249,8 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         size_jpy: float = 10_000.0, fee_bps: float = 0.0, min_order: float = 0.0,
         margin_bps: float | None = None, rule_bps: float = 8.0, ridge: float = 1e-3,
         margins=(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0), cal_frac: float = 0.3,
-        min_cal_trades: int = 20) -> FairResult:
+        min_cal_trades: int = 20, cal_start_ns: int | None = None,
+        stale_s: float = 10.0) -> FairResult:
     """`rows` yields (source, receive_ns, event) in time order. Sources:
     "gmo" (GMO's book), "bybit" and "binance" (the same coin's perps), and
     "x:<name>" for another coin's perp; `leads` maps each of those sources
@@ -262,7 +263,13 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     in `margins` on its last `cal_frac`, and the margin that made the most
     there (with at least `min_cal_trades` trades; else the largest) is the
     one used on `test`. A fixed `margin_bps` skips that and fits on all
-    of `train`."""
+    of `train`. `cal_start_ns` sets where that last part begins; the caller
+    knows when the recording was actually running, and a split by clock time
+    alone put the whole calibration inside a two-day gap once.
+
+    Grid steps where GMO, or every lead, has sent nothing for `stale_s`
+    are not sampled: a stopped recording is not a still market. Across a
+    gap longer than a minute the grid jumps ahead and starts afresh."""
     names = feature_names(cross)
     out = FairResult(label, names, tuple(holds))
     step = step_ms * 1_000_000
@@ -285,7 +292,9 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     calibrate = margin_bps is None
     # Set from the first sample actually inside `train`: a window opened
     # before the recording starts would otherwise leave nothing to fit on.
-    cal_start = train[1]
+    cal_start = cal_start_ns if (calibrate and cal_start_ns is not None) else train[1]
+    last_rx: dict = {}
+    stale = int(stale_s * NS)
     out.cal = {(m, h): Book() for m in margins for h in holds} if calibrate else {}
     out.chosen = {h: margin_bps for h in holds} if not calibrate else {}
     busy.update({("cal", m, h): -1 for m in margins for h in holds})
@@ -348,6 +357,15 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         nonlocal weights, armed, cal_start
         for action in tasks.pop(g, ()):
             action()
+        live_leads = [k for k in ("bybit", "binance") if t - last_rx.get(k, -stale - 1) <= stale]
+        if t - last_rx.get("gmo", -stale - 1) > stale or not live_leads:
+            # The recording stopped, or a feed did: nothing to learn here.
+            for s in series.values():
+                s.push(None)
+            gmo_mids.append(None)
+            while len(gmo_mids) > longest + 2:
+                gmo_mids.popleft()
+            return
         grid.push()
         gm = mid("gmo")
         gmo_mids.append(gm)
@@ -387,7 +405,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         if gm is None or mid("bybit") is None and mid("binance") is None:
             return
         x = grid.features(gm)
-        if calibrate and not out.train_n and train[0] <= t < train[1]:
+        if calibrate and cal_start_ns is None and not out.train_n and train[0] <= t < train[1]:
             cal_start = t + int((train[1] - t) * (1 - cal_frac))
         if train[0] <= t < cal_start:
             pending.append((g, x, "train"))
@@ -436,11 +454,23 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             continue
         if grid_t is None:
             grid_t = (rx // step + 1) * step
+        if rx - grid_t > 60 * NS:
+            # A gap in the recording: jump to it rather than step through
+            # hours of nothing, and forget what came before.
+            skip = (rx - grid_t) // step
+            grid_t += skip * step
+            g += skip
+            pending.clear()
+            gmo_mids.clear()
+            grid.basis_avg.clear()
+            for s in series.values():
+                s.vals.clear()
         while grid_t <= rx:
             on_grid(grid_t)
             grid_t += step
             g += 1
         books[src].apply(event)
+        last_rx[src] = rx
     if weights is None:
         out.weights = fit.weights(ridge)
     if calibrate and not out.chosen and out.cal:
@@ -451,6 +481,37 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             out.chosen[h] = (max(enough, key=lambda mb: (mb[1].pnl, mb[0]))[0]
                              if enough else max(margins))
     return out
+
+
+def active_split(starts_ns: list[int], window: tuple[int, int], frac: float = 0.7,
+                 part_s: float = 3600.0) -> tuple[int | None, float]:
+    """Where `frac` of the time actually recorded inside `window` has passed,
+    and how many hours were recorded there.
+
+    `starts_ns` are the start times of the recording's parts (five minutes
+    each as recorded); a part is taken to run until the next one starts, or
+    for one and a half times the usual spacing between parts (at most
+    `part_s`), so a gap between recordings counts for almost nothing."""
+    starts = sorted(t for t in starts_ns if window[0] <= t < window[1])
+    # A part lasts about as long as the usual spacing between parts; that,
+    # not the gap after the last one before a stop, is its length.
+    diffs = sorted(b - a for a, b in zip(starts, starts[1:], strict=False) if b > a)
+    longest = min(part_s * NS, 1.5 * diffs[len(diffs) // 2]) if diffs else part_s * NS
+    spans = []
+    for i, t in enumerate(starts):
+        nxt = starts[i + 1] if i + 1 < len(starts) else t + int(longest)
+        end = min(nxt, t + int(longest), window[1])
+        if end > t:
+            spans.append((t, end))
+    total = sum(e - b for b, e in spans)
+    if not total:
+        return None, 0.0
+    goal, run = total * frac, 0
+    for b, e in spans:
+        if run + (e - b) >= goal:
+            return b + int(goal - run), total / NS / 3600
+        run += e - b
+    return spans[-1][1], total / NS / 3600
 
 
 def model_dict(r: FairResult, *, cross, step_ms: int, latency_ms: int, train) -> dict:

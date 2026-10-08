@@ -4384,12 +4384,13 @@ async def cmd_visionlag(args: argparse.Namespace) -> int:
 async def cmd_fairprice(args: argparse.Namespace) -> int:
     """GMO's fair price from many inputs, fitted on one period, traded on the next."""
     import heapq
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime
 
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
     from .research.fairprice import (
         HEADER,
+        active_split,
         calibration_text,
         model_dict,
         report,
@@ -4412,11 +4413,17 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
         console.print("[red]--test は --train が終わった後にしてください（学習に使ったデータで試さない）。[/red]")
         return 1
     root = args.path if args.path.endswith("/") else args.path + "/"
-    days = []
-    d = train[0].date()
-    while d <= test[1].date():
-        days.append(d.isoformat())
-        d += timedelta(days=1)
+    import re
+
+    # Only the days that were recorded, and when within them: the split
+    # into fitting and calibration counts recorded time, not clock time.
+    part_times: dict = {}
+    for sym in {x.strip().upper() for x in args.only.split(",")}:
+        for uri in list_parts(f"{root}symbol={sym}/"):
+            if m := re.search(r"date=(\d{4}-\d{2}-\d{2})/.*?/(\d{15,})-\d+\.jsonl", uri):
+                part_times.setdefault(sym, []).append((m[1], int(m[2])))
+    first, last = train[0].date().isoformat(), test[1].date().isoformat()
+    days = sorted({d for times in part_times.values() for d, _ in times if first <= d <= last})
 
     def specs_of(symbol: str) -> dict:
         meta = f"{root}symbol={symbol}/meta.json"
@@ -4464,13 +4471,20 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             streams.append(stream(c, lambda s, c=c, pick=pick: f"x:{c}" if s == pick else None))
             used.append(c)
         rows = heapq.merge(*streams, key=lambda r: r[1])
+        cal_start, hours = active_split([t for _, t in part_times.get(symbol, [])],
+                                        (ns(train[0]), ns(train[1])))
+        if args.margin_bps is None and cal_start:
+            when = datetime.fromtimestamp(cal_start / 1e9, UTC).strftime("%Y-%m-%d %H:%M")
+            print(f"  {symbol}: 学習期間に録画があるのは {hours:.1f}時間。式は {when} UTC まで、"
+                  "入る基準はそれ以降で決めます", flush=True)
         r = run(rows, gmo, leads, label=symbol, train=(ns(train[0]), ns(train[1])),
                 test=(ns(test[0]), ns(test[1])), holds=holds, cross=tuple(used),
                 latency_ms=args.latency_ms, size_jpy=args.size_jpy,
                 fee_bps=float(specs["gmo"].get("taker_bps", 0.0)),
                 min_order=float(specs["gmo"].get("min_order", 0) or 0),
                 margin_bps=args.margin_bps, rule_bps=args.rule_bps,
-                margins=tuple(float(m) for m in args.margins.split(",")))
+                margins=tuple(float(m) for m in args.margins.split(",")),
+                cal_start_ns=cal_start)
         for line in report(r):
             print(line, flush=True)
         for line in calibration_text(r):
@@ -4635,6 +4649,8 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
 
     pumps = [_asyncio.create_task(pump(src, feed)) for src, feed in feeds.items()]
     trades: set = set()
+    last_seen: dict = {}
+    NS = 1_000_000_000
 
     async def fair_price() -> None:
         """Every grid step, as in the replay: take the mids, price GMO, and
@@ -4647,6 +4663,11 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             grid.push()
             if not grid.ready():
                 continue
+            now_ns = time.time_ns()
+            if now_ns - last_seen.get("gmo", 0) > 10 * NS or not any(
+                    now_ns - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance")):
+                armed[0] = True
+                continue  # a feed has gone quiet: its prices are not current
             gm = grid.mid("gmo")
             x = grid.features(gm)
             p = sum(w * v for w, v in zip(weights, x, strict=True))
@@ -4700,6 +4721,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             if src not in books:
                 continue
             books[src].apply(event)
+            last_seen[src] = rx
             signal = None if model else detector.update(src, rx, mid(src))
             if signal and follower.saw_signal(*signal, rx):
                 lead, side, gap = signal

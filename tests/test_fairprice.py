@@ -149,3 +149,28 @@ def test_a_fixed_margin_fits_on_all_of_training():
     r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
             holds=(2.0,), margin_bps=2.0)
     assert r.cal == {} and r.cal_n == 0 and r.chosen == {2.0: 2.0}
+
+
+def test_the_split_counts_recorded_time_not_clock_time():
+    from jsboard.research.fairprice import active_split
+
+    m = 60 * NS
+    # Ten hours recorded, a two-day gap, then two more hours.
+    starts = [T0 + i * 5 * m for i in range(120)] + [T0 + 58 * 60 * m + i * 5 * m for i in range(24)]
+    cut, hours = active_split(starts, (T0, T0 + 61 * 60 * m), frac=0.7)
+    assert abs(hours - 12.0) < 0.2
+    # 70% of ~12 recorded hours falls inside the first block, not in the gap.
+    assert T0 + 8 * 60 * m < cut < T0 + 9 * 60 * m
+
+
+def test_a_stopped_recording_is_not_learned_from():
+    rows, mid, end = tape()
+    # Cut ten minutes out of the middle of the training data.
+    gap = (T0 + 5 * 60 * NS, T0 + 15 * 60 * NS)
+    cut = [r for r in rows if not gap[0] <= r[1] < gap[1]]
+    full = run(iter(rows), GMO, {"bybit": PERP}, label="X", train=(T0, mid), test=(mid, end),
+               holds=(2.0,), margin_bps=0.0)
+    holed = run(iter(cut), GMO, {"bybit": PERP}, label="X", train=(T0, mid), test=(mid, end),
+                holds=(2.0,), margin_bps=0.0)
+    # The ten silent minutes add no samples.
+    assert holed.train_n <= full.train_n - 5 * 600
