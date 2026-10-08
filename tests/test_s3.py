@@ -44,6 +44,7 @@ class Clock:
 
 
 def sink(tmp_path, client, clock=None, **kw):
+    kw.setdefault("retry_wait", 0)
     return RotatingJsonlSink(
         path=tmp_path / "cap.jsonl",
         target=S3Target(bucket="b", prefix="raw"),
@@ -568,3 +569,43 @@ class TestADaysFolder:
         from jsboard.sim.s3 import meta_uri
 
         assert meta_uri("s3://b/raw/symbol=X/") == "s3://b/raw/symbol=X/meta.json"
+
+
+class TestNoDisk:
+    def test_a_part_being_written_is_not_on_disk(self, tmp_path):
+        s = sink(tmp_path, FakeS3())
+        s.write("x\n")
+        assert list(tmp_path.iterdir()) == []
+        s.close()
+
+    def test_an_upload_that_fails_once_is_tried_again(self, tmp_path):
+        class Flaky(FakeS3):
+            def upload_file(self, filename, bucket, key):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionResetError(104, "reset")
+                return super().upload_file(filename, bucket, key)
+
+        client = Flaky()
+        with sink(tmp_path, client) as fh:
+            fh.write("x\n")
+        assert len(client.objects) == 1 and not list(tmp_path.iterdir())
+
+    def test_parts_left_by_a_killed_run_are_sent_and_removed(self, tmp_path):
+        left = tmp_path / "cap-1757000000000000000-00003.jsonl"
+        left.write_text('{"old":1}\n')
+        other = tmp_path / "other-1757000000000000000-00001.jsonl"
+        other.write_text("not ours\n")
+        client = FakeS3()
+        with sink(tmp_path, client):
+            pass
+        key = S3Target(bucket="b", prefix="raw").key_for("btcusdt", 1757000000000000000, 3)
+        assert decompress(client, key) == '{"old":1}\n'
+        assert not left.exists() and other.exists()
+
+    def test_a_leftover_that_still_cannot_be_sent_stays(self, tmp_path):
+        left = tmp_path / "cap-1757000000000000000-00003.jsonl"
+        left.write_text("x\n")
+        with sink(tmp_path, FakeS3(fail_on=["*"])):
+            pass
+        assert left.exists()

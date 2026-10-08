@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import gzip
 import re
-import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -347,8 +346,12 @@ class RotatingJsonlSink:
     rotate_bytes: int = DEFAULT_ROTATE_BYTES
     keep_local: bool = False
     clock: object = time.time_ns
+    upload_tries: int = 4
+    retry_wait: float = 1.0
 
     _fh: object = field(default=None, init=False)
+    _buf: object = field(default=None, init=False)
+    _local: object = field(default=None, init=False)
     _part: Path | None = field(default=None, init=False)
     _started_ns: int = field(default=0, init=False)
     _bytes: int = field(default=0, init=False)
@@ -358,6 +361,7 @@ class RotatingJsonlSink:
     _seq: int = field(default=0, init=False)
     uploaded: list[str] = field(default_factory=list, init=False)
     failed: list[str] = field(default_factory=list, init=False)
+    swept: list[str] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -365,6 +369,8 @@ class RotatingJsonlSink:
         # Two workers: one uploading while the next part is already closing,
         # without letting a slow network build an unbounded backlog.
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="s3")
+        if not self.keep_local:
+            self._sweep()
         self._open_part()
 
     # ------------------------------------------------------------- file-like
@@ -376,12 +382,16 @@ class RotatingJsonlSink:
         if self._should_rotate():
             self.rotate()
         n = self._fh.write(text)
+        if self._local is not None:
+            self._local.write(text)
         self._bytes += len(text.encode("utf-8"))
         return n
 
     def flush(self) -> None:
         if self._fh is not None:
             self._fh.flush()
+        if self._local is not None:
+            self._local.flush()
 
     def close(self) -> None:
         if self._closing:
@@ -405,46 +415,95 @@ class RotatingJsonlSink:
         elapsed = (self.clock() - self._started_ns) / NS_PER_S
         return bool(self.rotate_seconds) and elapsed >= self.rotate_seconds
 
+    def _name(self, started_ns: int, seq: int) -> Path:
+        stem, suffix = self.path.stem, self.path.suffix or ".jsonl"
+        return self.path.parent / f"{stem}-{started_ns}-{seq:05d}{suffix}"
+
     def _open_part(self) -> None:
+        """A part is kept in memory, compressed as it is written, and goes
+        straight to the bucket: the disk is not used. Only `keep_local`
+        also writes a plain copy beside the recording."""
+        import io
+
         self._started_ns = self.clock()
         self._bytes = 0
         self._seq += 1
-        stem, suffix = self.path.stem, self.path.suffix or ".jsonl"
-        self._part = self.path.parent / f"{stem}-{self._started_ns}-{self._seq:05d}{suffix}"
-        self._part.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = self._part.open("w", encoding="utf-8")
+        self._part = self._name(self._started_ns, self._seq)
+        self._buf = io.BytesIO()
+        gz = gzip.GzipFile(fileobj=self._buf, mode="wb", compresslevel=6)
+        self._fh = io.TextIOWrapper(gz, encoding="utf-8", write_through=True)
+        self._local = None
+        if self.keep_local:
+            self._part.parent.mkdir(parents=True, exist_ok=True)
+            self._local = self._part.open("w", encoding="utf-8")
 
     def rotate(self) -> None:
         """Close the current part and hand it to the uploader."""
         if self._fh is None:
             return
-        self._fh.close()
-        self._fh = None
-        part, started = self._part, self._started_ns
-        self._part = None
-        if part is not None and part.exists() and part.stat().st_size > 0:
-            key = self.target.key_for(self.symbol, started, self._seq)
-            self._pending.append(self._pool.submit(self._upload, part, key))
-        elif part is not None and part.exists():
-            part.unlink()  # nothing was written to it
+        self._fh.close()  # writes the gzip trailer; the buffer stays open
+        if self._local is not None:
+            self._local.close()
+        data, wrote = self._buf.getvalue(), self._bytes
+        part, started, seq = self._part, self._started_ns, self._seq
+        self._fh = self._buf = self._local = self._part = None
+        if wrote:
+            key = self.target.key_for(self.symbol, started, seq)
+            self._pending.append(self._pool.submit(self._upload, data, key, part, False))
         if not self._closing:
             self._open_part()
 
-    def _upload(self, part: Path, key: str) -> None:
-        archive = part.with_suffix(part.suffix + ".gz")
-        try:
-            with part.open("rb") as raw, gzip.open(archive, "wb") as out:
-                shutil.copyfileobj(raw, out)
-            self.client.upload_file(str(archive), self.target.bucket, key)
-            self.uploaded.append(key)
-        except Exception as exc:  # noqa: BLE001 - a failed part must not stop recording
-            self.failed.append(f"{key}: {exc}")
-            # Keep the local copy: it is the only remaining evidence.
+    def _sweep(self) -> None:
+        """Parts an earlier run left on disk (killed mid-part, or a failed
+        upload): send them now and delete each once it is in the bucket."""
+        stem, suffix = self.path.stem, self.path.suffix or ".jsonl"
+        pattern = re.compile(rf"^{re.escape(stem)}-(\d+)-(\d+){re.escape(suffix)}$")
+        if not self.path.parent.is_dir():
             return
+        for leftover in sorted(self.path.parent.iterdir()):
+            m = pattern.match(leftover.name)
+            if not m or not leftover.is_file():
+                continue
+            if leftover.stat().st_size == 0:
+                leftover.unlink(missing_ok=True)
+                continue
+            key = self.target.key_for(self.symbol, int(m[1]), int(m[2]))
+            data = gzip.compress(leftover.read_bytes(), compresslevel=6)
+            self.swept.append(key)
+            self._pending.append(self._pool.submit(self._upload, data, key, leftover, True))
+
+    def _put(self, data: bytes, key: str) -> None:
+        if hasattr(self.client, "put_object"):
+            self.client.put_object(Bucket=self.target.bucket, Key=key, Body=data)
+            return
+        import tempfile
+
+        # A client that only takes files (as the tests' fake does).
+        with tempfile.NamedTemporaryFile(suffix=".gz", delete=False) as tmp:
+            tmp.write(data)
+        try:
+            self.client.upload_file(tmp.name, self.target.bucket, key)
         finally:
-            archive.unlink(missing_ok=True)
-        if not self.keep_local:
-            part.unlink(missing_ok=True)
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def _upload(self, data: bytes, key: str, part: Path, on_disk: bool) -> None:
+        for attempt in range(self.upload_tries):
+            try:
+                self._put(data, key)
+                self.uploaded.append(key)
+                if on_disk:
+                    part.unlink(missing_ok=True)
+                return
+            except Exception as exc:  # noqa: BLE001 - a failed part must not stop recording
+                last = exc
+                if attempt + 1 < self.upload_tries and self.retry_wait:
+                    time.sleep(min(self.retry_wait * 2 ** attempt, 30))
+        self.failed.append(f"{key}: {last}")
+        if not on_disk and not self.keep_local:
+            # Every try failed: this is the only copy, so it goes to disk,
+            # where the next run's sweep will send it.
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(gzip.decompress(data))
 
     def upload_meta(self, meta: Path) -> str | None:
         """Put the spec file beside the parts; return its key, or None on failure."""

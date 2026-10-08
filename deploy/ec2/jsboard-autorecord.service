@@ -9,7 +9,7 @@ EnvironmentFile=/etc/jsboard.env
 # Print each line as it is written, so journalctl shows progress live.
 Environment=PYTHONUNBUFFERED=1
 StateDirectory=jsboard
-ExecStart=/opt/jsboard/venv/bin/jsboard autorecord --always ${JSBOARD_TARGETS} --top 2 --s3-bucket ${JSBOARD_BUCKET} --workdir /var/lib/jsboard/autorecord --min-free-gb 1 --log-every 60 --slack
+ExecStart=/opt/jsboard/venv/bin/jsboard autorecord --always ${JSBOARD_TARGETS} --top 2 --s3-bucket ${JSBOARD_BUCKET} --workdir /var/lib/jsboard/autorecord --min-free-gb 0.3 --log-every 60 --slack
 Restart=always
 RestartSec=30
 
