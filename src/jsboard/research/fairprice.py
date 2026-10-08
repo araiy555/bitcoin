@@ -45,6 +45,8 @@ from .arbedge import _Book
 
 NS = 1_000_000_000
 LAGS = (1, 5, 10)  # grid steps: 0.1, 0.5, 1 s at the default step
+BANDS = ((2, 4), (4, 6), (6, 8), (8, 10), (10, 15), (15, float("inf")))
+"""Bands of predicted move size (bps) for comparing prediction with outcome."""
 
 
 def feature_names(cross, hinge_bps: float = 8.0) -> list[str]:
@@ -134,6 +136,19 @@ class Score:
     ysum: float = 0.0
     hit: int = 0
     called: int = 0
+    buckets: dict = field(default_factory=dict)
+    """Predicted size band -> [count, sum of |prediction|, sum of the move in
+    the predicted direction]: does +8bps predicted come out as +8bps?"""
+
+    def add_bucket(self, p: float, y: float) -> None:
+        size = abs(p)
+        if size < 2:
+            return
+        band = next((b for b in BANDS if size < b[1]), BANDS[-1])
+        cell = self.buckets.setdefault(band, [0, 0.0, 0.0])
+        cell[0] += 1
+        cell[1] += size
+        cell[2] += math.copysign(1.0, p) * y
 
     def r2(self) -> float:
         if not self.n:
@@ -462,6 +477,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                         if abs(p) > 1e-9 and abs(y) > 1e-9:
                             sc.called += 1
                             sc.hit += (p > 0) == (y > 0)
+                        sc.add_bucket(p, y)
         if gm is None or mid("bybit") is None and mid("binance") is None:
             return
         x = grid.features(gm)
@@ -652,6 +668,23 @@ def calibration_text(r: FairResult) -> list[str]:
                 b = v.cal[(m, h)]
                 cells.append(f"+{m:g}bps: {b.n}回 {b.pnl:+,.0f}円" if b.n else f"+{m:g}bps: 0回")
             out.append(f"   {h:g}秒  " + " / ".join(cells) + f"  → 選んだのは {_margin_text(v.chosen.get(h))}")
+    return out
+
+
+def calibration_bands(r: FairResult) -> list[str]:
+    """Prediction against outcome on the test, by predicted size, for the
+    model in use: the move is GMO's mid from order landing to exit, before
+    costs, in the predicted direction."""
+    out = [f"  予想と実際（試す期間、{_scene(r)}、手数料・スプレッド前、予想の向きをプラス）"]
+    for h in r.holds:
+        cells = []
+        for band in BANDS:
+            c = r.score[h].buckets.get(band)
+            if not c:
+                continue
+            hi = "" if band[1] == float("inf") else f"{band[1]:g}"
+            cells.append(f"予想{band[0]:g}〜{hi}: 平均予想 {c[1] / c[0]:+.1f} → 実際 {c[2] / c[0]:+.1f}（{c[0]:,}点）")
+        out.append(f"   {h:g}秒  " + (" / ".join(cells) if cells else "予想が 2bps を超えた点なし"))
     return out
 
 

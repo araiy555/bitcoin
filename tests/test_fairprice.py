@@ -214,3 +214,15 @@ def test_no_margin_that_made_money_means_no_trades():
     assert _pick_margins(cal, (0.0, 2.0), (10.0,), 20) == {10.0: None}
     cal[(2.0, 10.0)] = Book(n=25, wins=15, notional=250_000, pnl=8.0)
     assert _pick_margins(cal, (0.0, 2.0), (10.0,), 20) == {10.0: 2.0}
+
+
+def test_prediction_and_outcome_are_banded_on_the_test():
+    from jsboard.research.fairprice import calibration_bands
+
+    rows, mid, end = tape()
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(T0, mid), test=(mid, end),
+            holds=(2.0,), min_cal_trades=5)
+    bands = r.score[2.0].buckets
+    assert bands and all(c[0] > 0 for c in bands.values())
+    text = "\n".join(calibration_bands(r))
+    assert "平均予想" in text and "実際" in text

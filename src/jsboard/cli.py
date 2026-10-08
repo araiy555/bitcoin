@@ -4391,6 +4391,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     from .research.fairprice import (
         HEADER,
         active_split,
+        calibration_bands,
         calibration_text,
         model_dict,
         report,
@@ -4491,6 +4492,9 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             print(line, flush=True)
         for line in calibration_text(r):
             print(line, flush=True)
+        if r.test_n:
+            for line in calibration_bands(r):
+                print(line, flush=True)
         if args.save_model:
             folder = Path(args.save_model)
             folder.mkdir(parents=True, exist_ok=True)
