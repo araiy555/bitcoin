@@ -215,11 +215,41 @@ class _Parts:
 
     def __iter__(self):
         for uri in self.uris:
-            self._fh = open_text(uri)
+            self._fh = _open_part(uri)
             try:
                 yield from self._fh
             finally:
                 self.close()
+
+
+def _open_part(uri: str, tries: int = 6, sleep=None):
+    """One part of a recording, fetched whole before it is read.
+
+    A part is a few minutes of data, a few megabytes compressed. Streaming
+    it straight off the connection meant a reset two hours into a long read
+    (it happened: "Connection reset by peer") ended the whole run. Fetching
+    each part whole, and fetching it again when the connection drops, keeps
+    one dropped connection to a short wait.
+    """
+    import io
+    import time
+
+    if not is_s3_uri(uri):
+        return open_text(uri)
+    bucket, key = split_uri(uri)
+    wait = sleep or time.sleep
+    for attempt in range(tries):
+        try:
+            blob = default_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+            break
+        except Exception:  # noqa: BLE001 - botocore and urllib3 raise several kinds
+            if attempt == tries - 1:
+                raise
+            wait(min(2 ** attempt, 30))
+    raw = io.BytesIO(blob)
+    if key.endswith(".gz"):
+        return io.TextIOWrapper(gzip.GzipFile(fileobj=raw), encoding="utf-8")
+    return io.TextIOWrapper(raw, encoding="utf-8")
 
     def read(self) -> str:
         return "".join(self)
