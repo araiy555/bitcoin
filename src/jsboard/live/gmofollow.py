@@ -384,13 +384,19 @@ def skew(done: list[dict]) -> list[str]:
     by_hour: dict = {}
     for r in done:
         hour = (datetime.fromtimestamp(int(r["signal_ns"]) / 1e9, UTC) + jst).hour
-        by_hour.setdefault(hour, []).append(r["pnl_bps"])
-    cells = [f"{h:02d}時 {len(v)}回 {statistics.fmean(v):+.1f}" for h, v in sorted(by_hour.items())]
-    plus_hours = sum(statistics.fmean(v) > 0 for v in by_hour.values())
-    out = ["時間帯ごと（日本時間、1回あたり bps）: " + " / ".join(cells),
-           f"プラスだった時間帯 {plus_hours}/{len(by_hour)}"]
+        by_hour.setdefault(hour, []).append(r)
+    out = ["時間帯ごと（日本時間）:"]
+    plus_hours = 0
+    for h, rows in sorted(by_hour.items()):
+        mean = statistics.fmean(x["pnl_bps"] for x in rows)
+        plus_hours += mean > 0
+        wins = sum(x["pnl_jpy"] > 0 for x in rows)
+        out.append(f"  {h:02d}時  {len(rows)}回  勝率 {wins / len(rows):.0%}  "
+                   f"{sum(x['pnl_jpy'] for x in rows):+,.1f}円  1回あたり {mean:+.2f}bps")
+    out.append(f"プラスだった時間帯 {plus_hours}/{len(by_hour)}")
     bps = sorted(r["pnl_bps"] for r in done)
-    k = max(1, len(bps) // 20)  # the best and the worst 5%
+    # Fixed before any result was seen: the best and the worst 5%, at least one.
+    k = max(1, len(bps) // 20)
     if len(bps) > 2 * k:
         out.append(f"一番良い {k}回を除くと 1回あたり {statistics.fmean(bps[:-k]):+.2f}bps、"
                    f"一番悪い {k}回を除くと {statistics.fmean(bps[k:]):+.2f}bps、"
