@@ -368,4 +368,31 @@ def summary(records: list[dict]) -> list[str]:
         f"入りの値段のずれ 平均 {mean('entry_slip_bps')}bps  出の値段のずれ 平均 {mean('exit_slip_bps')}bps（プラスは不利）",
         f"合図→注文 {ms('signal_to_send_ms')}ms  注文→受付 {ms('send_to_ack_ms')}ms  受付→約定確認 {ms('ack_to_fill_seen_ms')}ms（中央値）",
     ]
+    lines += skew(done)
     return lines
+
+
+def skew(done: list[dict]) -> list[str]:
+    """Whether the result rests on a few hours or a few trades: by hour of
+    the day (Japan time), and without the best and the worst trades."""
+    import statistics
+    from datetime import UTC, datetime, timedelta
+
+    if not done:
+        return []
+    jst = timedelta(hours=9)
+    by_hour: dict = {}
+    for r in done:
+        hour = (datetime.fromtimestamp(int(r["signal_ns"]) / 1e9, UTC) + jst).hour
+        by_hour.setdefault(hour, []).append(r["pnl_bps"])
+    cells = [f"{h:02d}時 {len(v)}回 {statistics.fmean(v):+.1f}" for h, v in sorted(by_hour.items())]
+    plus_hours = sum(statistics.fmean(v) > 0 for v in by_hour.values())
+    out = ["時間帯ごと（日本時間、1回あたり bps）: " + " / ".join(cells),
+           f"プラスだった時間帯 {plus_hours}/{len(by_hour)}"]
+    bps = sorted(r["pnl_bps"] for r in done)
+    k = max(1, len(bps) // 20)  # the best and the worst 5%
+    if len(bps) > 2 * k:
+        out.append(f"一番良い {k}回を除くと 1回あたり {statistics.fmean(bps[:-k]):+.2f}bps、"
+                   f"一番悪い {k}回を除くと {statistics.fmean(bps[k:]):+.2f}bps、"
+                   f"両方除くと {statistics.fmean(bps[k:-k]):+.2f}bps")
+    return out

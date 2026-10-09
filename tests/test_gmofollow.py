@@ -273,3 +273,15 @@ def test_shadow_fills_at_the_book_after_the_latency():
         return (await api.fills(oid))[0].price
 
     assert asyncio.run(go()) == 100.3
+
+
+def test_the_summary_shows_hours_and_the_result_without_the_extremes():
+    from jsboard.live.gmofollow import summary
+
+    recs = []
+    for i in range(40):
+        recs.append({"signal_ns": T0 + i * 600 * NS, "pnl_jpy": 0.1, "pnl_bps": 1.0})
+    recs[0]["pnl_bps"] = 40.0  # one lucky trade
+    text = "\n".join(summary(recs))
+    assert "時間帯ごと" in text and "プラスだった時間帯" in text
+    assert "一番良い 2回を除くと 1回あたり +1.00bps" in text
