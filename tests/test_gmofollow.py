@@ -123,8 +123,8 @@ def test_a_margin_error_stops_at_once():
 
 
 def test_shadow_api_fills_at_the_book_and_sends_nothing():
-    api = ShadowApi(lambda side, q: 101.0 if side > 0 else 99.0)
     clock = Clock()
+    api = ShadowApi(lambda side, q: 101.0 if side > 0 else 99.0, sleep=clock.sleep)
     f = Follower(api=api, symbol="XRP_JPY", size="10", walk=api.walk, touch=lambda: (99.0, 101.0),
                  clock=clock, sleep=clock.sleep)
     rec = asyncio.run(f.trade("binance", 1, 9.0, clock()))
@@ -258,3 +258,18 @@ def test_signals_while_busy_are_counted_and_the_log_summarised():
     assert f.tally.signals == 2 and f.tally.skipped == 1
     text = "\n".join(summary(records))
     assert "見送り 1" in text and "約定率 100%" in text and "+7.00" in text
+
+
+def test_shadow_fills_at_the_book_after_the_latency():
+    clock = Clock()
+    book = {"ask": 100.0}
+    api = ShadowApi(lambda side, q: book["ask"], latency_s=0.2, sleep=clock.sleep)
+
+    async def go():
+        task = asyncio.ensure_future(api.market_open("XRP_JPY", "BUY", "10"))
+        await asyncio.sleep(0)
+        book["ask"] = 100.3  # the book moves while the order is on its way
+        oid = await task
+        return (await api.fills(oid))[0].price
+
+    assert asyncio.run(go()) == 100.3

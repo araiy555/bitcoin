@@ -81,21 +81,28 @@ class Detector:
 
 
 class ShadowApi:
-    """Fills every order at once at the live book, and sends nothing."""
+    """Sends nothing. Each order is filled at the live book as it stands
+    `latency_s` after it was sent, as a real order would only land then:
+    filling at the instant of the signal flattered the shadow by about
+    1.3bps a trade, the move GMO makes in the first 0.2 s."""
 
-    def __init__(self, walk) -> None:
+    def __init__(self, walk, latency_s: float = 0.2, sleep=asyncio.sleep) -> None:
         self.walk = walk  # (side +1/-1, size) -> price or None
+        self.latency_s = latency_s
+        self.sleep = sleep
         self._fills: dict[str, list[Fill]] = {}
         self._seq = 0
 
     async def market_open(self, symbol: str, side: str, size: str) -> str:
-        return self._fill(1 if side == "BUY" else -1, float(size), opening=True)
+        return await self._fill(1 if side == "BUY" else -1, float(size), opening=True)
 
     async def market_close(self, symbol: str, side: str, positions) -> str:
-        return self._fill(1 if side == "BUY" else -1, sum(float(s) for _, s in positions),
-                          opening=False)
+        return await self._fill(1 if side == "BUY" else -1, sum(float(s) for _, s in positions),
+                                opening=False)
 
-    def _fill(self, side: int, size: float, opening: bool) -> str:
+    async def _fill(self, side: int, size: float, opening: bool) -> str:
+        if self.latency_s:
+            await self.sleep(self.latency_s)
         self._seq += 1
         oid = f"shadow-{self._seq}"
         price = self.walk(side, size)

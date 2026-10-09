@@ -4635,7 +4635,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             await session.close()
             return 1
     else:
-        api = ShadowApi(walk)
+        api = ShadowApi(walk, latency_s=args.shadow_latency_ms / 1000)
 
     follower = Follower(api=api, symbol=symbol, size=args.size, walk=walk, touch=touch,
                         hold_s=args.hold_s, latency_ms=args.latency_ms,
@@ -8174,6 +8174,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--model", default=None,
                       help="フェア価格の式（fairprice --save-model で作った JSON）。指定すると後追いの代わりにこれで入る")
     p_gf.add_argument("--live", action="store_true", help="実際に注文する")
+    p_gf.add_argument("--shadow-latency-ms", type=float, default=200.0,
+                      help="シャドーで、注文を出してから約定するまでの遅れ（その時点の板で約定させる）")
     p_gf.add_argument("--env-file", default="/etc/jsboard.env")
     p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")
     p_gf.add_argument("--slack", action="store_true")
