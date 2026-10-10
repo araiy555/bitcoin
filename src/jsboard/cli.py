@@ -4857,6 +4857,13 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
             cancel_ms=tuple(float(x) for x in args.cancel_ms.split(",")),
             place_ms=args.place_ms, size=args.size, max_inv=args.max_inv,
             skew_bps=args.skew_bps, rebate_bps=args.rebate_bps)
+    if r.hours <= 0:
+        msg = (f"{symbol}: {start:%Y-%m-%d %H:%M}〜{end:%Y-%m-%d %H:%M} UTC に GMO の録画がありません。"
+               "録画（leadrecord）が止まっていないか確認してください。")
+        console.print(f"[red]{msg}[/red]")
+        if args.slack:
+            await _post_slack(f":warning: フェア価格で指値: {msg}")
+        return 1
     print(f"録画のある時間 {r.hours:.1f}時間")
     print(HEADER)
     for line in rows_of(r):
