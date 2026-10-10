@@ -35,8 +35,10 @@ def tape(gmo_at, prints, seconds=8):
 
 def go(rows, **kw):
     kw.setdefault("widths", (0.4999,))
+    kw.setdefault("requote_bps", (0.5,))
+    kw.setdefault("test", (T0 + NS, T0 + 100 * NS))
     return run(iter(rows), GMO, {"bybit": PERP}, MODEL, label="XRP",
-               test=(T0 + NS, T0 + 100 * NS), shrink=0.0, place_ms=200, **kw)
+               shrink=0.0, place_ms=200, **kw)
 
 
 def test_the_queue_ahead_must_trade_away_before_we_fill():
@@ -72,6 +74,38 @@ def test_inventory_stops_the_side_that_would_grow_it():
     rows = tape(lambda i: (100_000, 100_010), prints)
     [bk] = go(rows, cancel_ms=(200.0,), max_inv=20.0).books
     assert bk.inv <= 20.0 + 1e-9 and bk.max_inv == 20.0
+
+
+def test_a_quote_stays_put_until_its_target_moves_far_enough():
+    # GMO's book wobbles by 3 ticks (0.3 bps) every 100 ms: requoting on
+    # every change chases it, a 0.5 bps threshold leaves the quotes alone.
+    rows = tape(lambda i: (100_000, 100_010) if i % 2 else (100_003, 100_013), [])
+    every, calm = go(rows, cancel_ms=(200.0,), requote_bps=(0.0, 0.5)).books
+    assert every.placed > 20 and every.cancels > 20
+    assert calm.placed == 2 and calm.cancels == 0
+
+
+def test_a_fill_on_a_cancelled_order_cannot_take_inventory_past_the_cap():
+    # Long 10 with a bid resting and the cap at 20. The book drops; the old
+    # bid is being cancelled (1 s) and still counts, so no new bid goes out
+    # until it is gone. A seller then sweeps through both prices: only the
+    # old bid is there, the inventory stops at the cap.
+    rows = tape(lambda i: (100_000, 100_010) if i < 50 else (99_990, 100_000),
+                [(3.0, Side.SELL, 99_990, 10), (5.5, Side.SELL, 99_970, 60)])
+    [bk] = go(rows, cancel_ms=(1000.0,), max_inv=20.0).books
+    assert bk.held > 0
+    assert bk.late == 1 and abs(bk.late_qty - 10.0) < 1e-9
+    assert abs(bk.inv - 20.0) < 1e-9 and bk.max_inv == 20.0
+
+
+def test_hours_count_the_recording_not_the_gap_in_it():
+    first = tape(lambda i: (100_000, 100_010), [])
+    later = [(src, rx + 600 * NS, ev) for src, rx, ev in tape(lambda i: (100_000, 100_010), [])]
+    r = go(sorted(first + later, key=lambda r: r[1]), cancel_ms=(200.0,),
+           test=(T0 + NS, T0 + 1000 * NS))
+    assert r.span_hours * 3600 > 600
+    assert 10 < r.hours * 3600 < 17
+    assert 0 < r.quoting_hours * 3600 <= r.hours * 3600 + 0.2   # a grid step at each edge
 
 
 async def test_the_command_starts_where_the_model_stopped_learning(monkeypatch, capsys, tmp_path):
@@ -126,5 +160,12 @@ async def test_the_command_starts_where_the_model_stopped_learning(monkeypatch, 
         "--test", f"{iso(T0 + NS)},{iso(T0 + 100 * NS)}"])
     assert await args.func(args) == 0
     out = capsys.readouterr().out.splitlines()
-    row = next(x for x in out if x.startswith("200ms")).split("\t")
-    assert row[4] == "1"   # one estimated fill
+    rows = [x.split("\t") for x in out if x.startswith(("0.5bps", "1bps"))]
+    assert [r[0] for r in rows] == ["0.5bps", "1bps"]   # both thresholds, same tape
+    assert all(r[7] == "1" for r in rows)   # one estimated fill each
+    assert any(x.startswith("期間 ") and "録画のある時間" in x for x in out)
+
+    # A window that starts inside the model's training is refused.
+    args = cli.build_parser().parse_args([
+        "fairmm", "s3://b/raw/lead/", "--model", str(model), "--test", f"{iso(T0)},"])
+    assert await args.func(args) == 1

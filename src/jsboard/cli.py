@@ -4801,7 +4801,7 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
 
     from .feed.base import FeedStatus as _Status
     from .feed.replay import iter_tagged_timed
-    from .research.fairmm import HEADER, NOTE, rows_of, run, slack_summary
+    from .research.fairmm import HEADER, NOTE, hours_line, rows_of, run, slack_summary
     from .sim.s3 import exists, list_parts, read_bytes
 
     model = json.loads(Path(args.model).read_text())
@@ -4812,11 +4812,18 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
         return t if t.tzinfo else t.replace(tzinfo=UTC)
 
     if args.test:
-        start, end = (when(x) for x in args.test.split(","))
+        # "start," with no end runs to now.
+        a, _, b = args.test.partition(",")
+        start = when(a)
+        end = when(b) if b.strip() else datetime.now(UTC)
     else:
         # From where the model's training stopped to now: data it never saw.
         start = when(str(model["train"][0]).split(",")[1])
         end = datetime.now(UTC)
+    train_end = when(str(model["train"][-1]).split(",")[1])
+    if start < train_end:
+        console.print(f"[red]試す時間帯が式の学習（{train_end:%Y-%m-%d %H:%M} UTC まで）と重なっています。[/red]")
+        return 1
     root = args.path if args.path.endswith("/") else args.path + "/"
     cross = list(model.get("cross", []))
 
@@ -4858,6 +4865,7 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
             hold=args.hold, shrink=args.shrink,
             widths=tuple(float(x) for x in args.widths.split(",")),
             cancel_ms=tuple(float(x) for x in args.cancel_ms.split(",")),
+            requote_bps=tuple(float(x) for x in args.requote_bps.split(",")),
             place_ms=args.place_ms, size=args.size, max_inv=args.max_inv,
             skew_bps=args.skew_bps, rebate_bps=args.rebate_bps)
     if r.hours <= 0:
@@ -4867,7 +4875,7 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
         if args.slack:
             await _post_slack(f":warning: フェア価格で指値: {msg}")
         return 1
-    print(f"録画のある時間 {r.hours:.1f}時間")
+    print(hours_line(r))
     print(HEADER)
     for line in rows_of(r):
         print(line, flush=True)
@@ -8279,11 +8287,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_mm = sub.add_parser("fairmm", help="フェア価格のまわりに GMO で指値を置いたら（録画で再現、約定は保守的に推定、注文なし）")
     p_mm.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
     p_mm.add_argument("--model", required=True, help="fairprice --save-model で保存した式")
-    p_mm.add_argument("--test", default=None, help="試す時間帯（UTC）。省略で、式の学習が終わった時から今まで")
+    p_mm.add_argument("--test", default=None, help="試す時間帯（UTC、「始め,終わり」）。終わりを空けると今まで。省略で、式の学習が終わった時から今まで")
     p_mm.add_argument("--hold", default="2", help="式のうち何秒先の予想を使うか")
     p_mm.add_argument("--shrink", type=float, default=0.5, help="予想を何倍に割り引くか（入った瞬間の予想は約2倍に出すぎていた）")
     p_mm.add_argument("--widths", default="0.5,1,2", help="フェア価格から指値までの幅 bps")
     p_mm.add_argument("--cancel-ms", default="200,500,1000", help="取消が効くまでの遅れ")
+    p_mm.add_argument("--requote-bps", default="0.5,1", help="狙いの値段がこれだけ動くまで指値を出し直さない（bps）")
     p_mm.add_argument("--place-ms", type=float, default=200.0, help="指値が板に載るまでの遅れ")
     p_mm.add_argument("--size", type=float, default=10.0, help="1つの指値の枚数")
     p_mm.add_argument("--max-inv", type=float, default=30.0, help="在庫の上限（枚）")

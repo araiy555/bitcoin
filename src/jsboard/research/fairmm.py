@@ -22,9 +22,24 @@ and reported separately from anything measured:
   with the inventory closed by crossing half the spread.
 
 The quotes: fair = mid x (1 + shrink x prediction), less a skew per lot of
-inventory; bid and ask `width_bps` either side of it, kept post-only, and
-no quote on the side that would take inventory past `max_inv`. Every
-combination of cancel latency and width runs in one pass.
+inventory; bid and ask `width_bps` either side of it, kept post-only. A
+resting quote is left alone until its target has moved `requote_bps` or
+more from it; requoting every tick change gives the slow cancel too many
+chances to be picked off.
+
+Inventory is capped against everything that could still fill, not only
+what has: a new order goes out only if the inventory plus every live
+order on that side (still landing, resting, or with a cancel on its way)
+plus the new one stays within `max_inv`. So a late fill on a cancelled
+order can never carry the book past the cap.
+
+Time is counted three ways, because a recorder can stop: the span from
+the first to the last GMO book in the window, the time actually covered
+by the recording (gaps over a minute left out), and the time quotes were
+out. Fills per hour use the recorded time.
+
+Every combination of requote threshold, cancel latency and width runs in
+one pass, on the same tape and the same fill rules.
 """
 
 from __future__ import annotations
@@ -59,10 +74,14 @@ class Book:
     """One quoting variant's account and its measurements."""
     cancel_ms: float
     width_bps: float
+    requote_bps: float = 0.0
     orders: list = field(default_factory=list)
     inv: float = 0.0
     cash: float = 0.0
     placed: int = 0
+    cancels: int = 0
+    held: int = 0
+    """Orders not sent because live orders already used the inventory cap."""
     landed: int = 0
     rejected: int = 0
     fills: int = 0
@@ -73,6 +92,7 @@ class Book:
     after: dict = field(default_factory=lambda: {s: [0, 0.0] for s in AFTER_S})
     late: int = 0
     """Fills that came while a cancel was on its way."""
+    late_qty: float = 0.0
     late_after: list = field(default_factory=lambda: [0, 0.0])
     max_inv: float = 0.0
     rebate: float = 0.0
@@ -83,19 +103,29 @@ class Book:
                 return o
         return None
 
+    def exposure(self, side: int) -> float:
+        """Coins on `side` that could still fill: every order not yet dead."""
+        return sum(o.qty for o in self.orders if o.side == side and not o.rejected)
+
 
 @dataclass
 class MMResult:
     label: str
     books: list
     hours: float = 0.0
+    """Time the recording actually covers (gaps over a minute left out)."""
+    span_hours: float = 0.0
+    """First to last GMO book in the window, gaps and all."""
+    quoting_hours: float = 0.0
+    """Time the feeds were fresh and the quotes were out."""
     end_mid: float | None = None
     half_spread: float = 0.0
 
 
 def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tuple[int, int],
         hold: str = "2", shrink: float = 0.5, widths=(0.5, 1.0, 2.0),
-        cancel_ms=(200.0, 500.0, 1000.0), place_ms: float = 200.0, size: float = 10.0,
+        cancel_ms=(200.0, 500.0, 1000.0), requote_bps=(0.5, 1.0),
+        place_ms: float = 200.0, size: float = 10.0,
         max_inv: float = 30.0, skew_bps: float = 0.5, rebate_bps: float = 0.0,
         step_ms: int = 100, stale_s: float = 10.0) -> MMResult:
     """`rows` yields (source, receive_ns, event): "gmo" for GMO's book and
@@ -103,7 +133,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
     fairprice model; its weights for `hold` seconds price GMO."""
     weights = model["weights"][hold]
     grid = Grid(gmo, leads, model.get("cross", []), step_ms, float(model.get("hinge_bps", 8.0)))
-    books = [Book(c, w) for c in cancel_ms for w in widths]
+    books = [Book(c, w, q) for q in requote_bps for c in cancel_ms for w in widths]
     out = MMResult(label, books)
     step = step_ms * 1_000_000
     tick = float(gmo.tick_size)
@@ -114,6 +144,9 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
     seq = itertools.count()
     grid_t = None
     first = last = None
+    gap = 60 * NS
+    covered = 0
+    quoting = 0
 
     def mid() -> float | None:
         return grid.mid("gmo")
@@ -153,6 +186,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
             bk.edge_bps += o.side * (m - price) / price * 1e4 * qty
         is_late = o.cancel_at is not None and now >= o.cancel_at
         bk.late += is_late
+        bk.late_qty += qty if is_late else 0.0
         for s in AFTER_S:
             heapq.heappush(later, (now + int(s * NS), next(seq), bk, o.side, price, qty, s, is_late))
 
@@ -196,6 +230,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
                         o.queue = 0.0
 
     def on_grid(t: int) -> None:
+        nonlocal quoting
         settle_due(t)
         if t - last_rx.get("gmo", -stale - 1) > stale or not any(
                 t - last_rx.get(k, -stale - 1) <= stale for k in ("bybit", "binance")):
@@ -212,6 +247,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
         x = grid.features(gm)
         if not test[0] <= t < test[1]:
             return
+        quoting += step
         p = sum(w * v for w, v in zip(weights, x, strict=True))
         fair = gm * (1 + shrink * p / 1e4)
         for bk in books:
@@ -219,8 +255,9 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
             requote_one(bk, t, fair * (1 - skew_bps * bk.inv / size / 1e4))
 
     def requote_one(bk: Book, now: int, fair: float | None) -> None:
-        """Move each side's quote to where `fair` puts it: cancel the old
-        one (it lives on until the cancel lands) and send the new one.
+        """Move each side's quote to where `fair` puts it, once it has moved
+        `requote_bps` from the resting one: cancel the old one (it lives on
+        until the cancel lands) and send the new one if the cap allows.
         No fair price: take both sides away."""
         tidy(bk, now)
         cancel = int(bk.cancel_ms * 1e6)
@@ -230,20 +267,27 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
             if fair is not None and not (side * bk.inv >= max_inv - 1e-9):
                 raw = fair * (1 - side * bk.width_bps / 1e4)
                 want = math.floor(raw / tick + 1e-9) if side > 0 else math.ceil(raw / tick - 1e-9)
-            if o is not None and o.price == want:
+            if o is not None and want is not None and (
+                    abs(want - o.price) * tick / fair * 1e4 < bk.requote_bps - 1e-9
+                    or want == o.price):
                 continue
             if o is not None:
                 o.cancel_at, o.dead_at = now, now + cancel
-            if want is not None:
-                bk.orders.append(Order(side, want, size, now + place))
-                bk.placed += 1
+                bk.cancels += 1
+            if want is None:
+                continue
+            if side * bk.inv + bk.exposure(side) + size > max_inv + 1e-9:
+                bk.held += 1   # wait for the old order to die or fill
+                continue
+            bk.orders.append(Order(side, want, size, now + place))
+            bk.placed += 1
 
     for src, rx, event in rows:
         if src not in grid.books:
             continue
         if grid_t is None:
             grid_t = (rx // step + 1) * step
-        if rx - grid_t > 60 * NS:
+        if rx - grid_t > gap:
             skip = (rx - grid_t) // step
             grid_t += skip * step
             grid.basis_avg.clear()
@@ -263,10 +307,14 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
         grid.apply(src, event)
         last_rx[src] = rx
         if src == "gmo" and test[0] <= rx < test[1]:
+            if last is not None and rx - last <= gap:
+                covered += rx - last
             first = rx if first is None else first
             last = rx
     if first is not None:
-        out.hours = (last - first) / NS / 3600
+        out.span_hours = (last - first) / NS / 3600
+        out.hours = covered / NS / 3600
+        out.quoting_hours = quoting / NS / 3600
     out.end_mid = mid()
     b = grid.books["gmo"]
     if b.best_bid is not None and b.best_ask is not None:
@@ -275,9 +323,10 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
 
 
 HEADER = "\t".join([
-    "取消の遅れ", "指値の幅", "出した指値", "板に載った", "約定（推定）", "1時間あたり", "最大在庫",
+    "出し直し", "取消の遅れ", "指値の幅", "出した指値", "取り消した", "在庫枠で見送り", "板に載った",
+    "約定（推定）", "1時間あたり", "最大在庫",
     "約定時の取り分 bps", "0.1秒後", "0.5秒後", "1秒後", "5秒後",
-    "取消中の約定", "その1秒後", "損益 円", "1約定あたり bps", "在庫を閉じたら 円",
+    "取消中の約定", "その枚数", "その1秒後", "損益 円", "1約定あたり bps", "在庫を閉じたら 円",
 ])
 
 
@@ -293,10 +342,11 @@ def rows_of(r: MMResult) -> list[str]:
         after = [f(c[1] / c[0]) if c[0] else "-" for c in (bk.after[s] for s in AFTER_S)]
         late = bk.late_after
         lines.append("\t".join([
-            f"{bk.cancel_ms:g}ms", f"{bk.width_bps:g}bps", f"{bk.placed:,}", f"{bk.landed:,}",
+            f"{bk.requote_bps:g}bps", f"{bk.cancel_ms:g}ms", f"{bk.width_bps:g}bps",
+            f"{bk.placed:,}", f"{bk.cancels:,}", f"{bk.held:,}", f"{bk.landed:,}",
             f"{bk.fills:,}", f"{bk.fills / r.hours:.1f}" if r.hours else "-", f"{bk.max_inv:g}",
             f(bk.edge_bps / bk.fill_qty) if bk.fill_qty else "-", *after,
-            f"{bk.late:,}", f(late[1] / late[0]) if late[0] else "-",
+            f"{bk.late:,}", f"{bk.late_qty:g}", f(late[1] / late[0]) if late[0] else "-",
             f"{mark:+,.1f}", f(per), f"{flat:+,.1f}",
         ]))
     return lines
@@ -306,18 +356,27 @@ NOTE = (
     "約定は推定です（本物の注文ではありません）。指値は板に載った時点の同じ値段の行列の最後に並び、"
     "その値段の約定でだけ前に進みます（前の注文の取消では進めない＝保守的）。\n"
     "0.1〜5秒後 = 約定後の GMO の中値の動きを、約定値段から自分に有利な向きをプラスで（マイナスが逆選択）。\n"
-    "取消中の約定 = 取消を出してから実際に消えるまでに約定した回数。損益は現金＋在庫を最後の中値で評価。"
+    "出し直し = 狙いの値段が今の指値からこれだけ動くまで指値をそのままにする（0.5bps と 1bps で固定）。\n"
+    "取消中の約定 = 取消を出してから実際に消えるまでに約定した回数と枚数。"
+    "在庫枠で見送り = 取消待ちや板に載る前の指値まで約定したと考えると在庫の上限を超えるので、新しい指値を出さなかった回数。\n"
+    "損益は現金＋在庫を最後の中値で評価。"
 )
 
 
+def hours_line(r: MMResult) -> str:
+    return (f"期間 {r.span_hours:.1f}時間（最初〜最後の録画）・録画のある時間 {r.hours:.1f}時間・"
+            f"指値を出していた時間 {r.quoting_hours:.1f}時間")
+
+
 def slack_summary(r: MMResult) -> str:
-    lines = [f":scales: フェア価格で指値（{r.label}、{r.hours:.1f}時間、約定は推定・注文なし）"]
+    lines = [f":scales: フェア価格で指値（{r.label}、約定は推定・注文なし）", f"  {hours_line(r)}"]
     for bk in r.books:
         mark = bk.cash + bk.rebate + (bk.inv * r.end_mid if r.end_mid else 0.0)
         per = mark / bk.notional * 1e4 if bk.notional else float("nan")
         one = bk.after[1.0]
         adverse = f"{one[1] / one[0]:+.2f}" if one[0] else "-"
-        lines.append(f"  • 取消 {bk.cancel_ms:g}ms・幅 {bk.width_bps:g}bps: 約定 {bk.fills}回  "
-                     f"損益 {mark:+,.1f}円（{per:+.2f}bps）  1秒後 {adverse}bps  取消中の約定 {bk.late}回")
+        lines.append(f"  • 出し直し {bk.requote_bps:g}bps・取消 {bk.cancel_ms:g}ms・幅 {bk.width_bps:g}bps: "
+                     f"約定 {bk.fills}回  損益 {mark:+,.1f}円（{per:+.2f}bps）  1秒後 {adverse}bps  "
+                     f"取消中の約定 {bk.late}回")
     lines.append("  （約定は保守的な推定。本物の約定率・取消の速さは実注文でしか分かりません）")
     return "\n".join(lines)
