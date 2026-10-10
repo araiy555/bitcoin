@@ -133,6 +133,13 @@ async def test_the_command_starts_where_the_model_stopped_learning(monkeypatch, 
             "gmo": {**spec, "symbol": "XRP_JPY", "tick_size": "0.001", "lot_size": "1"},
             "bybit": {**spec, "symbol": "XRPUSDT", "tick_size": "0.0001", "lot_size": "1"},
         }}).encode(),
+        # The same tape as GMO's spot book, where a maker is paid 1 bps.
+        target.key_for("XRP", T0, 1): gzip.compress(("\n".join(lines) + "\n").encode()),
+        target.meta_key("XRP"): json.dumps({"sources": {
+            "gmo": {**spec, "symbol": "XRP", "tick_size": "0.001", "lot_size": "1",
+                    "maker_bps": -1.0},
+            "bybit": {**spec, "symbol": "XRPUSDT", "tick_size": "0.0001", "lot_size": "1"},
+        }}).encode(),
     }
 
     class Bucket:
@@ -169,3 +176,14 @@ async def test_the_command_starts_where_the_model_stopped_learning(monkeypatch, 
     args = cli.build_parser().parse_args([
         "fairmm", "s3://b/raw/lead/", "--model", str(model), "--test", f"{iso(T0)},"])
     assert await args.func(args) == 1
+
+    # The leverage model quoting GMO's spot book: the recorded rebate is used.
+    args = cli.build_parser().parse_args([
+        "fairmm", "s3://b/raw/lead/", "--model", str(model), "--symbol", "XRP",
+        "--widths", "0.4999", "--cancel-ms", "200", "--shrink", "0", "--requote-bps", "0.5",
+        "--test", f"{iso(T0 + NS)},{iso(T0 + 100 * NS)}"])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert any(x.startswith("XRP:") and "リベート +1bps" in x for x in out)
+    [row] = [x.split("\t") for x in out if x.startswith("0.5bps")]
+    assert row[7] == "1" and float(row[19].replace(",", "")) > 0   # paid on the fill

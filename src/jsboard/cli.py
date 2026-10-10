@@ -4124,7 +4124,8 @@ async def cmd_leadrecord(args: argparse.Namespace) -> int:
 
     For the follow-the-leader test: when a perp jumps and GMO has not
     moved yet. Each lead is optional (a coin either may not list); the
-    GMO book and at least one lead are needed. No orders.
+    GMO book and at least one lead are needed. No orders. "xrp-spot"
+    records GMO's spot book instead (symbol XRP), where a maker is paid.
     """
     import asyncio as _asyncio
     import re
@@ -4143,15 +4144,19 @@ async def cmd_leadrecord(args: argparse.Namespace) -> int:
     # "xrp,eth" on the command line; "xrp_eth" where a comma cannot go (a
     # systemd instance name).
     for coin in (c.strip().upper() for c in re.split(r"[,_+]", args.coins) if c.strip()):
-        gm_symbol, perp = f"{coin}_JPY", f"{coin}USDT"
+        base, _, kind = coin.partition("-")
+        market = "spot" if kind == "SPOT" else "leverage"
+        gm_symbol = base if market == "spot" else f"{base}_JPY"
+        perp = f"{base}USDT"
         try:
             gm_inst, gm_feed = await _live_book(Target("gmo", gm_symbol))
         except Exception as exc:  # noqa: BLE001 - one missing book must not stop the rest
             console.print(f"[yellow]{gm_symbol}: 録画できません ({exc})[/yellow]")
             continue
         sources = {"gmo": gm_feed}
-        specs = {"gmo": {**_spec_dict(gm_inst, "leverage"), "venue": "gmo",
+        specs = {"gmo": {**_spec_dict(gm_inst, market), "venue": "gmo",
                          "taker_bps": fees[gm_symbol].taker_bps,
+                         "maker_bps": fees[gm_symbol].maker_bps,
                          "min_order": str(minimum.get(gm_symbol, "0"))}}
         try:
             bybit = await fetch_bybit_instrument(perp, "linear")
@@ -4805,7 +4810,8 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
     from .sim.s3 import exists, list_parts, read_bytes
 
     model = json.loads(Path(args.model).read_text())
-    symbol = model.get("symbol", "XRP_JPY")
+    # --symbol quotes another GMO book of the same coin (spot) with this model.
+    symbol = args.symbol or model.get("symbol", "XRP_JPY")
 
     def when(text: str) -> datetime:
         t = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
@@ -4850,6 +4856,9 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
         console.print(f"[red]{symbol} の録画がありません。[/red]")
         return 1
     gmo = _instrument_from_spec(specs["gmo"])
+    # The maker rebate GMO quoted when the recording started (spot pays one).
+    rebate = (args.rebate_bps if args.rebate_bps is not None
+              else -float(specs["gmo"].get("maker_bps", 0.0)))
     leads = {k: _instrument_from_spec(specs[k]) for k in ("bybit", "binance") if k in specs}
     streams = [stream(symbol, lambda s: s if s in ("gmo", "bybit", "binance") else None)]
     for c in cross:
@@ -4859,7 +4868,8 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
             leads[f"x:{c}"] = _instrument_from_spec(cs[pick])
             streams.append(stream(c, lambda s, c=c, pick=pick: f"x:{c}" if s == pick else None))
     rows = heapq.merge(*streams, key=lambda r: r[1])
-    print(f"{symbol}: {start:%Y-%m-%d %H:%M}〜{end:%Y-%m-%d %H:%M} UTC（式の学習より後）で指値を試します", flush=True)
+    print(f"{symbol}: {start:%Y-%m-%d %H:%M}〜{end:%Y-%m-%d %H:%M} UTC（式の学習より後）で指値を試します"
+          f"（指値の約定でもらえるリベート {rebate:+g}bps）", flush=True)
     r = run(rows, gmo, leads, model, label=symbol,
             test=(int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)),
             hold=args.hold, shrink=args.shrink,
@@ -4867,7 +4877,8 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
             cancel_ms=tuple(float(x) for x in args.cancel_ms.split(",")),
             requote_bps=tuple(float(x) for x in args.requote_bps.split(",")),
             place_ms=args.place_ms, size=args.size, max_inv=args.max_inv,
-            skew_bps=args.skew_bps, rebate_bps=args.rebate_bps)
+            skew_bps=args.skew_bps, rebate_bps=rebate)
+    r.rebate_bps = rebate
     if r.hours <= 0:
         msg = (f"{symbol}: {start:%Y-%m-%d %H:%M}〜{end:%Y-%m-%d %H:%M} UTC に GMO の録画がありません。"
                "録画（leadrecord）が止まっていないか確認してください。")
@@ -8190,7 +8201,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_he.set_defaults(func=cmd_hedgeedge)
 
     p_lr = sub.add_parser("leadrecord", help="GMO（レバレッジ）と Bybit・Binance の先物を同時に録画（注文なし）")
-    p_lr.add_argument("--coins", default="xrp,eth")
+    p_lr.add_argument("--coins", default="xrp,eth", help="xrp,eth（レバレッジ）。xrp-spot で GMO 現物")
     p_lr.add_argument("--hours", type=float, default=48.0)
     p_lr.add_argument("--s3-bucket", required=True)
     p_lr.add_argument("--s3-prefix", default="raw/lead")
@@ -8287,6 +8298,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mm = sub.add_parser("fairmm", help="フェア価格のまわりに GMO で指値を置いたら（録画で再現、約定は保守的に推定、注文なし）")
     p_mm.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
     p_mm.add_argument("--model", required=True, help="fairprice --save-model で保存した式")
+    p_mm.add_argument("--symbol", default=None, help="指値を置く GMO の板（例: XRP＝現物）。省略で式と同じ板")
     p_mm.add_argument("--test", default=None, help="試す時間帯（UTC、「始め,終わり」）。終わりを空けると今まで。省略で、式の学習が終わった時から今まで")
     p_mm.add_argument("--hold", default="2", help="式のうち何秒先の予想を使うか")
     p_mm.add_argument("--shrink", type=float, default=0.5, help="予想を何倍に割り引くか（入った瞬間の予想は約2倍に出すぎていた）")
@@ -8297,7 +8309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mm.add_argument("--size", type=float, default=10.0, help="1つの指値の枚数")
     p_mm.add_argument("--max-inv", type=float, default=30.0, help="在庫の上限（枚）")
     p_mm.add_argument("--skew-bps", type=float, default=0.5, help="在庫1単位あたり指値をずらす bps")
-    p_mm.add_argument("--rebate-bps", type=float, default=0.0, help="指値の約定でもらえる手数料（bps、払うならマイナス）")
+    p_mm.add_argument("--rebate-bps", type=float, default=None, help="指値の約定でもらえる手数料（bps、払うならマイナス）。省略で録画時の GMO の手数料表")
     p_mm.add_argument("--slack", action="store_true")
     p_mm.set_defaults(func=cmd_fairmm)
 

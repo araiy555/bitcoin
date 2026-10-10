@@ -9,7 +9,8 @@ EnvironmentFile=/etc/jsboard.env
 Environment=PYTHONUNBUFFERED=1
 StateDirectory=jsboard
 # The instance is the coins, joined by "_" (a comma cannot go in a unit
-# name): jsboard-leadrecord@xrp_eth, jsboard-leadrecord@btc. Recording only
+# name): jsboard-leadrecord@xrp_eth, jsboard-leadrecord@btc; xrp-spot is
+# GMO's spot book (where a maker is paid) instead of leverage. Recording only
 # goes to S3; nothing is kept on disk. It runs until stopped, survives a
 # reboot once enabled, and comes back by itself if it falls over.
 ExecStart=/opt/jsboard/venv/bin/jsboard leadrecord --coins %i --hours 87600 --s3-bucket ${JSBOARD_BUCKET} --slack

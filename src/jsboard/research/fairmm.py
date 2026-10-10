@@ -120,6 +120,7 @@ class MMResult:
     """Time the feeds were fresh and the quotes were out."""
     end_mid: float | None = None
     half_spread: float = 0.0
+    rebate_bps: float = 0.0
 
 
 def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tuple[int, int],
@@ -326,7 +327,8 @@ HEADER = "\t".join([
     "出し直し", "取消の遅れ", "指値の幅", "出した指値", "取り消した", "在庫枠で見送り", "板に載った",
     "約定（推定）", "1時間あたり", "最大在庫",
     "約定時の取り分 bps", "0.1秒後", "0.5秒後", "1秒後", "5秒後",
-    "取消中の約定", "その枚数", "その1秒後", "損益 円", "1約定あたり bps", "在庫を閉じたら 円",
+    "取消中の約定", "その枚数", "その1秒後", "損益 円", "うちリベート 円", "1約定あたり bps",
+    "在庫を閉じたら 円",
 ])
 
 
@@ -347,7 +349,7 @@ def rows_of(r: MMResult) -> list[str]:
             f"{bk.fills:,}", f"{bk.fills / r.hours:.1f}" if r.hours else "-", f"{bk.max_inv:g}",
             f(bk.edge_bps / bk.fill_qty) if bk.fill_qty else "-", *after,
             f"{bk.late:,}", f"{bk.late_qty:g}", f(late[1] / late[0]) if late[0] else "-",
-            f"{mark:+,.1f}", f(per), f"{flat:+,.1f}",
+            f"{mark:+,.1f}", f"{bk.rebate:+,.1f}", f(per), f"{flat:+,.1f}",
         ]))
     return lines
 
@@ -359,7 +361,7 @@ NOTE = (
     "出し直し = 狙いの値段が今の指値からこれだけ動くまで指値をそのままにする（0.5bps と 1bps で固定）。\n"
     "取消中の約定 = 取消を出してから実際に消えるまでに約定した回数と枚数。"
     "在庫枠で見送り = 取消待ちや板に載る前の指値まで約定したと考えると在庫の上限を超えるので、新しい指値を出さなかった回数。\n"
-    "損益は現金＋在庫を最後の中値で評価。"
+    "損益は現金＋在庫を最後の中値で評価し、指値の約定でもらえるリベートを含む（うちリベート）。"
 )
 
 
@@ -369,14 +371,16 @@ def hours_line(r: MMResult) -> str:
 
 
 def slack_summary(r: MMResult) -> str:
-    lines = [f":scales: フェア価格で指値（{r.label}、約定は推定・注文なし）", f"  {hours_line(r)}"]
+    lines = [f":scales: フェア価格で指値（{r.label}、リベート {r.rebate_bps:+g}bps 込み、約定は推定・注文なし）",
+             f"  {hours_line(r)}"]
     for bk in r.books:
         mark = bk.cash + bk.rebate + (bk.inv * r.end_mid if r.end_mid else 0.0)
         per = mark / bk.notional * 1e4 if bk.notional else float("nan")
         one = bk.after[1.0]
         adverse = f"{one[1] / one[0]:+.2f}" if one[0] else "-"
         lines.append(f"  • 出し直し {bk.requote_bps:g}bps・取消 {bk.cancel_ms:g}ms・幅 {bk.width_bps:g}bps: "
-                     f"約定 {bk.fills}回  損益 {mark:+,.1f}円（{per:+.2f}bps）  1秒後 {adverse}bps  "
+                     f"約定 {bk.fills}回  損益 {mark:+,.1f}円（{per:+.2f}bps、うちリベート {bk.rebate:+,.1f}円）  "
+                     f"1秒後 {adverse}bps  "
                      f"取消中の約定 {bk.late}回")
     lines.append("  （約定は保守的な推定。本物の約定率・取消の速さは実注文でしか分かりません）")
     return "\n".join(lines)
