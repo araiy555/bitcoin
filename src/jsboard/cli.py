@@ -4127,6 +4127,7 @@ async def cmd_leadrecord(args: argparse.Namespace) -> int:
     GMO book and at least one lead are needed. No orders.
     """
     import asyncio as _asyncio
+    import re
     from types import SimpleNamespace
 
     from .research.daily import Target
@@ -4139,7 +4140,9 @@ async def cmd_leadrecord(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     runs, watched = [], []
-    for coin in (c.strip().upper() for c in args.coins.split(",") if c.strip()):
+    # "xrp,eth" on the command line; "xrp_eth" where a comma cannot go (a
+    # systemd instance name).
+    for coin in (c.strip().upper() for c in re.split(r"[,_+]", args.coins) if c.strip()):
         gm_symbol, perp = f"{coin}_JPY", f"{coin}USDT"
         try:
             gm_inst, gm_feed = await _live_book(Target("gmo", gm_symbol))

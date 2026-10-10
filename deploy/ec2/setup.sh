@@ -17,6 +17,7 @@ sudo install -m 755 "$here/capture.sh" /opt/jsboard/capture.sh
 sudo install -m 644 "$here/jsboard-capture@.service" "$here/jsboard-paper@.service" \
   "$here/jsboard-autorecord.service" "$here/jsboard-trade@.service" "$here/jsboard-daily.service" \
   "$here/jsboard-daily.timer" "$here/jsboard-tradeedge.service" "$here/jsboard-tradeedge.timer" \
+  "$here/jsboard-leadrecord@.service" \
   /etc/systemd/system/
 if [ ! -f /etc/jsboard.env ]; then
   sudo install -m 600 "$here/jsboard.env.example" /etc/jsboard.env

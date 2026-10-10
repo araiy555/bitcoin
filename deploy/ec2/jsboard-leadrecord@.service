@@ -1,0 +1,22 @@
+[Unit]
+Description=jsboard: GMO's leverage book with Bybit's and Binance's perps, for the fair-price model (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jsboard
+EnvironmentFile=/etc/jsboard.env
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=jsboard
+# The instance is the coins, joined by "_" (a comma cannot go in a unit
+# name): jsboard-leadrecord@xrp_eth, jsboard-leadrecord@btc. Recording only
+# goes to S3; nothing is kept on disk. It runs until stopped, survives a
+# reboot once enabled, and comes back by itself if it falls over.
+ExecStart=/opt/jsboard/venv/bin/jsboard leadrecord --coins %i --hours 87600 --s3-bucket ${JSBOARD_BUCKET} --slack
+MemoryMax=350M
+Nice=10
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
