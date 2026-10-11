@@ -134,7 +134,8 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
     prints, "bybit"/"binance"/"x:<name>" for the leads. `model` is a saved
     fairprice model; its weights for `hold` seconds price GMO."""
     weights = model["weights"][hold]
-    grid = Grid(gmo, leads, model.get("cross", []), step_ms, float(model.get("hinge_bps", 8.0)))
+    grid = Grid(gmo, leads, model.get("cross", []), step_ms, float(model.get("hinge_bps", 8.0)),
+                bool(model.get("flow")))
     books = [Book(c, w, q) for q in requote_bps for c in cancel_ms for w in widths]
     out = MMResult(label, books, size=size)
     step = step_ms * 1_000_000
@@ -242,7 +243,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
                 for bk in books:   # a feed is down: take the quotes away
                     requote_one(bk, t, None)
             return
-        grid.push()
+        grid.push(t)
         gm = mid()
         if gm is None or not grid.ready():
             return
@@ -292,15 +293,14 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
         if rx - grid_t > gap:
             skip = (rx - grid_t) // step
             grid_t += skip * step
-            grid.basis_avg.clear()
-            for ser in grid.series.values():
-                ser.vals.clear()
+            grid.forget()
             for bk in books:   # nothing rests through a gap in the recording
                 bk.orders.clear()
         while grid_t <= rx:
             on_grid(grid_t)
             grid_t += step
         if isinstance(event, TradeTick):
+            grid.trade(src, rx, event)   # momentum, when the model uses it
             if src == "gmo" and test[0] <= rx < test[1]:
                 on_trade(event, rx)
             continue

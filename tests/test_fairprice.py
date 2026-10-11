@@ -226,3 +226,62 @@ def test_prediction_and_outcome_are_banded_on_the_test():
     assert bands and all(c[0] > 0 for c in bands.values())
     text = "\n".join(calibration_bands(r))
     assert "平均予想" in text and "実際" in text
+
+
+def flow_tape(minutes=40, seed=3):
+    """The perp is still. Before each jump GMO's takers lean the way it
+    goes (a burst of buys before a rise), and the jump comes 1.5 s later."""
+    from jsboard.core.types import Side
+    from jsboard.feed.base import TradeTick
+
+    rnd = random.Random(seed)
+    steps = minutes * 600
+    jumps = {}
+    i = 0
+    while i < steps - 40:
+        if rnd.random() < 0.01:
+            jumps[i] = rnd.choice((-1, 1))
+            i += 40
+        i += 1
+    level, rows, due = 150.0, [], {}
+    for i in range(steps):
+        t = T0 + i * NS // 10 + 1
+        if i in jumps:
+            due[i + 15] = jumps[i]
+            for k in range(4):   # the burst, over 0.4 s
+                side = Side.BUY if jumps[i] > 0 else Side.SELL
+                rows.append(("gmo", t + k * NS // 10 + 5, TradeTick(150_000, 50, side, ts_ns=t)))
+        elif rnd.random() < 0.05:   # ordinary two-way trading
+            rows.append(("gmo", t + 5, TradeTick(150_000, 5, rnd.choice((Side.BUY, Side.SELL)), ts_ns=t)))
+        level *= 1 + due.pop(i, 0) * 0.0015
+        gb = round(level / 0.001) - 30
+        rows.append(("gmo", t, book(gb, gb + 60, t)))
+        rows.append(("bybit", t, book(10_000, 10_001, t)))
+    rows.sort(key=lambda r: r[1])
+    return rows, T0 + minutes * 300 * NS // 10, T0 + minutes * 600 * NS // 10
+
+
+def test_momentum_is_learned_when_asked_for_and_ignored_otherwise():
+    rows, mid, end = flow_tape()
+    plain = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(0, mid), test=(mid, end),
+                holds=(2.0,), margin_bps=4.0)
+    flow = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(0, mid), test=(mid, end),
+               holds=(2.0,), margin_bps=4.0, flow=True)
+    assert len(plain.weights[2.0]) == len(feature_names(()))
+    w = dict(zip(feature_names((), flow=True), flow.weights[2.0], strict=True))
+    assert w["GMO 約定の買い越し 1秒"] > 1.0
+    assert flow.score[2.0].r2() > plain.score[2.0].r2() + 0.1
+
+
+def test_momentum_counts_the_last_seconds_only():
+    from jsboard.core.types import Side
+    from jsboard.feed.base import TradeTick
+    from jsboard.research.fairprice import Grid
+
+    g = Grid(GMO, {"bybit": PERP}, flow=True)
+    g.trade("gmo", T0, TradeTick(1, 30, Side.BUY))
+    g.trade("gmo", T0 + 4 * NS, TradeTick(1, 10, Side.SELL))
+    g.push(T0 + int(4.5 * NS))
+    assert g.flow_features()[:2] == [-1.0, (30 - 10) / 40]   # 1 s: the sell; 5 s: both
+    g.push(T0 + 10 * NS)
+    assert g.flow_features() == [0.0, 0.0, 0.0, 0.0]          # all old, and no Binance prints
