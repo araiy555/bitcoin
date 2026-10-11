@@ -334,3 +334,81 @@ async def test_a_loss_gmo_sees_but_our_fills_miss_still_stops():
     assert "GMO の口座で損失" in m.stopped and m.clean is True
     assert m.pnl(book.bid, book.ask) == 0                # our own count saw nothing
     assert "GMO の口座で -50.0円" in m.text(book.bid, book.ask)
+
+
+async def test_each_fill_counts_for_the_model_that_priced_its_quote():
+    m, dry, clock, book, _ = setup()
+    m.tag = "A"
+    await quote(m, book, 100.005)
+    clock.t += NS // 2
+    dry.on_trade(-1, 99.900, 10)                         # A's bid is filled
+    await m.poll()
+    m.tag = "B"
+    m.requote(None, book.bid, book.ask)                  # B's turn: A's quotes go
+    await turn()
+    clock.t += 2 * NS
+    await m.poll()
+    await quote(m, book, 100.005)
+    clock.t += NS // 2
+    dry.on_trade(1, 100.100, 10)                         # B's ask is filled
+    await m.poll()
+    for mid in (100.05,) * 400:                          # 40 s of grid steps, above both fills
+        clock.t += NS // 10
+        m.settle_after(mid)
+    a, b = m.by_tag["A"], m.by_tag["B"]
+    assert a.fills == 1 and b.fills == 1 and m.stats.fills == 2
+    assert a.after[30.0][2] > 0 > b.after[30.0][2]        # the bid gained, the ask lost by 30 s
+    assert len(m.tag_lines()) == 2 and "式A" in m.text(book.bid, book.ask)
+
+
+def test_two_models_take_turns_in_a_dry_run(monkeypatch, tmp_path):
+    import json
+    from decimal import Decimal
+
+    import jsboard.cli as cli
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import DepthSnapshot
+    from jsboard.research.fairprice import feature_names
+
+    gmo = Instrument("XRP_JPY", Decimal("0.001"), Decimal("1"), "XRP", "JPY")
+    perp = Instrument("XRPUSDT", Decimal("0.0001"), Decimal("1"), "XRP", "USDT")
+
+    class Script:
+        def __init__(self, price, tick):
+            self.price, self.tick = price, tick
+
+        async def __aiter__(self):
+            b = round(self.price / self.tick)
+            for _ in range(60):
+                await asyncio.sleep(0.05)
+                yield DepthSnapshot(((b, 10_000),), ((b + 2, 10_000),), 1)
+            await asyncio.sleep(3600)
+
+    async def live_book(target):
+        return gmo, Script(150.0, 0.001)
+
+    async def bybit_inst(sym, cat="linear"):
+        return perp
+
+    async def no_binance(sym):
+        raise RuntimeError("off")
+
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_bybit_instrument", bybit_inst)
+    monkeypatch.setattr(cli, "BybitFeed", lambda inst, **kw: Script(1.0, 0.0001))
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_binance)
+    base = tmp_path / "base" / "XRP_JPY.json"
+    full = tmp_path / "full" / "XRP_JPY.json"
+    for path, extras in ((base, []), (full, ["flow", "volume", "depth"])):
+        path.parent.mkdir()
+        path.write_text(json.dumps({"symbol": "XRP_JPY", "cross": [], "step_ms": 100, "extras": extras,
+                                    "weights": {"2": [0.0] * len(feature_names((), extras=extras))}}))
+    log = tmp_path / "mm.jsonl"
+    args = cli.build_parser().parse_args([
+        "gmomm", "--model", str(base), "--model-b", str(full), "--switch-min", "0.005",
+        "--hours", "0.0008", "--log", str(log)])
+    assert asyncio.run(args.func(args)) == 0
+    recs = [json.loads(x) for x in log.read_text().splitlines()]
+    assert {r["tag"] for r in recs if r["ev"] == "placed"} == {"A", "B"}
+    [last] = [r for r in recs if r["ev"] == "stopped"]
+    assert last["clean"] is True

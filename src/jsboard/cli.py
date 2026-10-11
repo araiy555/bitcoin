@@ -4796,7 +4796,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
     from .live.gmo import GmoPrivate, load_keys
     from .live.gmomm import DryApi, Maker
     from .research.daily import Target
-    from .research.fairprice import Grid, feature_names, model_extras
+    from .research.fairprice import EXTRAS, Grid, feature_names, model_extras
 
     coin = args.coin.upper()
     symbol, perp = f"{coin}_JPY", f"{coin}USDT"
@@ -4805,12 +4805,22 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
         console.print("[red]GMO_API_KEY と GMO_API_SECRET を /etc/jsboard.env に入れてください"
                       "（キーはここには表示しません）。[/red]")
         return 1
-    model = json.loads(Path(args.model).read_text())
-    if args.hold not in model["weights"]:
-        console.print(f"[red]式に {args.hold}秒 の分がありません（あるのは {', '.join(model['weights'])}秒）。[/red]")
-        return 1
-    weights = model["weights"][args.hold]
+    # One model, or two taking turns (A then B, `switch_min` minutes each)
+    # so both meet the same market on the same day.
+    paths = {"A": args.model, **({"B": args.model_b} if args.model_b else {})}
+    models = {tag: json.loads(Path(path).read_text()) for tag, path in paths.items()}
+    for tag, m in models.items():
+        if args.hold not in m["weights"]:
+            console.print(f"[red]式{tag} に {args.hold}秒 の分がありません（あるのは {', '.join(m['weights'])}秒）。[/red]")
+            return 1
+    model = models["A"]
     hinge = float(model.get("hinge_bps", 8.0))
+    if any(float(m.get("hinge_bps", 8.0)) != hinge or int(m.get("step_ms", 100)) != int(model.get("step_ms", 100))
+           for m in models.values()):
+        console.print("[red]2つの式の hinge か刻みが違います。同じ条件で作った式を使ってください。[/red]")
+        return 1
+    cross = list(dict.fromkeys(c for m in models.values() for c in m.get("cross", [])))
+    extras = tuple(e for e in EXTRAS if any(e in model_extras(m) for m in models.values()))
     gm_inst, gm_feed = await _live_book(Target("gmo", symbol))
     feeds = {"gmo": gm_feed}
     insts = {"gmo": gm_inst}
@@ -4827,7 +4837,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
     if len(feeds) < 2:
         console.print("[red]先行市場がありません。[/red]")
         return 1
-    for c in model.get("cross", []):
+    for c in cross:
         cperp = f"{c.split('_')[0]}USDT"
         try:
             ci = await fetch_futures_instrument(cperp)
@@ -4835,12 +4845,18 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
             console.print(f"[yellow]{cperp}: 使えません ({exc})。この材料は 0 として計算します[/yellow]")
             continue
         feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
-    extras = model_extras(model)
     grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
-                model.get("cross", []), int(model.get("step_ms", 100)), hinge, extras=extras)
-    if len(weights) != len(feature_names(model.get("cross", []), hinge, extras=extras)):
-        console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
-        return 1
+                cross, int(model.get("step_ms", 100)), hinge, extras=extras)
+    # The grid computes every feature either model uses; each model reads its own.
+    union = feature_names(cross, hinge, extras=extras)
+    pricing = {}
+    for tag, m in models.items():
+        names = feature_names(m.get("cross", []), hinge, extras=model_extras(m))
+        w = m["weights"][args.hold]
+        if len(w) != len(names):
+            console.print(f"[red]式{tag} の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
+            return 1
+        pricing[tag] = (w, [union.index(n) for n in names])
     books = grid.books
     tick = float(gm_inst.tick_size)
 
@@ -4902,7 +4918,8 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                   requote_bps=args.requote_bps, max_inv=args.max_inv, skew_bps=args.skew_bps,
                   max_loss_jpy=args.max_loss_jpy, stop_jpy=stop_jpy,
                   time_in_force=args.time_in_force, log=record, notify=notify,
-                  where="GMO" if args.live else "ドライラン")
+                  where="GMO" if args.live else "ドライラン",
+                  tag_names={tag: Path(path).parent.name for tag, path in paths.items()})
     maker.seen.update(str(e.get("executionId")) for e in past)
     try:
         await maker.read_equity()   # the account's value at the start, as GMO counts it
@@ -4918,7 +4935,10 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
         f"{args.requote_bps:g}bps 動いたら出し直し・在庫 最大 {args.max_inv:g}枚（取消待ちの注文も数える）\n"
         f"  損失 {stop_jpy:,.0f}円で止める（GMO の口座の評価額でも見る、開始時 {maker.equity0:,.0f}円）"
         f"（上限 {args.max_loss_jpy:,.0f}円）・{args.hours:g}時間・"
-        f"式 {Path(args.model).name}（{args.hold}秒先、{args.shrink:g}倍）")
+        f"式 {' / '.join(f'{t}={Path(pth).parent.name}' for t, pth in paths.items())}"
+        f"（{args.hold}秒先、{args.shrink:g}倍）"
+        + (f"\n  2つの式を {args.switch_min:g}分ごとに交互に使い、約定をどちらの式の指値かで分けて数えます"
+           if len(models) > 1 else ""))
 
     queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
     last_seen: dict = {}
@@ -4932,6 +4952,11 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
     def stop(reason: str) -> None:
         if not maker.stopping:
             maker._spawn(maker.flatten(reason))
+
+    def turn() -> str:
+        if len(models) < 2:
+            return "A"
+        return "AB"[int(time.time() // (args.switch_min * 60)) % 2]
 
     async def quoter() -> None:
         """Every grid step, as in the replay: price GMO and move the quotes."""
@@ -4951,7 +4976,16 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                     or not any(now - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance"))):
                 maker.requote(None, bid, ask)   # a feed is quiet: take the quotes away
                 continue
-            p = sum(w * v for w, v in zip(weights, grid.features(gm), strict=True))
+            tag = turn()
+            if tag != maker.tag:
+                # The other model's turn: its quotes start afresh, so every
+                # fill belongs to the model that priced it.
+                maker.tag = tag
+                maker.requote(None, bid, ask)
+                continue
+            w, idx = pricing[tag]
+            x = grid.features(gm)
+            p = sum(wi * x[j] for wi, j in zip(w, idx, strict=True))
             fair = gm * (1 + args.shrink * p / 1e4)
             if abs(fair / gm - 1) * 1e4 > args.max_fair_gap_bps:
                 maker.requote(None, bid, ask)   # the model is far off the market: stand aside
@@ -8573,6 +8607,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gm = sub.add_parser("gmomm", help="フェア価格のまわりに GMO で指値（--live で実際に注文。無しなら注文を出さない）")
     p_gm.add_argument("--coin", default="xrp")
     p_gm.add_argument("--model", required=True, help="fairprice --save-model で保存した式")
+    p_gm.add_argument("--model-b", default=None,
+                      help="比べるもう1つの式。--switch-min 分ごとに交互に使い、約定を式ごとに数える")
+    p_gm.add_argument("--switch-min", type=float, default=10.0, help="2つの式を切り替える間隔（分）")
     p_gm.add_argument("--hold", default="2", help="式のうち何秒先の予想を使うか")
     p_gm.add_argument("--shrink", type=float, default=0.5, help="予想を何倍に割り引くか")
     p_gm.add_argument("--width-bps", type=float, default=2.0, help="フェア価格から指値までの幅")

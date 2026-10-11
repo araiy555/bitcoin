@@ -54,7 +54,8 @@ from datetime import UTC, datetime
 from .gmo import GmoError
 
 NS = 1_000_000_000
-AFTER_S = (0.1, 0.5, 1.0, 5.0)
+AFTER_S = (0.1, 0.5, 1.0, 5.0, 30.0)
+KEEP_MIDS_S = 40
 FINAL = {"EXECUTED", "CANCELED", "EXPIRED"}
 FATAL = ("ERR-201", "ERR-5010", "ERR-5011", "ERR-5012")
 """Not enough margin, or the key is refused: retrying will not help."""
@@ -84,6 +85,8 @@ class Quote:
     filled: float = 0.0                # from the executions we have seen
     executed: float | None = None      # GMO's executed size once finished
     status: str = "SENDING"
+    tag: str = "A"
+    """Which model priced it, when two take turns."""
 
     @property
     def live(self) -> bool:
@@ -117,7 +120,10 @@ class Stats:
     ack_ms: list = field(default_factory=list)
     cancel_ack_ms: list = field(default_factory=list)
     cancel_dead_ms: list = field(default_factory=list)
-    after: dict = field(default_factory=lambda: {s: [0.0, 0.0] for s in AFTER_S})
+    after: dict = field(default_factory=lambda: {s: [0.0, 0.0, 0.0] for s in AFTER_S})
+    """seconds after a fill -> [coins, sum of bps x coins, yen]: the mid then
+    against the fill price, in its favour. The yen at 30 s is the fill's
+    profit marked there, whatever the inventory did afterwards."""
 
 
 def _median(xs: list) -> str:
@@ -170,6 +176,14 @@ class Maker:
     _sending: set = field(default_factory=set)
     _posts: deque = field(default_factory=deque)
     _flatten: object = None
+    tag: str = "A"
+    """The model pricing new quotes now."""
+    tag_names: dict = field(default_factory=dict)
+    by_tag: dict = field(default_factory=dict)
+    """tag -> Stats of the quotes that model priced."""
+
+    def tag_stats(self, tag: str) -> Stats:
+        return self.by_tag.setdefault(tag, Stats())
 
     # ---------------------------------------------------------------- state
 
@@ -269,9 +283,11 @@ class Maker:
         # already being closed; otherwise open.
         other = self.short_qty if side > 0 else self.long_qty
         closing_out = sum(q.exposure() for q in self.quotes if q.side == side and q.closing)
-        q = Quote(side, price, self.size, other - closing_out >= self.size - 1e-9, self.clock())
+        q = Quote(side, price, self.size, other - closing_out >= self.size - 1e-9, self.clock(),
+                  tag=self.tag)
         self.quotes.append(q)   # counted against the cap from now on
         self.stats.placed += 1
+        self.tag_stats(q.tag).placed += 1
         self._spawn(self._place(q), sending=True)
 
     async def _place(self, q: Quote) -> None:
@@ -303,7 +319,7 @@ class Maker:
         self.stats.acked += 1
         self.stats.ack_ms.append((q.ack_ns - q.sent_ns) / 1e6)
         self._record({"ev": "placed", "order_id": oid, "side": word, "price": q.price,
-                      "size": q.size, "closing": q.closing, "sent_ns": q.sent_ns,
+                      "size": q.size, "closing": q.closing, "sent_ns": q.sent_ns, "tag": q.tag,
                       "ack_ms": round((q.ack_ns - q.sent_ns) / 1e6, 1)})
         if q.cancel_ns is not None or self.stopping:
             self._ask_cancel(q)
@@ -374,18 +390,21 @@ class Maker:
         if q is not None:
             q.filled += qty
             late = q.cancel_ns is not None and when >= q.cancel_ns
-            s.fills += 1
-            s.fill_qty += qty
-            s.notional += qty * price
-            if late:
-                s.late += 1
-                s.late_qty += qty
             then = self.mid_at(when) or mid
-            if then:
-                s.edge_bps += side * (then - price) / price * 1e4 * qty
+            for st in (s, self.tag_stats(q.tag)):
+                st.fills += 1
+                st.fill_qty += qty
+                st.notional += qty * price
+                if late:
+                    st.late += 1
+                    st.late_qty += qty
+                if then:
+                    st.edge_bps += side * (then - price) / price * 1e4 * qty
             for a in AFTER_S:
-                heapq.heappush(self._later, (when + int(a * NS), next(self._seq), side, price, qty, a))
-            rec.update(late=late, cancel_asked_ns=q.cancel_ns, quote_price=q.price, mid=then)
+                heapq.heappush(self._later, (when + int(a * NS), next(self._seq), side, price, qty, a,
+                                             q.tag))
+            rec.update(late=late, cancel_asked_ns=q.cancel_ns, quote_price=q.price, mid=then,
+                       tag=q.tag)
         elif oid not in self.own_ids:
             rec["foreign"] = True
         self._record(rec)
@@ -405,15 +424,17 @@ class Maker:
         now = self.clock()
         if mid:
             self._mids.append((now, mid))
-        while self._mids and self._mids[0][0] < now - 30 * NS:
+        while self._mids and self._mids[0][0] < now - KEEP_MIDS_S * NS:
             self._mids.popleft()
         while self._later and self._later[0][0] <= now:
-            due, _, side, price, qty, a = heapq.heappop(self._later)
+            due, _, side, price, qty, a, tag = heapq.heappop(self._later)
             m = self.mid_at(due) or mid
             if m:
-                cell = self.stats.after[a]
-                cell[0] += qty
-                cell[1] += side * (m - price) / price * 1e4 * qty
+                for st in (self.stats, self.tag_stats(tag)):
+                    cell = st.after[a]
+                    cell[0] += qty
+                    cell[1] += side * (m - price) / price * 1e4 * qty
+                    cell[2] += side * (m - price) * qty
 
     def _status(self, o: dict) -> None:
         oid = str(o.get("orderId"))
@@ -572,6 +593,22 @@ class Maker:
 
     # ---------------------------------------------------------------- report
 
+    def tag_lines(self) -> list[str]:
+        """Each model's own fills, when two took turns."""
+        out = []
+        for tag in sorted(self.by_tag):
+            st = self.by_tag[tag]
+            name = self.tag_names.get(tag, tag)
+            late = f"{st.late / st.fills:.0%}" if st.fills else "-"
+            moves = "  ".join(f"{a:g}秒後 {c[1] / c[0]:+.2f}" if c[0] else f"{a:g}秒後 -"
+                              for a, c in ((a, st.after[a]) for a in AFTER_S if a >= 1.0))
+            c30 = st.after[30.0]
+            mark = (f"{c30[2]:+,.1f}円（1約定 {c30[2] / st.notional * 1e4:+.2f}bps）"
+                    if c30[0] and st.notional else "-")
+            out.append(f"  式{tag}（{name}）: 指値 {st.placed}回  約定 {st.fills}回（取消を出した後 {late}）  "
+                       f"{moves}  30秒後の値で見た損益 {mark}")
+        return out
+
     def text(self, bid: float | None = None, ask: float | None = None) -> str:
         s = self.stats
         pnl = self.pnl(bid, ask) if (bid or ask or not self.position) else None
@@ -589,7 +626,8 @@ class Maker:
                 f"  約定 {s.fills}回 {s.fill_qty:g}枚（うち取消を出した後 {s.late}回 {s.late_qty:g}枚）\n"
                 f"  約定時の取り分 {edge}bps  約定後の値動き（bps、プラスが有利）{after}\n"
                 f"  注文→受付 {_median(s.ack_ms)}ms  取消→受付 {_median(s.cancel_ack_ms)}ms  "
-                f"取消→消えた確認 {_median(s.cancel_dead_ms)}ms（中央値）")
+                f"取消→消えた確認 {_median(s.cancel_dead_ms)}ms（中央値）"
+                + "".join("\n" + line for line in (self.tag_lines() if len(self.by_tag) > 1 else [])))
 
 
 class DryApi:
