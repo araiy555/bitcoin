@@ -1,8 +1,9 @@
 """GMO Coin's private REST API, for the leverage (取引所レバレッジ) book.
 
-Only what the follow test needs: a market order that opens a position, a
-market order that closes exactly that position, the fills of an order, and
-the open positions. Keys come from the environment (GMO_API_KEY /
+What the follow test needs (a market order that opens a position, a market
+order that closes exactly that position, the fills of an order, the open
+positions) and what quoting needs (post-only limit orders that open or
+close, cancels, order status, executions, the position summary). Keys come from the environment (GMO_API_KEY /
 GMO_API_SECRET) or an env file readable only by root; they are never
 printed or logged.
 
@@ -131,4 +132,54 @@ class GmoPrivate:
 
     async def open_positions(self, symbol: str) -> list[dict]:
         data = await self._call("GET", "/v1/openPositions", params={"symbol": symbol}) or {}
+        return list(data.get("list") or [])
+
+    # Limit orders, for quoting (gmomm).
+
+    async def limit_open(self, symbol: str, side: str, price: str, size: str,
+                         time_in_force: str = "SOK") -> str:
+        """A limit order that opens a position; SOK is post-only."""
+        data = await self._call("POST", "/v1/order", {
+            "symbol": symbol, "side": side, "executionType": "LIMIT",
+            "timeInForce": time_in_force, "price": price, "size": size})
+        return str(data)
+
+    async def limit_close(self, symbol: str, side: str, price: str, size: str,
+                          time_in_force: str = "SOK") -> str:
+        """A limit order that closes this much of the opposite position."""
+        data = await self._call("POST", "/v1/closeBulkOrder", {
+            "symbol": symbol, "side": side, "executionType": "LIMIT",
+            "timeInForce": time_in_force, "price": price, "size": size})
+        return str(data)
+
+    async def market_close_all(self, symbol: str, side: str, size: str) -> str:
+        """A market order that closes this much of the opposite position."""
+        data = await self._call("POST", "/v1/closeBulkOrder", {
+            "symbol": symbol, "side": side, "executionType": "MARKET", "size": size})
+        return str(data)
+
+    async def cancel_order(self, order_id: str) -> None:
+        await self._call("POST", "/v1/cancelOrder", {"orderId": int(order_id)})
+
+    async def cancel_all(self, symbol: str) -> list[str]:
+        data = await self._call("POST", "/v1/cancelBulkOrder", {"symbols": [symbol]})
+        return [str(x) for x in data or []]
+
+    async def orders(self, order_ids: list[str]) -> list[dict]:
+        """Up to ten orders' status and executed size."""
+        data = await self._call("GET", "/v1/orders", params={"orderId": ",".join(order_ids)}) or {}
+        return list(data.get("list") or [])
+
+    async def active_orders(self, symbol: str) -> list[dict]:
+        data = await self._call("GET", "/v1/activeOrders",
+                                params={"symbol": symbol, "count": 100}) or {}
+        return list(data.get("list") or [])
+
+    async def latest_executions(self, symbol: str, count: int = 100) -> list[dict]:
+        data = await self._call("GET", "/v1/latestExecutions",
+                                params={"symbol": symbol, "count": count}) or {}
+        return list(data.get("list") or [])
+
+    async def position_summary(self, symbol: str) -> list[dict]:
+        data = await self._call("GET", "/v1/positionSummary", params={"symbol": symbol}) or {}
         return list(data.get("list") or [])

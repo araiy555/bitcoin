@@ -4775,6 +4775,223 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_gmomm(args: argparse.Namespace) -> int:
+    """Quote GMO's leverage book around the fair price: real limit orders
+    with --live, the same loop against DryApi (nothing sent) without."""
+    import asyncio as _asyncio
+    import signal as _signal
+
+    from .feed.base import FeedStatus as _Status
+    from .live.gmo import GmoPrivate, load_keys
+    from .live.gmomm import DryApi, Maker
+    from .research.daily import Target
+    from .research.fairprice import Grid, feature_names
+
+    coin = args.coin.upper()
+    symbol, perp = f"{coin}_JPY", f"{coin}USDT"
+    keys = load_keys(args.env_file) if args.live else None
+    if args.live and keys is None:
+        console.print("[red]GMO_API_KEY と GMO_API_SECRET を /etc/jsboard.env に入れてください"
+                      "（キーはここには表示しません）。[/red]")
+        return 1
+    model = json.loads(Path(args.model).read_text())
+    if args.hold not in model["weights"]:
+        console.print(f"[red]式に {args.hold}秒 の分がありません（あるのは {', '.join(model['weights'])}秒）。[/red]")
+        return 1
+    weights = model["weights"][args.hold]
+    hinge = float(model.get("hinge_bps", 8.0))
+    gm_inst, gm_feed = await _live_book(Target("gmo", symbol))
+    feeds = {"gmo": gm_feed}
+    insts = {"gmo": gm_inst}
+    try:
+        bybit = await fetch_bybit_instrument(perp, "linear")
+        feeds["bybit"], insts["bybit"] = BybitFeed(bybit, category="linear", depth=50), bybit
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Bybit {perp}: 使えません ({exc})[/yellow]")
+    try:
+        binance = await fetch_futures_instrument(perp)
+        feeds["binance"], insts["binance"] = _binance_lead(binance, 100), binance
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Binance {perp}: 使えません ({exc})[/yellow]")
+    if len(feeds) < 2:
+        console.print("[red]先行市場がありません。[/red]")
+        return 1
+    for c in model.get("cross", []):
+        cperp = f"{c.split('_')[0]}USDT"
+        try:
+            ci = await fetch_futures_instrument(cperp)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]{cperp}: 使えません ({exc})。この材料は 0 として計算します[/yellow]")
+            continue
+        feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
+    grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
+                model.get("cross", []), int(model.get("step_ms", 100)), hinge)
+    if len(weights) != len(feature_names(model.get("cross", []), hinge)):
+        console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
+        return 1
+    books = grid.books
+    tick = float(gm_inst.tick_size)
+
+    def touch():
+        b = books["gmo"]
+        if b.best_bid is None or b.best_ask is None:
+            return None, None
+        return gm_inst.price_f(b.best_bid), gm_inst.price_f(b.best_ask)
+
+    def level(side: int, price: float) -> float:
+        b = books["gmo"]
+        return gm_inst.qty_f((b.bids if side > 0 else b.asks).get(round(price / tick), 0))
+
+    def walk(side: int, qty: float) -> float | None:
+        b = books["gmo"]
+        return b.take(side, qty, gm_inst) if b.best_bid is not None and b.best_ask is not None else None
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(rec: dict) -> None:
+        rec = {"live": bool(args.live), **rec}
+        with log_path.open("a") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        if rec["ev"] == "fill":
+            late = "（取消を出した後）" if rec.get("late") else ""
+            print(f"約定 {rec['side']} {rec['size']:g}枚 @{rec['price']:g}{late}  建玉 {rec['position']:+g}",
+                  flush=True)
+        elif rec["ev"] in ("refused", "unknown", "mismatch", "close_failed", "stopped"):
+            print(json.dumps(rec, ensure_ascii=False, default=str), flush=True)
+
+    async def notify(text: str) -> None:
+        print(text, flush=True)
+        if args.slack:
+            await _post_slack(text)
+
+    session = None
+    past: list = []
+    if args.live:
+        session = make_session()
+        api = GmoPrivate(*keys, session=session)
+        try:
+            held = await api.position_summary(symbol)
+            active = await api.active_orders(symbol)
+            past = await api.latest_executions(symbol)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]GMO の口座を確認できません: {exc}[/red]")
+            await session.close()
+            return 1
+        if active or any(float(r.get("sumPositionQuantity") or 0) > 0 for r in held):
+            console.print(f"[red]{symbol} に注文かポジションがあります。"
+                          "自分の注文に触らないよう、なくしてから始めてください。[/red]")
+            await session.close()
+            return 1
+    else:
+        api = DryApi(tick, touch, level, walk, place_ms=args.dry_place_ms, cancel_ms=args.dry_cancel_ms)
+    stop_jpy = args.stop_jpy if args.stop_jpy is not None else 0.8 * args.max_loss_jpy
+    maker = Maker(api=api, symbol=symbol, tick=tick, size=args.size, width_bps=args.width_bps,
+                  requote_bps=args.requote_bps, max_inv=args.max_inv, skew_bps=args.skew_bps,
+                  max_loss_jpy=args.max_loss_jpy, stop_jpy=stop_jpy,
+                  time_in_force=args.time_in_force, log=record, notify=notify,
+                  where="GMO" if args.live else "ドライラン")
+    maker.seen.update(str(e.get("executionId")) for e in past)
+    mode = "本番（実際に注文します）" if args.live else "ドライラン（注文は出しません）"
+    await notify(
+        f":rocket: GMO 指値を始めました: {mode}\n"
+        f"  {symbol} 1回 {args.size:g}枚・フェア価格 ±{args.width_bps:g}bps・"
+        f"{args.requote_bps:g}bps 動いたら出し直し・在庫 最大 {args.max_inv:g}枚（取消待ちの注文も数える）\n"
+        f"  損失 {stop_jpy:,.0f}円で止める（上限 {args.max_loss_jpy:,.0f}円）・{args.hours:g}時間・"
+        f"式 {Path(args.model).name}（{args.hold}秒先、{args.shrink:g}倍）")
+
+    queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
+    last_seen: dict = {}
+    started = time.time_ns()
+    NS = 1_000_000_000
+
+    async def pump(src: str, feed) -> None:
+        async for event in feed:
+            await queue.put((src, time.time_ns(), event))
+
+    def stop(reason: str) -> None:
+        if not maker.stopping:
+            maker._spawn(maker.flatten(reason))
+
+    async def quoter() -> None:
+        """Every grid step, as in the replay: price GMO and move the quotes."""
+        step = int(model.get("step_ms", 100)) / 1000
+        while not maker.stopping:
+            await _asyncio.sleep(step - (time.time() % step))
+            grid.push()
+            now = time.time_ns()
+            bid, ask = touch()
+            gm = grid.mid("gmo")
+            maker.settle_after(gm)
+            maker.check_loss(bid, ask)
+            if now - last_seen.get("gmo", started) > 60 * NS:
+                stop("GMO の板が1分届いていません")
+                return
+            if (not grid.ready() or gm is None or now - last_seen.get("gmo", 0) > 10 * NS
+                    or not any(now - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance"))):
+                maker.requote(None, bid, ask)   # a feed is quiet: take the quotes away
+                continue
+            p = sum(w * v for w, v in zip(weights, grid.features(gm), strict=True))
+            fair = gm * (1 + args.shrink * p / 1e4)
+            if abs(fair / gm - 1) * 1e4 > args.max_fair_gap_bps:
+                maker.requote(None, bid, ask)   # the model is far off the market: stand aside
+                continue
+            maker.requote(fair, bid, ask)
+
+    async def poller() -> None:
+        n = 0
+        while not maker.stopping:
+            await _asyncio.sleep(1.0)
+            n += 1
+            await maker.poll(grid.mid("gmo"), reconcile=n % 5 == 0)
+
+    tasks = [_asyncio.create_task(pump(src, feed)) for src, feed in feeds.items()]
+    tasks += [_asyncio.create_task(quoter()), _asyncio.create_task(poller())]
+    halt = _asyncio.Event()
+    loop = _asyncio.get_running_loop()
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        # systemctl stop sends SIGTERM: cancel everything and close first.
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, halt.set)
+    end = time.monotonic() + args.hours * 3600
+    next_summary = time.monotonic() + 3600
+    try:
+        while not (maker._flatten is not None and maker._flatten.done()):
+            if halt.is_set():
+                stop("止める指示を受けました")
+            elif time.monotonic() >= end:
+                stop("予定の時間が終わりました")
+            if time.monotonic() >= next_summary and not maker.stopping:
+                next_summary += 3600
+                await notify(f":bar_chart: GMO 指値（{mode}）1時間ごと:\n  {maker.text(*touch())}")
+            try:
+                src, rx, event = await _asyncio.wait_for(queue.get(), timeout=1)
+            except TimeoutError:
+                continue
+            if isinstance(event, _Status) or src not in books:
+                continue
+            if isinstance(event, TradeTick):
+                if src == "gmo" and isinstance(api, DryApi):
+                    api.on_trade(1 if event.aggressor is Side.BUY else -1,
+                                 gm_inst.price_f(event.price), gm_inst.qty_f(event.qty))
+                continue
+            if not isinstance(event, (DepthSnapshot, DepthDelta)):
+                continue
+            books[src].apply(event)
+            last_seen[src] = rx
+    finally:
+        if not maker.stopping:
+            await maker.flatten("プログラムが止まりました")
+        elif maker._flatten is not None:
+            await maker._flatten
+        for t in tasks:
+            t.cancel()
+        await _asyncio.gather(*tasks, return_exceptions=True)
+        if session is not None:
+            await session.close()
+    return 0 if maker.clean else 2
+
+
 async def cmd_gmofollow_report(args: argparse.Namespace) -> int:
     """The live (or shadow) follow run's numbers, from its log."""
     from .live.gmofollow import summary
@@ -8288,6 +8505,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")
     p_gf.add_argument("--slack", action="store_true")
     p_gf.set_defaults(func=cmd_gmofollow)
+
+    p_gm = sub.add_parser("gmomm", help="フェア価格のまわりに GMO で指値（--live で実際に注文。無しなら注文を出さない）")
+    p_gm.add_argument("--coin", default="xrp")
+    p_gm.add_argument("--model", required=True, help="fairprice --save-model で保存した式")
+    p_gm.add_argument("--hold", default="2", help="式のうち何秒先の予想を使うか")
+    p_gm.add_argument("--shrink", type=float, default=0.5, help="予想を何倍に割り引くか")
+    p_gm.add_argument("--width-bps", type=float, default=2.0, help="フェア価格から指値までの幅")
+    p_gm.add_argument("--requote-bps", type=float, default=0.5, help="狙いの値段がこれだけ動くまで出し直さない")
+    p_gm.add_argument("--size", type=float, default=10.0, help="1つの指値の枚数")
+    p_gm.add_argument("--max-inv", type=float, default=30.0, help="在庫の上限（取消待ちの注文も数える）")
+    p_gm.add_argument("--skew-bps", type=float, default=0.5, help="在庫1単位あたり指値をずらす bps")
+    p_gm.add_argument("--max-loss-jpy", type=float, default=500.0)
+    p_gm.add_argument("--stop-jpy", type=float, default=None,
+                      help="この損失で止め始める（省略で上限の8割。決済の間の値動きの余裕）")
+    p_gm.add_argument("--max-fair-gap-bps", type=float, default=20.0,
+                      help="フェア価格が中値からこれ以上離れたら指値を出さない（式の異常よけ）")
+    p_gm.add_argument("--time-in-force", default="SOK", help="SOK＝板に載るだけ（Post-only）")
+    p_gm.add_argument("--hours", type=float, default=24.0)
+    p_gm.add_argument("--live", action="store_true", help="実際に注文する")
+    p_gm.add_argument("--dry-place-ms", type=float, default=200.0, help="ドライランで指値が板に載るまで")
+    p_gm.add_argument("--dry-cancel-ms", type=float, default=200.0, help="ドライランで取消が効くまで")
+    p_gm.add_argument("--env-file", default="/etc/jsboard.env")
+    p_gm.add_argument("--log", default="/var/lib/jsboard/gmomm/log.jsonl")
+    p_gm.add_argument("--slack", action="store_true")
+    p_gm.set_defaults(func=cmd_gmomm)
 
     p_gr = sub.add_parser("gmofollow-report", help="gmofollow の記録をまとめる（約定率・ずれ・遅れ・損益）")
     p_gr.add_argument("log", help="gmofollow --log のファイル")
