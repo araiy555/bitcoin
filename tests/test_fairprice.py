@@ -316,3 +316,17 @@ def test_every_feature_group_is_named_computed_and_saved():
     saved = model_dict(r, cross=(), step_ms=100, latency_ms=200, train=["a,b"], extras=ex)
     assert model_extras(saved) == ex and len(saved["weights"]["2"]) == len(feature_names((), extras=ex))
     assert model_extras({"flow": True}) == ("flow",) and model_extras({}) == ()
+
+
+def test_the_report_says_which_features_were_really_in_the_training_data():
+    from jsboard.research.fairprice import coverage_summary, coverage_text
+
+    rows, mid, end = tape(minutes=4)
+    # Asked for momentum, but this tape has no prints at all: it must say so.
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(0, mid), test=(mid, end),
+            holds=(2.0,), margin_bps=4.0, extras=("flow",))
+    cov = dict(zip(r.names, r.coverage, strict=True))
+    assert cov["bybit 1秒"][0] > 0.5                       # the lead moves: present
+    assert cov["GMO 約定の買い越し 1秒"] == (0.0, 0.0, 0.0)  # no prints: absent
+    assert "データなし: " in coverage_summary(r) and "GMO 約定の買い越し 1秒" in coverage_summary(r)
+    assert any("← データなし" in line for line in coverage_text(r))

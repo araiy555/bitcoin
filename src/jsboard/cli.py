@@ -4401,6 +4401,8 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
         active_split,
         calibration_bands,
         calibration_text,
+        coverage_summary,
+        coverage_text,
         model_dict,
         report,
         run,
@@ -4515,6 +4517,9 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             print(f"  式と入る基準を保存しました: {path}", flush=True)
         print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
         for line in weights_text(r, holds[-1]):
+            print(line)
+        print(f"  （材料が学習データに本当に入っているか: {coverage_summary(r)}）")
+        for line in coverage_text(r):
             print(line)
         results.append(r)
     print()

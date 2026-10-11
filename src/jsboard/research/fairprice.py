@@ -134,8 +134,11 @@ class Fit:
     yy: dict = field(default_factory=dict)
     ysum: dict = field(default_factory=dict)
     n: int = 0
+    nonzero: list = field(default_factory=list)
+    """Per feature, how many training samples had it non-zero."""
 
     def __post_init__(self) -> None:
+        self.nonzero = [0] * self.k
         self.xtx = [[0.0] * self.k for _ in range(self.k)]
         self.xty = {h: [0.0] * self.k for h in self.holds}
         self.yy = {h: 0.0 for h in self.holds}
@@ -145,6 +148,7 @@ class Fit:
         self.n += 1
         for i, xi in enumerate(x):
             if xi:
+                self.nonzero[i] += 1
                 row = self.xtx[i]
                 for j, xj in enumerate(x):
                     row[j] += xi * xj
@@ -154,6 +158,17 @@ class Fit:
                 v[i] += xi * y
             self.yy[h] += y * y
             self.ysum[h] += y
+
+    def coverage(self) -> list[tuple[float, float, float]]:
+        """Per feature over the training samples: (share non-zero, mean,
+        standard deviation), from the sums the fit keeps anyway."""
+        n = max(self.n, 1)
+        out = []
+        for j in range(self.k):
+            mean = self.xtx[0][j] / n
+            var = max(self.xtx[j][j] / n - mean * mean, 0.0)
+            out.append((self.nonzero[j] / n, mean, math.sqrt(var)))
+        return out
 
     def weights(self, ridge: float = 1e-3) -> dict:
         lam = ridge * max(self.n, 1)
@@ -214,6 +229,8 @@ class FairResult:
     """Fitted and traded only where a lead was this far ahead of GMO."""
     variants: dict = field(default_factory=dict)
     """min_gap -> FairResult, for every subset fitted; this one is the pick."""
+    coverage: list = field(default_factory=list)
+    """Per feature: (share non-zero, mean, sd) over the training samples."""
 
 
 class _Series:
@@ -660,6 +677,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         if var.weights is None:
             var.weights = var.fit.weights(ridge)
             var.out.weights = var.weights
+        var.out.coverage = var.fit.coverage()
     if not picked and calibrate:
         # No test period seen (fitting a model to use live): pick all the same.
         pick_variant()
@@ -789,6 +807,23 @@ def calibration_bands(r: FairResult) -> list[str]:
     return out
 
 
+def coverage_text(r: FairResult) -> list[str]:
+    """Whether each feature was really in the training data."""
+    lines = []
+    for name, (share, mean, sd) in zip(r.names, r.coverage, strict=False):
+        flag = "  ← データなし" if share == 0 or (sd == 0 and name != "定数") else ""
+        lines.append(f"  {name}: 0でない割合 {share:.0%}  平均 {mean:+.4g}  ばらつき {sd:.4g}{flag}")
+    return lines
+
+
+def coverage_summary(r: FairResult) -> str:
+    empty = [name for name, (share, _, sd) in zip(r.names, r.coverage, strict=False)
+             if name != "定数" and (share == 0 or sd == 0)]
+    have = len(r.names) - 1 - len(empty)
+    text = f"材料 {len(r.names) - 1}個のうちデータあり {have}個"
+    return text + (f"（データなし: {', '.join(empty)}）" if empty else "")
+
+
 def weights_text(r: FairResult, h: float) -> list[str]:
     w = r.weights.get(h) or []
     return [f"  {name}: {v:+.4f}" for name, v in zip(r.names, w, strict=False)]
@@ -805,5 +840,6 @@ def slack_summary(results: list[FairResult]) -> str:
 
             lines.append(f"  • {r.label} {h:g}秒  モデル（{_scene(r)}・コスト{_margin_text(r.chosen.get(h))}）: "
                          f"{cell(m)}  /  後追い: {cell(s)}  （R² {sc.r2():+.3f}）")
+        lines.append(f"  　{r.label}: 学習 {r.train_n:,}点・試験 {r.test_n:,}点・{coverage_summary(r)}")
     lines.append("  （モデル・学習する場面・入る基準は前の時間帯だけで決め、この時間帯では一度も調整していません）")
     return "\n".join(lines)
