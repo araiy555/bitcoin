@@ -156,6 +156,9 @@ class Maker:
     errors_in_row: int = 0
     mismatches: int = 0
     _later: list = field(default_factory=list)
+    _mids: deque = field(default_factory=deque)
+    """(ns, GMO mid) every grid step for the last half minute: a fill is
+    seen up to a poll late, and is measured from when GMO made it."""
     _seq: object = field(default_factory=itertools.count)
     _tasks: set = field(default_factory=set)
     _sending: set = field(default_factory=set)
@@ -371,26 +374,40 @@ class Maker:
             if late:
                 s.late += 1
                 s.late_qty += qty
-            if mid:
-                s.edge_bps += side * (mid - price) / price * 1e4 * qty
+            then = self.mid_at(when) or mid
+            if then:
+                s.edge_bps += side * (then - price) / price * 1e4 * qty
             for a in AFTER_S:
-                heapq.heappush(self._later, (now + int(a * NS), next(self._seq), side, price, qty, a))
-            rec.update(late=late, cancel_asked_ns=q.cancel_ns, quote_price=q.price, mid=mid)
+                heapq.heappush(self._later, (when + int(a * NS), next(self._seq), side, price, qty, a))
+            rec.update(late=late, cancel_asked_ns=q.cancel_ns, quote_price=q.price, mid=then)
         elif oid not in self.own_ids:
             rec["foreign"] = True
         self._record(rec)
         if rec.get("foreign") and not self.stopping:
             self._spawn(self.flatten("自分のものではない約定がありました（手動の注文？）"))
 
+    def mid_at(self, t_ns: int) -> float | None:
+        """GMO's mid as it stood at `t_ns`, from the grid steps kept."""
+        for t, m in reversed(self._mids):
+            if t <= t_ns:
+                return m
+        return None
+
     def settle_after(self, mid: float | None) -> None:
-        """How the mid moved 0.1/0.5/1/5 s after each fill, in its favour."""
+        """Keep this step's mid; then how the mid moved 0.1/0.5/1/5 s after
+        each fill (counted from GMO's time of the fill), in its favour."""
         now = self.clock()
+        if mid:
+            self._mids.append((now, mid))
+        while self._mids and self._mids[0][0] < now - 30 * NS:
+            self._mids.popleft()
         while self._later and self._later[0][0] <= now:
-            _, _, side, price, qty, a = heapq.heappop(self._later)
-            if mid:
+            due, _, side, price, qty, a = heapq.heappop(self._later)
+            m = self.mid_at(due) or mid
+            if m:
                 cell = self.stats.after[a]
                 cell[0] += qty
-                cell[1] += side * (mid - price) / price * 1e4 * qty
+                cell[1] += side * (m - price) / price * 1e4 * qty
 
     def _status(self, o: dict) -> None:
         oid = str(o.get("orderId"))

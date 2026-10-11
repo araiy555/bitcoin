@@ -275,3 +275,24 @@ def test_live_without_keys_refuses_before_connecting(monkeypatch, tmp_path):
     args = cli.build_parser().parse_args([
         "gmomm", "--live", "--model", "unused.json", "--env-file", str(tmp_path / "none.env")])
     assert asyncio.run(args.func(args)) == 1
+
+
+async def test_a_fill_is_measured_from_when_gmo_made_it_not_when_we_saw_it():
+    from jsboard.live.gmomm import Quote
+
+    m, dry, clock, book, _ = setup()
+    m.quotes.append(Quote(1, 100.0, 10.0, False, clock(), order_id="x"))
+    m.own_ids.add("x")
+    for mid in (100.0, 100.0, 100.0, 100.05, 100.05, 100.05, 100.05, 100.05, 100.05, 100.05, 100.05):
+        m.settle_after(mid)                              # one grid step every 0.1 s
+        clock.t += NS // 10
+    # GMO filled our bid at 0.1 s, at a mid of 100; we only see it now, at 1.1 s.
+    when = dry._t(T0 + NS // 10)
+    m.apply({"executionId": "e1", "orderId": "x", "side": "BUY", "settleType": "OPEN",
+             "size": "10", "price": "100.0", "fee": "0", "timestamp": when}, mid=100.05)
+    m.settle_after(100.05)
+    assert abs(m.stats.edge_bps / m.stats.fill_qty) < 1e-9            # mid at the fill, not now
+    tenth = m.stats.after[0.1]
+    assert abs(tenth[1] / tenth[0]) < 1e-9                            # 0.2 s: still 100
+    one = m.stats.after[1.0]
+    assert abs(one[1] / one[0] - 5.0) < 1e-6                          # 1.1 s: 100.05, +5 bps
