@@ -296,3 +296,28 @@ async def test_a_fill_is_measured_from_when_gmo_made_it_not_when_we_saw_it():
     assert abs(tenth[1] / tenth[0]) < 1e-9                            # 0.2 s: still 100
     one = m.stats.after[1.0]
     assert abs(one[1] / one[0] - 5.0) < 1e-6                          # 1.1 s: 100.05, +5 bps
+
+
+def test_the_key_check_reads_only_and_says_whether_to_start(monkeypatch, tmp_path, capsys):
+    import jsboard.cli as cli
+    from jsboard.live.gmo import GmoPrivate
+
+    env = tmp_path / "jsboard.env"
+    env.write_text("GMO_API_KEY=k\nGMO_API_SECRET=s\n")
+    for k in ("GMO_API_KEY", "GMO_API_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+    calls = []
+
+    async def fake_call(self, method, path, payload=None, params=None):
+        calls.append((method, path))
+        return {"/v1/account/margin": {"availableAmount": "12000"},
+                "/v1/positionSummary": {"list": []},
+                "/v1/activeOrders": {"list": []}}[path]
+
+    monkeypatch.setattr(GmoPrivate, "_call", fake_call)
+    args = cli.build_parser().parse_args(["gmocheck", "--env-file", str(env)])
+    assert asyncio.run(args.func(args)) == 0
+    out = capsys.readouterr().out
+    assert "12,000円" in out and "始められる" in out
+    assert all(m == "GET" for m, _ in calls)          # nothing but reads
+    assert "k" not in out.replace("キー", "")         # the key is never shown

@@ -180,6 +180,10 @@ class GmoPrivate:
                                 params={"symbol": symbol, "count": count}) or {}
         return list(data.get("list") or [])
 
+    async def margin(self) -> dict:
+        """The account's margin: availableAmount is what new orders can use."""
+        return await self._call("GET", "/v1/account/margin") or {}
+
     async def position_summary(self, symbol: str) -> list[dict]:
         data = await self._call("GET", "/v1/positionSummary", params={"symbol": symbol}) or {}
         return list(data.get("list") or [])

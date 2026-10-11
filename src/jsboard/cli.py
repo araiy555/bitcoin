@@ -4992,6 +4992,39 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
     return 0 if maker.clean else 2
 
 
+async def cmd_gmocheck(args: argparse.Namespace) -> int:
+    """Whether the GMO key works, with reads only: the margin free for new
+    orders, and what the account holds and has working on the symbol."""
+    from .live.gmo import GmoPrivate, load_keys
+
+    keys = load_keys(args.env_file)
+    if keys is None:
+        console.print("[red]GMO_API_KEY と GMO_API_SECRET が見つかりません。"
+                      f"{args.env_file} に入れて、sudo を付けて実行してください（キーはここには表示しません）。[/red]")
+        return 1
+    symbol = f"{args.coin.upper()}_JPY"
+    async with make_session() as session:
+        api = GmoPrivate(*keys, session=session)
+        try:
+            margin = await api.margin()
+            held = await api.position_summary(symbol)
+            active = await api.active_orders(symbol)
+        except Exception as exc:  # noqa: BLE001 - say why, never the key
+            console.print(f"[red]GMO に断られました: {exc}[/red]")
+            console.print("キーの権限（照会・注文）と、レバレッジ取引の申込が済んでいるか確認してください。")
+            return 1
+    print("キー: 使えます（注文は出していません）")
+    print(f"新しい注文に使える額: {float(margin.get('availableAmount') or 0):,.0f}円")
+    pos = {r.get("side"): float(r.get("sumPositionQuantity") or 0) for r in held}
+    print(f"{symbol} の建玉: 買 {pos.get('BUY', 0):g}枚・売 {pos.get('SELL', 0):g}枚")
+    print(f"{symbol} の注文中: {len(active)}件")
+    if active or any(pos.values()):
+        print("→ 本番を始める前に、この注文と建玉をなくしてください（プログラムは自分のもの以外に触りません）。")
+    else:
+        print("→ 本番を始められる状態です。")
+    return 0
+
+
 async def cmd_gmofollow_report(args: argparse.Namespace) -> int:
     """The live (or shadow) follow run's numbers, from its log."""
     from .live.gmofollow import summary
@@ -8506,6 +8539,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--log", default="/var/lib/jsboard/gmofollow/trades.jsonl")
     p_gf.add_argument("--slack", action="store_true")
     p_gf.set_defaults(func=cmd_gmofollow)
+
+    p_gc = sub.add_parser("gmocheck", help="GMO の API キーが使えるか確認（照会だけ、注文なし）")
+    p_gc.add_argument("--coin", default="xrp")
+    p_gc.add_argument("--env-file", default="/etc/jsboard.env")
+    p_gc.set_defaults(func=cmd_gmocheck)
 
     p_gm = sub.add_parser("gmomm", help="フェア価格のまわりに GMO で指値（--live で実際に注文。無しなら注文を出さない）")
     p_gm.add_argument("--coin", default="xrp")
