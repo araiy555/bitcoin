@@ -4892,12 +4892,20 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                   time_in_force=args.time_in_force, log=record, notify=notify,
                   where="GMO" if args.live else "ドライラン")
     maker.seen.update(str(e.get("executionId")) for e in past)
+    try:
+        await maker.read_equity()   # the account's value at the start, as GMO counts it
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]GMO の口座の評価額を読めません: {exc}[/red]")
+        if session is not None:
+            await session.close()
+        return 1
     mode = "本番（実際に注文します）" if args.live else "ドライラン（注文は出しません）"
     await notify(
         f":rocket: GMO 指値を始めました: {mode}\n"
         f"  {symbol} 1回 {args.size:g}枚・フェア価格 ±{args.width_bps:g}bps・"
         f"{args.requote_bps:g}bps 動いたら出し直し・在庫 最大 {args.max_inv:g}枚（取消待ちの注文も数える）\n"
-        f"  損失 {stop_jpy:,.0f}円で止める（上限 {args.max_loss_jpy:,.0f}円）・{args.hours:g}時間・"
+        f"  損失 {stop_jpy:,.0f}円で止める（GMO の口座の評価額でも見る、開始時 {maker.equity0:,.0f}円）"
+        f"（上限 {args.max_loss_jpy:,.0f}円）・{args.hours:g}時間・"
         f"式 {Path(args.model).name}（{args.hold}秒先、{args.shrink:g}倍）")
 
     queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)

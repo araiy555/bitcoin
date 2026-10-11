@@ -20,8 +20,11 @@ Guards:
   `max_inv`. An order counts until GMO reports it cancelled or executed;
   a fill GMO has reported in the order's status but not yet in the
   executions still counts.
-- **Loss.** The position is marked where it could be closed (the bid for a
-  long, the ask for a short). At `stop_jpy` the run stops: no new orders;
+- **Loss.** Two counts, either stops the run: the fills as we read them,
+  with the position marked where it could be closed (the bid for a long,
+  the ask for a short); and GMO's own valuation of the account
+  (actualProfitLoss), read every few seconds against its value at the
+  start, which holds whatever our count misses. At `stop_jpy` the run stops: no new orders;
   every order cancelled, and GMO asked until none is left; the position
   closed at market, and GMO asked until none is left. The stop starts
   short of `max_loss_jpy` so the close has room; a gap in the market can
@@ -151,6 +154,9 @@ class Maker:
     stopping: bool = False
     stopped: str | None = None
     clean: bool | None = None
+    equity0: float | None = None
+    """GMO's valuation of the account when the run started."""
+    equity: float | None = None
     """After a stop: True once GMO shows no order and no position of ours."""
     stats: Stats = field(default_factory=Stats)
     errors_in_row: int = 0
@@ -470,6 +476,20 @@ class Maker:
                     f"（買 {self.long_qty:g}・売 {self.short_qty:g}）と合いません"))
         else:
             self.mismatches = 0
+        await self.read_equity()
+
+    async def read_equity(self) -> None:
+        """GMO's own valuation of the account: the loss as GMO counts it."""
+        m = await self.api.margin()
+        eq = float(m.get("actualProfitLoss") or 0)
+        if self.equity0 is None:
+            self.equity0 = eq
+        self.equity = eq
+        loss = self.equity0 - eq
+        if loss >= self.stop_jpy and not self.stopping:
+            self._spawn(self.flatten(
+                f"GMO の口座で損失が {loss:,.0f}円 になりました（{self.stop_jpy:,.0f}円で止める設定、"
+                f"上限 {self.max_loss_jpy:,.0f}円）"))
 
     def check_loss(self, bid: float | None, ask: float | None) -> None:
         pnl = self.pnl(bid, ask)
@@ -561,7 +581,9 @@ class Maker:
             for a, c in ((a, s.after[a]) for a in AFTER_S))
         edge = f"{s.edge_bps / s.fill_qty:+.2f}" if s.fill_qty else "-"
         money = f"{pnl:+,.1f}円（約定1回あたり {per}）" if pnl is not None else "-"
-        return (f"損益 {money}  建玉 {self.position:+g}枚（最大 {s.max_position:g}）\n"
+        gmo = (f"GMO の口座で {self.equity - self.equity0:+,.1f}円  "
+               if self.equity is not None and self.equity0 is not None else "")
+        return (f"{gmo}損益（約定から計算）{money}  建玉 {self.position:+g}枚（最大 {s.max_position:g}）\n"
                 f"  指値 {s.placed}回（受付 {s.acked}・拒否 {s.refused}・板に載らず {s.unlanded}）  "
                 f"取消 {s.cancels}回  在庫枠で見送り {s.held}回  エラー {s.errors}回\n"
                 f"  約定 {s.fills}回 {s.fill_qty:g}枚（うち取消を出した後 {s.late}回 {s.late_qty:g}枚）\n"
@@ -588,6 +610,7 @@ class DryApi:
         self.by_id: dict[str, dict] = {}
         self.execs: list[dict] = []
         self.long = self.short = 0.0
+        self.cash = 0.0
         self._ids = itertools.count(1)
         self.sent = 0
 
@@ -618,6 +641,7 @@ class DryApi:
         self._book(o["id"], o["side"], o["settle"], qty, price)
 
     def _book(self, oid: str, side: int, settle: str, qty: float, price: float) -> None:
+        self.cash -= side * qty * price
         if settle == "CLOSE":
             if side > 0:
                 self.short -= qty
@@ -712,3 +736,9 @@ class DryApi:
     async def position_summary(self, symbol) -> list[dict]:
         return [{"side": k, "sumPositionQuantity": f"{v:g}"}
                 for k, v in (("BUY", self.long), ("SELL", self.short)) if v > 1e-12]
+
+    async def margin(self) -> dict:
+        """The account valued at the mid, from a notional 10,000 yen."""
+        bid, ask = self.touch()
+        mid = (bid + ask) / 2 if bid is not None and ask is not None else 0.0
+        return {"actualProfitLoss": f"{10_000 + self.cash + (self.long - self.short) * mid}"}

@@ -321,3 +321,16 @@ def test_the_key_check_reads_only_and_says_whether_to_start(monkeypatch, tmp_pat
     assert "12,000円" in out and "始められる" in out
     assert all(m == "GET" for m, _ in calls)          # nothing but reads
     assert "k" not in out.replace("キー", "")         # the key is never shown
+
+
+async def test_a_loss_gmo_sees_but_our_fills_miss_still_stops():
+    m, dry, clock, book, _ = setup(stop_jpy=40.0)
+    await m.read_equity()
+    assert m.equity0 == 10_000
+    dry.cash -= 50.0                                     # a cost our fills never show
+    await m.poll(reconcile=True)
+    await turn()
+    await m._flatten
+    assert "GMO の口座で損失" in m.stopped and m.clean is True
+    assert m.pnl(book.bid, book.ask) == 0                # our own count saw nothing
+    assert "GMO の口座で -50.0円" in m.text(book.bid, book.ask)
