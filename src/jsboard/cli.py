@@ -5103,6 +5103,7 @@ async def cmd_fairmm(args: argparse.Namespace) -> int:
         if args.slack:
             await _post_slack(f":warning: フェア価格で指値: {msg}")
         return 1
+    print(f"1回 {args.size:g}枚・在庫の上限 {args.max_inv:g}枚")
     print(hours_line(r))
     print(HEADER)
     for line in rows_of(r):

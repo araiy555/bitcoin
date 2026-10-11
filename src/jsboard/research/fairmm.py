@@ -121,6 +121,7 @@ class MMResult:
     end_mid: float | None = None
     half_spread: float = 0.0
     rebate_bps: float = 0.0
+    size: float = 10.0
 
 
 def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tuple[int, int],
@@ -135,7 +136,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
     weights = model["weights"][hold]
     grid = Grid(gmo, leads, model.get("cross", []), step_ms, float(model.get("hinge_bps", 8.0)))
     books = [Book(c, w, q) for q in requote_bps for c in cancel_ms for w in widths]
-    out = MMResult(label, books)
+    out = MMResult(label, books, size=size)
     step = step_ms * 1_000_000
     tick = float(gmo.tick_size)
     place = int(place_ms * 1e6)
@@ -371,7 +372,7 @@ def hours_line(r: MMResult) -> str:
 
 
 def slack_summary(r: MMResult) -> str:
-    lines = [f":scales: フェア価格で指値（{r.label}、リベート {r.rebate_bps:+g}bps 込み、約定は推定・注文なし）",
+    lines = [f":scales: フェア価格で指値（{r.label}、1回 {r.size:g}枚、リベート {r.rebate_bps:+g}bps 込み、約定は推定・注文なし）",
              f"  {hours_line(r)}"]
     for bk in r.books:
         mark = bk.cash + bk.rebate + (bk.inv * r.end_mid if r.end_mid else 0.0)
