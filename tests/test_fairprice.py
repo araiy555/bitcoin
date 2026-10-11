@@ -1,5 +1,6 @@
 """A fair price fitted on one period and traded on the next."""
 
+import math
 import random
 from decimal import Decimal
 
@@ -285,3 +286,33 @@ def test_momentum_counts_the_last_seconds_only():
     assert g.flow_features()[:2] == [-1.0, (30 - 10) / 40]   # 1 s: the sell; 5 s: both
     g.push(T0 + 10 * NS)
     assert g.flow_features() == [0.0, 0.0, 0.0, 0.0]          # all old, and no Binance prints
+
+
+def test_every_feature_group_is_named_computed_and_saved():
+    from jsboard.core.types import Side
+    from jsboard.feed.base import TradeTick
+    from jsboard.research.fairprice import Grid, model_dict, model_extras
+
+    ex = ("flow", "volume", "depth")
+    names = feature_names(("BTC_JPY",), extras=ex)
+    assert names[-4:] == ["GMO 買い板の厚さ(5段)", "GMO 売り板の厚さ(5段)",
+                          "binance 板の偏り(最良)", "binance 板の偏り(5段)"]
+    g = Grid(GMO, {"bybit": PERP, "binance": PERP, "x:BTC_JPY": PERP}, ("BTC_JPY",), extras=ex)
+    g.apply("gmo", DepthSnapshot(((150_000, 30),), ((150_002, 10),), 1, T0))
+    g.apply("bybit", book(10_000, 10_001, T0))
+    g.apply("binance", DepthSnapshot(((10_000, 3),), ((10_001, 1),), 1, T0))
+    g.trade("binance", T0, TradeTick(10_000, 20, Side.SELL))
+    g.push(T0 + NS // 2)
+    x = g.features(150.001)
+    assert len(x) == len(names)
+    got = dict(zip(names, x, strict=True))
+    assert got["binance 約定の買い越し 1秒"] == -1.0
+    assert abs(got["binance 約定量 1秒"] - math.log1p(20)) < 1e-9
+    assert abs(got["GMO 買い板の厚さ(5段)"] - math.log1p(30)) < 1e-9
+    assert got["binance 板の偏り(最良)"] == 0.5
+    rows, mid, end = tape(minutes=4)
+    r = run(iter(rows), GMO, {"bybit": PERP}, label="XRP", train=(0, mid), test=(mid, end),
+            holds=(2.0,), margin_bps=4.0, extras=ex)
+    saved = model_dict(r, cross=(), step_ms=100, latency_ms=200, train=["a,b"], extras=ex)
+    assert model_extras(saved) == ex and len(saved["weights"]["2"]) == len(feature_names((), extras=ex))
+    assert model_extras({"flow": True}) == ("flow",) and model_extras({}) == ()

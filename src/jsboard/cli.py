@@ -4454,6 +4454,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
 
     cross = [c.strip().upper() for c in (args.cross or "").split(",") if c.strip()]
     holds = tuple(float(x) for x in args.holds.split(","))
+    extras = [e.strip() for e in (args.extras or "").split(",") if e.strip()]
 
     def ns(t: datetime) -> int:
         return int(t.timestamp() * 1e9)
@@ -4495,7 +4496,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
                 margins=tuple(float(m) for m in args.margins.split(",")),
                 cal_start_ns=cal_start,
                 min_gaps=tuple(float(x) for x in args.min_gaps.split(",")),
-                hinge_bps=args.hinge_bps, flow=args.flow)
+                hinge_bps=args.hinge_bps, flow=args.flow, extras=extras)
         for line in report(r):
             print(line, flush=True)
         for line in calibration_text(r):
@@ -4509,7 +4510,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
             path = folder / f"{symbol}.json"
             path.write_text(json.dumps(model_dict(
                 r, cross=used, step_ms=100, latency_ms=args.latency_ms,
-                train=[args.train], hinge_bps=args.hinge_bps, flow=args.flow),
+                train=[args.train], hinge_bps=args.hinge_bps, flow=args.flow, extras=extras),
                 ensure_ascii=False, indent=1))
             print(f"  式と入る基準を保存しました: {path}", flush=True)
         print(f"  （学習 {r.train_n:,} 点・試験 {r.test_n:,} 点。{holds[-1]:g}秒の式の重み:）")
@@ -4561,7 +4562,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
         return 1
     model = None
     if args.model:
-        from .research.fairprice import Grid, feature_names
+        from .research.fairprice import Grid, feature_names, model_extras
 
         model = json.loads(Path(args.model).read_text())
         hold = f"{args.hold_s:g}"
@@ -4581,10 +4582,10 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 console.print(f"[yellow]{cperp}: 使えません ({exc})。この材料は 0 として計算します[/yellow]")
                 continue
             feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
-        flow = bool(model.get("flow"))
+        extras = model_extras(model)
         grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
-                    model.get("cross", []), int(model.get("step_ms", 100)), hinge, flow)
-        if len(weights) != len(feature_names(model.get("cross", []), hinge, flow)):
+                    model.get("cross", []), int(model.get("step_ms", 100)), hinge, extras=extras)
+        if len(weights) != len(feature_names(model.get("cross", []), hinge, extras=extras)):
             console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
             return 1
         books = grid.books
@@ -4790,7 +4791,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
     from .live.gmo import GmoPrivate, load_keys
     from .live.gmomm import DryApi, Maker
     from .research.daily import Target
-    from .research.fairprice import Grid, feature_names
+    from .research.fairprice import Grid, feature_names, model_extras
 
     coin = args.coin.upper()
     symbol, perp = f"{coin}_JPY", f"{coin}USDT"
@@ -4829,10 +4830,10 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
             console.print(f"[yellow]{cperp}: 使えません ({exc})。この材料は 0 として計算します[/yellow]")
             continue
         feeds[f"x:{c}"], insts[f"x:{c}"] = _binance_lead(ci, 100), ci
-    flow = bool(model.get("flow"))
+    extras = model_extras(model)
     grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"},
-                model.get("cross", []), int(model.get("step_ms", 100)), hinge, flow)
-    if len(weights) != len(feature_names(model.get("cross", []), hinge, flow)):
+                model.get("cross", []), int(model.get("step_ms", 100)), hinge, extras=extras)
+    if len(weights) != len(feature_names(model.get("cross", []), hinge, extras=extras)):
         console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
         return 1
     books = grid.books
@@ -8533,6 +8534,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--rule-bps", type=float, default=8.0, help="比べる単純な後追いのしきい")
     p_fp.add_argument("--flow", action="store_true",
                       help="モメンタム（直近 1・5秒に GMO と Binance で買い手と売り手のどちらが多く取ったか）も材料に入れる")
+    p_fp.add_argument("--extras", default="",
+                      help="足す材料: flow（モメンタム）, volume（約定量）, depth（GMO の買い板・売り板の厚さ、Binance の板の偏り）。例: flow,volume,depth")
     p_fp.add_argument("--slack", action="store_true")
     p_fp.add_argument("--save-model", default=None,
                       help="式と入る基準をこのフォルダに銘柄ごとに保存する（本番の gmofollow --model で使う）")

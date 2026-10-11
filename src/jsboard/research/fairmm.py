@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 
 from ..core.types import Instrument, Side
 from ..feed.base import DepthDelta, DepthSnapshot, TradeTick
-from .fairprice import Grid
+from .fairprice import Grid, model_extras
 
 NS = 1_000_000_000
 AFTER_S = (0.1, 0.5, 1.0, 5.0)
@@ -135,7 +135,7 @@ def run(rows, gmo: Instrument, leads: dict, model: dict, *, label: str, test: tu
     fairprice model; its weights for `hold` seconds price GMO."""
     weights = model["weights"][hold]
     grid = Grid(gmo, leads, model.get("cross", []), step_ms, float(model.get("hinge_bps", 8.0)),
-                bool(model.get("flow")))
+                extras=model_extras(model))
     books = [Book(c, w, q) for q in requote_bps for c in cancel_ms for w in widths]
     out = MMResult(label, books, size=size)
     step = step_ms * 1_000_000

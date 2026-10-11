@@ -11,10 +11,14 @@ for GMO's move over the next few seconds:
 - other coins' Binance perps (BTC, ETH): returns over 0.5 and 1 s;
 - GMO itself: returns over 0.1, 0.5 and 1 s, the imbalance of size at
   the touch and over five levels, and the spread;
-- with `flow`, momentum in the quants' sense: of the coins traded on GMO
-  and on Binance over the last 1 and 5 s, how much more the buyers took
-  than the sellers (taker buys less taker sells, over all taken; 0 with
-  no trades).
+- extras, each asked for by name:
+  "flow", momentum in the quants' sense: of the coins traded on GMO and
+  on Binance over the last 1 and 5 s, how much more the buyers took than
+  the sellers (taker buys less taker sells, over all taken; 0 with no
+  trades); "volume", how much was traded there in those windows
+  (log of 1 + coins); "depth", how thick GMO's book is on each side over
+  five levels (log of 1 + coins) and the imbalance of Binance's book at
+  the touch and over five levels.
 
 Everything is sampled on a fixed grid (every `step_ms`). The target is
 GMO's mid from `latency_ms` after the sample (when an order would land)
@@ -52,11 +56,26 @@ LAGS = (1, 5, 10)  # grid steps: 0.1, 0.5, 1 s at the default step
 FLOW_SOURCES = ("gmo", "binance")
 """The recordings with prints: GMO's own and Binance's perp (Bybit's are books only)."""
 FLOW_WINDOWS = (1.0, 5.0)
+EXTRAS = ("flow", "volume", "depth")
+"""Optional feature groups, always in this order."""
+
+
+def model_extras(model: dict) -> tuple:
+    """The feature groups a saved model was fitted with (old models: flow or none)."""
+    return tuple(model.get("extras") or (["flow"] if model.get("flow") else []))
+
+
+def _extras(flow: bool, extras) -> tuple:
+    wanted = set(extras or ()) | ({"flow"} if flow else set())
+    unknown = wanted - set(EXTRAS)
+    if unknown:
+        raise ValueError(f"unknown feature groups: {sorted(unknown)}")
+    return tuple(e for e in EXTRAS if e in wanted)
 BANDS = ((2, 4), (4, 6), (6, 8), (8, 10), (10, 15), (15, float("inf")))
 """Bands of predicted move size (bps) for comparing prediction with outcome."""
 
 
-def feature_names(cross, hinge_bps: float = 8.0, flow: bool = False) -> list[str]:
+def feature_names(cross, hinge_bps: float = 8.0, flow: bool = False, extras=()) -> list[str]:
     names = ["定数"]
     for lead in ("bybit", "binance"):
         names += [f"{lead} {x / 10:g}秒" for x in LAGS] + [f"{lead} との乖離"]
@@ -65,9 +84,15 @@ def feature_names(cross, hinge_bps: float = 8.0, flow: bool = False) -> list[str
     names += ["GMO 板の偏り(最良)", "GMO 板の偏り(5段)", "GMO スプレッド"]
     for c in cross:
         names += [f"{c} 0.5秒", f"{c} 1秒"]
-    if flow:
-        names += [f"{'GMO' if src == 'gmo' else src} 約定の買い越し {w:g}秒"
-                  for src in FLOW_SOURCES for w in FLOW_WINDOWS]
+    ex = _extras(flow, extras)
+    tag = {"gmo": "GMO", "binance": "binance"}
+    if "flow" in ex:
+        names += [f"{tag[src]} 約定の買い越し {w:g}秒" for src in FLOW_SOURCES for w in FLOW_WINDOWS]
+    if "volume" in ex:
+        names += [f"{tag[src]} 約定量 {w:g}秒" for src in FLOW_SOURCES for w in FLOW_WINDOWS]
+    if "depth" in ex:
+        names += ["GMO 買い板の厚さ(5段)", "GMO 売り板の厚さ(5段)",
+                  "binance 板の偏り(最良)", "binance 板の偏り(5段)"]
     return names
 
 
@@ -215,9 +240,11 @@ class Grid:
     same features."""
 
     def __init__(self, gmo: Instrument, leads: dict, cross=(), step_ms: int = 100,
-                 hinge_bps: float = 8.0, flow: bool = False) -> None:
+                 hinge_bps: float = 8.0, flow: bool = False, extras=()) -> None:
         self.gmo = gmo
-        self.flow = flow
+        self.extras = _extras(flow, extras)
+        self.flow = "flow" in self.extras or "volume" in self.extras
+        """Whether prints are kept (momentum and volume read them)."""
         self.trades = {src: deque() for src in FLOW_SOURCES}
         """(receive ns, signed coins, coins) of each print, a few seconds' worth."""
         self.now: int | None = None
@@ -253,7 +280,8 @@ class Grid:
         for dq in self.trades.values():
             dq.clear()
 
-    def flow_features(self) -> list[float]:
+    def _windows(self) -> list[tuple[float, float]]:
+        """(signed coins, coins) taken on each print source in each window."""
         out = []
         for src in FLOW_SOURCES:
             dq = self.trades[src]
@@ -267,8 +295,22 @@ class Grid:
                     if t > since:
                         signed += sq
                         total += q
-                out.append(signed / total if total else 0.0)
+                out.append((signed, total))
         return out
+
+    def flow_features(self) -> list[float]:
+        """Momentum: taker buys less sells, over all taken, per source and window."""
+        return [sg / tot if tot else 0.0 for sg, tot in self._windows()]
+
+    def volume_features(self) -> list[float]:
+        return [math.log1p(tot) for _, tot in self._windows()]
+
+    def depth_features(self) -> list[float]:
+        b = self.books["gmo"]
+        bid5 = sum(q for _, q in heapq.nlargest(5, b.bids.items()))
+        ask5 = sum(q for _, q in heapq.nsmallest(5, b.asks.items()))
+        return [math.log1p(self.gmo.qty_f(bid5)), math.log1p(self.gmo.qty_f(ask5)),
+                self.imbalance(1, "binance"), self.imbalance(5, "binance")]
 
     def mid(self, key: str) -> float | None:
         b, inst = self.books[key], self.insts.get(key)
@@ -276,8 +318,8 @@ class Grid:
             return None
         return (b.best_bid + b.best_ask) / 2 * float(inst.tick_size)
 
-    def imbalance(self, levels: int) -> float:
-        b = self.books["gmo"]
+    def imbalance(self, levels: int, key: str = "gmo") -> float:
+        b = self.books[key]
         bids = heapq.nlargest(levels, b.bids.items())
         asks = heapq.nsmallest(levels, b.asks.items())
         bq, aq = sum(q for _, q in bids), sum(q for _, q in asks)
@@ -324,8 +366,12 @@ class Grid:
         for c in self.cross:
             s = self.series[f"x:{c}"]
             x += [s.ret(5), s.ret(10)]
-        if self.flow:
+        if "flow" in self.extras:
             x += self.flow_features()
+        if "volume" in self.extras:
+            x += self.volume_features()
+        if "depth" in self.extras:
+            x += self.depth_features()
         return x
 
 
@@ -359,7 +405,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         margins=(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0), cal_frac: float = 0.3,
         min_cal_trades: int = 20, cal_start_ns: int | None = None,
         stale_s: float = 10.0, min_gaps=(0.0,), hinge_bps: float = 8.0,
-        flow: bool = False) -> FairResult:
+        flow: bool = False, extras=()) -> FairResult:
     """`rows` yields (source, receive_ns, event) in time order. Sources:
     "gmo" (GMO's book), "bybit" and "binance" (the same coin's perps), and
     "x:<name>" for another coin's perp; `leads` maps each of those sources
@@ -386,7 +432,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     Grid steps where GMO, or every lead, has sent nothing for `stale_s`
     are not sampled: a stopped recording is not a still market. Across a
     gap longer than a minute the grid jumps ahead and starts afresh."""
-    names = feature_names(cross, hinge_bps, flow)
+    names = feature_names(cross, hinge_bps, flow, extras)
     rule_out = {h: Book() for h in holds}
     variants = []
     for v in min_gaps:
@@ -399,7 +445,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
     lat = max(1, round(latency_ms / step_ms))
     hsteps = {h: max(1, round(h * 1000 / step_ms)) for h in holds}
     longest = lat + max(hsteps.values())
-    grid = Grid(gmo, leads, cross, step_ms, hinge_bps, flow)
+    grid = Grid(gmo, leads, cross, step_ms, hinge_bps, flow, extras)
     books, series, mid = grid.books, grid.series, grid.mid
 
     pending: deque = deque()   # (grid index, features, gap, phase) awaiting their target
@@ -587,7 +633,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
                 open_trade(rule_out[h], h, 1 if rgap > 0 else -1, qty)
 
     for src, rx, event in rows:
-        is_print = flow and isinstance(event, TradeTick)
+        is_print = grid.flow and isinstance(event, TradeTick)
         if src not in books or not (is_print or isinstance(event, (DepthSnapshot, DepthDelta))):
             continue
         if grid_t is None:
@@ -664,12 +710,12 @@ def _margin_text(m) -> str:
 
 
 def model_dict(r: FairResult, *, cross, step_ms: int, latency_ms: int, train,
-               hinge_bps: float = 8.0, flow: bool = False) -> dict:
+               hinge_bps: float = 8.0, flow: bool = False, extras=()) -> dict:
     """What the live run needs to price GMO exactly as the replay did."""
     return {
         "symbol": r.label, "names": r.names, "cross": list(cross), "step_ms": step_ms,
         "latency_ms": latency_ms, "train": list(train),
-        "hinge_bps": hinge_bps, "min_gap_bps": r.min_gap, "flow": flow,
+        "hinge_bps": hinge_bps, "min_gap_bps": r.min_gap, "extras": list(_extras(flow, extras)),
         "weights": {f"{h:g}": w for h, w in r.weights.items()},
         "margin_bps": {f"{h:g}": m for h, m in r.chosen.items()},
         "calibration": {f"{m:g}/{h:g}": [b.n, round(b.pnl, 2)] for (m, h), b in r.cal.items()},
