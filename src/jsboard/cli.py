@@ -4926,7 +4926,8 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                   max_loss_jpy=args.max_loss_jpy, stop_jpy=stop_jpy,
                   time_in_force=args.time_in_force, log=record, notify=notify,
                   where="GMO" if args.live else "ドライラン",
-                  tag_names={tag: Path(path).parent.name for tag, path in paths.items()})
+                  tag_names={**{tag: Path(path).parent.name for tag, path in paths.items()},
+                             **({"C": "海外の値段×比率"} if args.leader_arm else {})})
     maker.seen.update(str(e.get("executionId")) for e in past)
     try:
         await maker.read_equity()   # the account's value at the start, as GMO counts it
@@ -4944,8 +4945,11 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
         f"（上限 {args.max_loss_jpy:,.0f}円）・{args.hours:g}時間・"
         f"式 {' / '.join(f'{t}={Path(pth).parent.name}' for t, pth in paths.items())}"
         f"（{args.hold}秒先、{args.shrink:g}倍）"
-        + (f"\n  2つの式を {args.switch_min:g}分ごとに交互に使い、約定をどちらの式の指値かで分けて数えます"
-           if len(models) > 1 else ""))
+        + ("\n  C=海外の値段×比率（予想ではなく、Binance の今の値段に GMO との比率をかける）"
+           if args.leader_arm else "")
+        + (f"\n  {len(models) + bool(args.leader_arm)}つのやり方を {args.switch_min:g}分ごとに順番に使い、"
+           "約定をどのやり方の指値かで分けて数えます"
+           if len(models) + bool(args.leader_arm) > 1 else ""))
 
     queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
     last_seen: dict = {}
@@ -4960,10 +4964,12 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
         if not maker.stopping:
             maker._spawn(maker.flatten(reason))
 
+    tags = list(models) + (["C"] if args.leader_arm else [])
+
     def turn() -> str:
-        if len(models) < 2:
-            return "A"
-        return "AB"[int(time.time() // (args.switch_min * 60)) % 2]
+        if len(tags) < 2:
+            return tags[0]
+        return tags[int(time.time() // (args.switch_min * 60)) % len(tags)]
 
     lead_ref: dict = {}
     """Each lead's mid at the last grid step: a jump from it between steps
@@ -5006,10 +5012,16 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                 maker.tag = tag
                 maker.requote(None, bid, ask)
                 continue
-            w, idx = pricing[tag]
-            x = grid.features(gm)
-            p = sum(wi * x[j] for wi, j in zip(w, idx, strict=True))
-            fair = gm * (1 + args.shrink * p / 1e4)
+            x = grid.features(gm)   # every step: it also keeps the premium's average
+            if tag == "C":
+                fair = grid.leader_fair()   # the leader's price now x the smoothed ratio
+                if fair is None:
+                    maker.requote(None, bid, ask)
+                    continue
+            else:
+                w, idx = pricing[tag]
+                p = sum(wi * x[j] for wi, j in zip(w, idx, strict=True))
+                fair = gm * (1 + args.shrink * p / 1e4)
             if abs(fair / gm - 1) * 1e4 > args.max_fair_gap_bps:
                 maker.requote(None, bid, ask)   # the model is far off the market: stand aside
                 continue
@@ -8633,7 +8645,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gm.add_argument("--model", required=True, help="fairprice --save-model で保存した式")
     p_gm.add_argument("--model-b", default=None,
                       help="比べるもう1つの式。--switch-min 分ごとに交互に使い、約定を式ごとに数える")
-    p_gm.add_argument("--switch-min", type=float, default=10.0, help="2つの式を切り替える間隔（分）")
+    p_gm.add_argument("--switch-min", type=float, default=10.0, help="式を切り替える間隔（分）")
+    p_gm.add_argument("--leader-arm", action="store_true",
+                      help="もう1つ順番に加える: フェア価格＝Binance の今の値段×GMO との比率（1分平均）。予想ではない")
     p_gm.add_argument("--hold", default="2", help="式のうち何秒先の予想を使うか")
     p_gm.add_argument("--shrink", type=float, default=0.5, help="予想を何倍に割り引くか")
     p_gm.add_argument("--width-bps", type=float, default=2.0, help="フェア価格から指値までの幅")

@@ -404,3 +404,22 @@ def test_the_best_levels_are_found_without_sorting_the_whole_book():
             assert Grid._top(book, max(book), n, -1) == want_bid
             assert Grid._top(book, min(book), n, 1) == want_ask
     assert Grid._top({}, None, 5, -1) == 0
+
+
+def test_the_leaders_fair_value_moves_with_the_leader_at_once():
+    from jsboard.research.fairprice import Grid
+
+    g = Grid(GMO, {"binance": PERP})
+    t = T0
+    for _ in range(600):                                  # a minute of GMO at 150, Binance at 1.0
+        t += NS // 10
+        g.apply("gmo", DepthSnapshot(((149_999, 10),), ((150_001, 10),), 1, t))
+        g.apply("binance", DepthSnapshot(((9_999, 10),), ((10_001, 10),), 1, t))
+        g.push(t)
+        g.features(g.mid("gmo"))
+    assert abs(g.leader_fair() - 150.0) < 1e-6
+    # Binance jumps 10 bps; GMO has not moved yet.
+    g.apply("binance", DepthSnapshot(((10_009, 10),), ((10_011, 10),), 1, t))
+    g.features(g.mid("gmo"))
+    assert abs(g.leader_fair() / 150.0 - 1.001) < 2e-5     # the fair value moved the full 10 bps now
+    assert Grid(GMO, {"binance": PERP}).leader_fair() is None

@@ -397,6 +397,18 @@ class Grid:
         return self.mid("gmo") is not None and (
             self.mid("bybit") is not None or self.mid("binance") is not None)
 
+    def leader_fair(self) -> float | None:
+        """GMO's fair value the way a market maker on a follower venue sets
+        it: the deeper market's price now, times the smoothed ratio between
+        the two (the premium's one-minute average, kept by features()). Not
+        a forecast: when the leader moves, this moves with it at once.
+        Binance when it has a book, else Bybit."""
+        for lead in ("binance", "bybit"):
+            lm, avg = self.mid(lead), self.basis_avg.get(lead)
+            if lm and avg is not None:
+                return lm * math.exp(avg / 1e4)
+        return None
+
     def features(self, gmo_mid: float) -> list[float]:
         x = [1.0]
         gmo_1s = self.series["gmo"].ret(10)

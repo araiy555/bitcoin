@@ -361,7 +361,7 @@ async def test_each_fill_counts_for_the_model_that_priced_its_quote():
     assert len(m.tag_lines()) == 2 and "式A" in m.text(book.bid, book.ask)
 
 
-def test_two_models_take_turns_in_a_dry_run(monkeypatch, tmp_path):
+def test_two_models_and_the_leader_price_take_turns_in_a_dry_run(monkeypatch, tmp_path):
     import json
     from decimal import Decimal
 
@@ -405,11 +405,11 @@ def test_two_models_take_turns_in_a_dry_run(monkeypatch, tmp_path):
                                     "weights": {"2": [0.0] * len(feature_names((), extras=extras))}}))
     log = tmp_path / "mm.jsonl"
     args = cli.build_parser().parse_args([
-        "gmomm", "--model", str(base), "--model-b", str(full), "--switch-min", "0.005",
+        "gmomm", "--model", str(base), "--model-b", str(full), "--leader-arm", "--switch-min", "0.005",
         "--hours", "0.0008", "--log", str(log)])
     assert asyncio.run(args.func(args)) == 0
     recs = [json.loads(x) for x in log.read_text().splitlines()]
-    assert {r["tag"] for r in recs if r["ev"] == "placed"} == {"A", "B"}
+    assert {r["tag"] for r in recs if r["ev"] == "placed"} == {"A", "B", "C"}
     [last] = [r for r in recs if r["ev"] == "stopped"]
     assert last["clean"] is True
 
