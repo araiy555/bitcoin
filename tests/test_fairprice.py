@@ -386,3 +386,21 @@ async def test_the_command_runs_with_every_extra_and_all_moments(monkeypatch, ca
     assert "材料が学習データに本当に入っているか" in out
     saved = json.loads((tmp_path / "XRP_JPY.json").read_text())
     assert saved["extras"] == ["flow", "volume", "depth"]
+
+
+def test_the_best_levels_are_found_without_sorting_the_whole_book():
+    import heapq
+
+    from jsboard.research.fairprice import Grid
+
+    rnd = random.Random(5)
+    dense = {p: rnd.randint(1, 50) for p in range(10_000, 12_000)}
+    sparse = {p: rnd.randint(1, 50) for p in range(10_000, 200_000, 997)}   # gaps wider than the walk
+    small = {10_000: 3, 10_010: 4}
+    for book in (dense, sparse, small):
+        for n in (1, 5):
+            want_bid = sum(q for _, q in heapq.nlargest(n, book.items()))
+            want_ask = sum(q for _, q in heapq.nsmallest(n, book.items()))
+            assert Grid._top(book, max(book), n, -1) == want_bid
+            assert Grid._top(book, min(book), n, 1) == want_ask
+    assert Grid._top({}, None, 5, -1) == 0

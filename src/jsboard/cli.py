@@ -4457,6 +4457,13 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
     cross = [c.strip().upper() for c in (args.cross or "").split(",") if c.strip()]
     holds = tuple(float(x) for x in args.holds.split(","))
     extras = [e.strip() for e in (args.extras or "").split(",") if e.strip()]
+    began = time.monotonic()
+
+    def progress(t_ns: int) -> None:
+        from datetime import UTC, datetime
+
+        print(f"  …{datetime.fromtimestamp(t_ns / 1e9, UTC):%m/%d %H:%M} UTC まで読みました"
+              f"（開始から {(time.monotonic() - began) / 60:.0f}分）", flush=True)
 
     def ns(t: datetime) -> int:
         return int(t.timestamp() * 1e9)
@@ -4498,7 +4505,7 @@ async def cmd_fairprice(args: argparse.Namespace) -> int:
                 margins=tuple(float(m) for m in args.margins.split(",")),
                 cal_start_ns=cal_start,
                 min_gaps=tuple(float(x) for x in args.min_gaps.split(",")),
-                hinge_bps=args.hinge_bps, flow=args.flow, extras=extras)
+                hinge_bps=args.hinge_bps, flow=args.flow, extras=extras, progress=progress)
         for line in report(r):
             print(line, flush=True)
         for line in calibration_text(r):

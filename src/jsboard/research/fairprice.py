@@ -233,6 +233,40 @@ class FairResult:
     """Per feature: (share non-zero, mean, sd) over the training samples."""
 
 
+class _Window:
+    """One source's prints over the last `span` ns, with their sums kept as
+    prints come in and age out: reading it costs nothing, however busy the
+    tape (summing the window afresh every grid step made a busy Binance
+    hour take minutes)."""
+
+    __slots__ = ("span", "q", "signed", "total")
+
+    def __init__(self, span: int) -> None:
+        self.span = span
+        self.q: deque = deque()
+        self.signed = self.total = 0.0
+
+    def add(self, t: int, signed: float, qty: float) -> None:
+        self.q.append((t, signed, qty))
+        self.signed += signed
+        self.total += qty
+
+    def at(self, now: int | None) -> tuple[float, float]:
+        """(signed coins, coins) of the prints after `now` - span."""
+        if now is not None:
+            while self.q and self.q[0][0] <= now - self.span:
+                _, sg, qty = self.q.popleft()
+                self.signed -= sg
+                self.total -= qty
+        if not self.q:
+            self.signed = self.total = 0.0   # no drift left behind
+        return self.signed, self.total
+
+    def clear(self) -> None:
+        self.q.clear()
+        self.signed = self.total = 0.0
+
+
 class _Series:
     """One price on the grid: the last `keep` grid values."""
 
@@ -262,8 +296,8 @@ class Grid:
         self.extras = _extras(flow, extras)
         self.flow = "flow" in self.extras or "volume" in self.extras
         """Whether prints are kept (momentum and volume read them)."""
-        self.trades = {src: deque() for src in FLOW_SOURCES}
-        """(receive ns, signed coins, coins) of each print, a few seconds' worth."""
+        self.windows = {(src, w): _Window(int(w * NS)) for src in FLOW_SOURCES for w in FLOW_WINDOWS}
+        """Each print source's prints over each momentum window."""
         self.now: int | None = None
         self.hinge = hinge_bps
         self.gap = 0.0
@@ -282,38 +316,25 @@ class Grid:
 
     def trade(self, src: str, rx: int, event) -> None:
         """A print, for the momentum features (kept only with `flow`)."""
-        if not self.flow or src not in self.trades or not isinstance(event, TradeTick):
+        if not self.flow or src not in FLOW_SOURCES or not isinstance(event, TradeTick):
             return
         inst = self.insts.get(src)
         qty = inst.qty_f(event.qty) if inst is not None else float(event.qty)
         side = 1 if event.aggressor is Side.BUY else -1
-        self.trades[src].append((rx, side * qty, qty))
+        for w in FLOW_WINDOWS:
+            self.windows[(src, w)].add(rx, side * qty, qty)
 
     def forget(self) -> None:
         """Across a gap in the recording: nothing before it counts."""
         self.basis_avg.clear()
         for ser in self.series.values():
             ser.vals.clear()
-        for dq in self.trades.values():
-            dq.clear()
+        for win in self.windows.values():
+            win.clear()
 
     def _windows(self) -> list[tuple[float, float]]:
         """(signed coins, coins) taken on each print source in each window."""
-        out = []
-        for src in FLOW_SOURCES:
-            dq = self.trades[src]
-            if self.now is not None:
-                while dq and dq[0][0] <= self.now - int(max(FLOW_WINDOWS) * NS):
-                    dq.popleft()
-            for w in FLOW_WINDOWS:
-                since = (self.now or 0) - int(w * NS)
-                signed = total = 0.0
-                for t, sq, q in dq:
-                    if t > since:
-                        signed += sq
-                        total += q
-                out.append((signed, total))
-        return out
+        return [self.windows[(src, w)].at(self.now) for src in FLOW_SOURCES for w in FLOW_WINDOWS]
 
     def flow_features(self) -> list[float]:
         """Momentum: taker buys less sells, over all taken, per source and window."""
@@ -324,8 +345,8 @@ class Grid:
 
     def depth_features(self) -> list[float]:
         b = self.books["gmo"]
-        bid5 = sum(q for _, q in heapq.nlargest(5, b.bids.items()))
-        ask5 = sum(q for _, q in heapq.nsmallest(5, b.asks.items()))
+        bid5 = self._top(b.bids, b.best_bid, 5, -1)
+        ask5 = self._top(b.asks, b.best_ask, 5, 1)
         return [math.log1p(self.gmo.qty_f(bid5)), math.log1p(self.gmo.qty_f(ask5)),
                 self.imbalance(1, "binance"), self.imbalance(5, "binance")]
 
@@ -335,11 +356,34 @@ class Grid:
             return None
         return (b.best_bid + b.best_ask) / 2 * float(inst.tick_size)
 
+    @staticmethod
+    def _top(levels: dict, best: int | None, n: int, step: int) -> int:
+        """Size on the `n` best levels, walking out from the best price a
+        tick at a time; sorting the whole book every grid step was slow on a
+        book that keeps every level it ever saw."""
+        if best is None:
+            return 0
+        if len(levels) <= n:
+            return sum(levels.values())
+        total = found = 0
+        p = best
+        for _ in range(500):
+            q = levels.get(p)
+            if q:
+                total += q
+                found += 1
+                if found == n:
+                    return total
+            p += step
+        if found < min(n, len(levels)):   # levels sparser than the walk: sort after all
+            pick = heapq.nlargest if step < 0 else heapq.nsmallest
+            return sum(q for _, q in pick(n, levels.items()))
+        return total
+
     def imbalance(self, levels: int, key: str = "gmo") -> float:
         b = self.books[key]
-        bids = heapq.nlargest(levels, b.bids.items())
-        asks = heapq.nsmallest(levels, b.asks.items())
-        bq, aq = sum(q for _, q in bids), sum(q for _, q in asks)
+        bq = self._top(b.bids, b.best_bid, levels, -1)
+        aq = self._top(b.asks, b.best_ask, levels, 1)
         return (bq - aq) / (bq + aq) if bq + aq else 0.0
 
     def push(self, now: int | None = None) -> None:
@@ -422,7 +466,7 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
         margins=(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0), cal_frac: float = 0.3,
         min_cal_trades: int = 20, cal_start_ns: int | None = None,
         stale_s: float = 10.0, min_gaps=(0.0,), hinge_bps: float = 8.0,
-        flow: bool = False, extras=()) -> FairResult:
+        flow: bool = False, extras=(), progress=None) -> FairResult:
     """`rows` yields (source, receive_ns, event) in time order. Sources:
     "gmo" (GMO's book), "bybit" and "binance" (the same coin's perps), and
     "x:<name>" for another coin's perp; `leads` maps each of those sources
@@ -543,8 +587,17 @@ def run(rows, gmo: Instrument, leads: dict, *, label: str, train: tuple[int, int
             if not var.out.chosen:
                 var.out.chosen = _pick_margins(var.out.cal, margins, holds, min_cal_trades)
 
+    hour = 3600 * NS
+    next_report = [None]
+
     def on_grid(t: int) -> None:
         nonlocal armed, cal_start, train_n
+        if progress is not None:
+            if next_report[0] is None:
+                next_report[0] = (t // hour + 1) * hour
+            elif t >= next_report[0]:
+                progress(t)
+                next_report[0] = (t // hour + 1) * hour
         for action in tasks.pop(g, ()):
             action()
         live_leads = [k for k in ("bybit", "binance") if t - last_rx.get(k, -stale - 1) <= stale]
