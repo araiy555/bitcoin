@@ -4892,7 +4892,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
             late = "（取消を出した後）" if rec.get("late") else ""
             print(f"約定 {rec['side']} {rec['size']:g}枚 @{rec['price']:g}{late}  建玉 {rec['position']:+g}",
                   flush=True)
-        elif rec["ev"] in ("refused", "unknown", "mismatch", "close_failed", "stopped"):
+        elif rec["ev"] in ("refused", "unknown", "mismatch", "close_failed", "stopped", "paused", "feed"):
             print(json.dumps(rec, ensure_ascii=False, default=str), flush=True)
 
     async def notify(text: str) -> None:
@@ -4952,6 +4952,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
            if len(models) + bool(args.leader_arm) > 1 else ""))
 
     queue: _asyncio.Queue = _asyncio.Queue(maxsize=10_000)
+    flow = {"lag": 0.0, "lag_max": 0.0, "pause": None}
     last_seen: dict = {}
     started = time.time_ns()
     NS = 1_000_000_000
@@ -4998,12 +4999,23 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
             gm = grid.mid("gmo")
             maker.settle_after(gm)
             maker.check_loss(bid, ask)
-            if now - last_seen.get("gmo", started) > 60 * NS:
-                stop("GMO の板が1分届いていません")
-                return
-            if (not grid.ready() or gm is None or now - last_seen.get("gmo", 0) > 10 * NS
-                    or not any(now - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance"))):
-                maker.requote(None, bid, ask)   # a feed is quiet: take the quotes away
+            fresh = (now - last_seen.get("gmo", 0) <= 10 * NS
+                     and any(now - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance")))
+            if now - last_seen.get("gmo", started) > args.stale_close_s * NS:
+                # GMO's book has been silent too long to hold a position on:
+                # close everything, but stay up and wait for it to come back.
+                if not maker.paused:
+                    flow["pause"] = _asyncio.ensure_future(maker.pause_close(
+                        f"GMO の板が {args.stale_close_s:g}秒届いていません"
+                        f"（そのときの処理の遅れ {flow['lag']:.1f}秒）"))
+            elif maker.paused and fresh and flow["pause"] is not None and flow["pause"].done():
+                maker.paused = False
+                await notify(f":arrow_forward: GMO 指値を再開します（一時停止 {maker.pauses}回目のあと）")
+            behind = flow["lag"] > args.max_lag_s
+            if (maker.paused or behind or not grid.ready() or gm is None or not fresh):
+                # A feed is quiet, or this program is behind the market it
+                # reads: take the quotes away.
+                maker.requote(None, bid, ask)
                 continue
             tag = turn()
             if tag != maker.tag:
@@ -5052,12 +5064,22 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                 stop("予定の時間が終わりました")
             if time.monotonic() >= next_summary and not maker.stopping:
                 next_summary += 3600
-                await notify(f":bar_chart: GMO 指値（{mode}）1時間ごと:\n  {maker.text(*touch())}")
+                await notify(f":bar_chart: GMO 指値（{mode}）1時間ごと:\n  {maker.text(*touch())}\n"
+                             f"  処理の遅れ 最大 {flow['lag_max']:.1f}秒・一時停止 {maker.pauses}回")
+                flow["lag_max"] = 0.0
             try:
                 src, rx, event = await _asyncio.wait_for(queue.get(), timeout=1)
             except TimeoutError:
                 continue
-            if isinstance(event, _Status) or src not in books:
+            # How far behind the market this program is: an event read now
+            # that arrived long ago means the quotes are being set on old prices.
+            flow["lag"] = (time.time_ns() - rx) / NS
+            flow["lag_max"] = max(flow["lag_max"], flow["lag"])
+            if isinstance(event, _Status):
+                record({"ev": "feed", "src": src, "state": str(getattr(event, "state", "")),
+                        "lag_s": round(flow["lag"], 3)})
+                continue
+            if src not in books:
                 continue
             if isinstance(event, TradeTick):
                 grid.trade(src, rx, event)   # momentum, when the model uses it
@@ -8660,6 +8682,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="この損失で止め始める（省略で上限の8割。決済の間の値動きの余裕）")
     p_gm.add_argument("--pull-bps", type=float, default=2.0,
                       help="Bybit か Binance が前の刻みからこれだけ動いたら、0.1秒を待たずに危ない側の指値を引っ込める（0で無効）")
+    p_gm.add_argument("--stale-close-s", type=float, default=60.0,
+                      help="GMO の板がこれだけ届かなければ、全部閉じて一時停止（戻れば再開）")
+    p_gm.add_argument("--max-lag-s", type=float, default=1.0,
+                      help="このプログラムの処理がこれだけ遅れたら、追いつくまで指値を引っ込める")
     p_gm.add_argument("--max-fair-gap-bps", type=float, default=20.0,
                       help="フェア価格が中値からこれ以上離れたら指値を出さない（式の異常よけ）")
     p_gm.add_argument("--time-in-force", default="SOK", help="SOK＝板に載るだけ（Post-only）")

@@ -161,6 +161,11 @@ class Maker:
     own_ids: set = field(default_factory=set)
     stopping: bool = False
     stopped: str | None = None
+    paused: bool = False
+    """Everything cancelled and closed while a feed is down; quoting
+    resumes once the caller says the feeds are back."""
+    pauses: int = 0
+    max_pauses: int = 5
     clean: bool | None = None
     equity0: float | None = None
     """GMO's valuation of the account when the run started."""
@@ -241,7 +246,8 @@ class Maker:
             work = next((q for q in self.quotes
                          if q.side == side and q.live and q.cancel_ns is None), None)
             want = None
-            if fair is not None and not self.stopping and side * self.position < self.max_inv - 1e-9:
+            if (fair is not None and not self.stopping and not self.paused
+                    and side * self.position < self.max_inv - 1e-9):
                 raw = fair * (1 - side * self.width_bps / 1e4)
                 ticks = (math.floor(raw / self.tick + 1e-9) if side > 0
                          else math.ceil(raw / self.tick - 1e-9))
@@ -544,9 +550,47 @@ class Maker:
             self._flatten = asyncio.ensure_future(self._do_flatten(reason))
         await asyncio.shield(self._flatten)
 
+    async def pause_close(self, reason: str) -> None:
+        """A feed is down: cancel everything and close the position, as a
+        stop does, but stay up; the caller resumes quoting (paused = False)
+        once the feeds are back. A close that cannot be confirmed, or too
+        many pauses in one run, becomes a stop."""
+        if self.stopping or self.paused:
+            return
+        self.paused = True
+        self.pauses += 1
+        if self.pauses > self.max_pauses:
+            await self.flatten(f"{reason}（{self.max_pauses}回を超えて止まったので終わります）")
+            return
+        await self._say(f":pause_button: GMO 指値を一時停止します: {reason}\n"
+                        "  注文を全部取り消して、ポジションを閉じます。板が戻ったら再開します。")
+        problems = await self._cancel_and_close()
+        self._record({"ev": "paused", "reason": reason, "problems": problems,
+                      "position": self.position, "cash": self.cash})
+        if problems:
+            self.paused = False
+            await self.flatten(f"一時停止で閉じきれませんでした（{'・'.join(problems)}）")
+            return
+        await self._say(f":white_check_mark: 一時停止: 注文 0件・ポジション 0 を{self.where}で確認しました。"
+                        "板が戻るのを待ちます。")
+
     async def _do_flatten(self, reason: str) -> None:
         await self._say(f":octagonal_sign: GMO 指値を止めます: {reason}\n"
                         "  注文を全部取り消して、ポジションを閉じます。")
+        problems = await self._cancel_and_close()
+        self.clean = not problems
+        self._record({"ev": "stopped", "reason": reason, "clean": self.clean, "problems": problems,
+                      "position": self.position, "cash": self.cash})
+        if problems:
+            await self._say(":rotating_light: GMO 指値: " + "・".join(problems)
+                            + "。GMO の画面で確認してください。\n  " + self.text())
+        else:
+            await self._say(f":white_check_mark: GMO 指値を止めました。注文 0件・ポジション 0 を{self.where}で確認しました。\n  "
+                            + self.text())
+
+    async def _cancel_and_close(self) -> list[str]:
+        """Cancel everything until GMO lists none, then close the position at
+        market until GMO shows none; what could not be done, if anything."""
         pending = [t for t in self._sending if not t.done()]
         if pending:   # let orders in flight get their ids, so they can be cancelled
             await asyncio.wait(pending, timeout=5)
@@ -596,15 +640,7 @@ class Maker:
             now = self.clock()
             for q in self.quotes:
                 q.dead_ns = q.dead_ns or now
-        self.clean = not problems
-        self._record({"ev": "stopped", "reason": reason, "clean": self.clean, "problems": problems,
-                      "position": self.position, "cash": self.cash})
-        if problems:
-            await self._say(":rotating_light: GMO 指値: " + "・".join(problems)
-                            + "。GMO の画面で確認してください。\n  " + self.text())
-        else:
-            await self._say(f":white_check_mark: GMO 指値を止めました。注文 0件・ポジション 0 を{self.where}で確認しました。\n  "
-                            + self.text())
+        return problems
 
     # ---------------------------------------------------------------- report
 

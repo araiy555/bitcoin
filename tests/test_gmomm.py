@@ -472,3 +472,83 @@ def test_the_command_pulls_quotes_when_a_lead_jumps(monkeypatch, tmp_path, capsy
     assert asyncio.run(args.func(args)) == 0
     pulled = re.findall(r"先回り (\d+)回", capsys.readouterr().out)
     assert pulled and int(pulled[-1]) >= 1
+
+
+async def test_a_pause_closes_everything_but_the_run_goes_on():
+    m, dry, clock, book, said = setup()
+    await quote(m, book, 100.005)
+    clock.t += NS // 2
+    dry.on_trade(-1, 99.900, 10)                         # long 10
+    await m.poll()
+    await m.pause_close("GMO の板が止まった")
+    assert m.paused and not m.stopping and m.stopped is None
+    assert dry.long == dry.short == 0 and not await dry.active_orders("XRP_JPY")
+    await quote(m, book, 100.005)
+    assert not [o for o in dry.by_id.values() if o["status"] in ("WAITING", "ORDERED")]  # nothing while paused
+    m.paused = False                                     # the feeds are back
+    await m.poll()
+    await quote(m, book, 100.005)
+    assert [o for o in dry.by_id.values() if o["status"] in ("WAITING", "ORDERED")]
+    assert any("一時停止" in x for x in said)
+
+
+async def test_too_many_pauses_become_a_stop():
+    m, dry, clock, book, _ = setup(max_pauses=1)
+    await m.pause_close("1回目")
+    m.paused = False
+    await m.pause_close("2回目")
+    assert m.stopping and "2回目" in m.stopped
+
+
+def test_the_command_pauses_when_gmo_goes_quiet_and_resumes(monkeypatch, tmp_path):
+    import json
+    from decimal import Decimal
+
+    import jsboard.cli as cli
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import DepthSnapshot
+    from jsboard.research.fairprice import feature_names
+
+    gmo = Instrument("XRP_JPY", Decimal("0.001"), Decimal("1"), "XRP", "JPY")
+    perp = Instrument("XRPUSDT", Decimal("0.0001"), Decimal("1"), "XRP", "USDT")
+
+    class Script:
+        def __init__(self, price, tick, quiet=None):
+            self.price, self.tick, self.quiet = price, tick, quiet
+
+        async def __aiter__(self):
+            b = round(self.price / self.tick)
+            for i in range(100):
+                if i == self.quiet:
+                    await asyncio.sleep(1.5)          # the feed goes silent
+                await asyncio.sleep(0.05)
+                yield DepthSnapshot(((b, 10_000),), ((b + 2, 10_000),), 1)
+            await asyncio.sleep(3600)
+
+    async def live_book(target):
+        return gmo, Script(150.0, 0.001, quiet=20)
+
+    async def bybit_inst(sym, cat="linear"):
+        return perp
+
+    async def no_binance(sym):
+        raise RuntimeError("off")
+
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_bybit_instrument", bybit_inst)
+    monkeypatch.setattr(cli, "BybitFeed", lambda inst, **kw: Script(1.0, 0.0001))
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_binance)
+    model = tmp_path / "XRP_JPY.json"
+    model.write_text(json.dumps({"symbol": "XRP_JPY", "cross": [], "step_ms": 100,
+                                 "weights": {"2": [0.0] * len(feature_names(()))}}))
+    log = tmp_path / "mm.jsonl"
+    args = cli.build_parser().parse_args([
+        "gmomm", "--model", str(model), "--hours", "0.0016", "--stale-close-s", "0.5",
+        "--log", str(log)])
+    assert asyncio.run(args.func(args)) == 0
+    recs = [json.loads(x) for x in log.read_text().splitlines()]
+    paused = [r for r in recs if r["ev"] == "paused"]
+    assert paused and paused[0]["problems"] == []
+    assert any(r["ev"] == "placed" and r["t_ns"] > paused[0]["t_ns"] for r in recs)   # quoting resumed
+    [last] = [r for r in recs if r["ev"] == "stopped"]
+    assert last["clean"] is True and "予定の時間" in last["reason"]
