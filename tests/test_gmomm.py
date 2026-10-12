@@ -412,3 +412,63 @@ def test_two_models_take_turns_in_a_dry_run(monkeypatch, tmp_path):
     assert {r["tag"] for r in recs if r["ev"] == "placed"} == {"A", "B"}
     [last] = [r for r in recs if r["ev"] == "stopped"]
     assert last["clean"] is True
+
+
+async def test_a_lead_jump_pulls_only_the_quotes_it_threatens():
+    m, dry, clock, book, _ = setup()
+    await quote(m, book, 100.005)
+    clock.t += NS // 2
+    assert m.pull(-1) == 1                               # the lead jumped up: the ask goes
+    await turn()
+    bid = next(q for q in m.quotes if q.side > 0)
+    ask = next(q for q in m.quotes if q.side < 0)
+    assert ask.cancel_ns is not None and bid.cancel_ns is None
+    assert m.pull(-1) == 0 and m.stats.pulls == 1         # nothing left to pull on that side
+
+
+def test_the_command_pulls_quotes_when_a_lead_jumps(monkeypatch, tmp_path, capsys):
+    import json
+    import re
+    from decimal import Decimal
+
+    import jsboard.cli as cli
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import DepthSnapshot
+    from jsboard.research.fairprice import feature_names
+
+    gmo = Instrument("XRP_JPY", Decimal("0.001"), Decimal("1"), "XRP", "JPY")
+    perp = Instrument("XRPUSDT", Decimal("0.0001"), Decimal("1"), "XRP", "USDT")
+
+    class Script:
+        def __init__(self, prices, tick):
+            self.prices, self.tick = prices, tick
+
+        async def __aiter__(self):
+            for p in self.prices:
+                await asyncio.sleep(0.05)
+                b = round(p / self.tick)
+                yield DepthSnapshot(((b, 10_000),), ((b + 1, 10_000),), 1)
+            await asyncio.sleep(3600)
+
+    async def live_book(target):
+        return gmo, Script([150.0] * 60, 0.001)
+
+    async def bybit_inst(sym, cat="linear"):
+        return perp
+
+    async def no_binance(sym):
+        raise RuntimeError("off")
+
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_bybit_instrument", bybit_inst)
+    # Bybit jumps 50 bps up two seconds in: the asks are in its way.
+    monkeypatch.setattr(cli, "BybitFeed", lambda inst, **kw: Script([1.0] * 40 + [1.005] * 20, 0.0001))
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_binance)
+    model = tmp_path / "XRP_JPY.json"
+    model.write_text(json.dumps({"symbol": "XRP_JPY", "cross": [], "step_ms": 100,
+                                 "weights": {"2": [0.0] * len(feature_names(()))}}))
+    args = cli.build_parser().parse_args([
+        "gmomm", "--model", str(model), "--hours", "0.0008", "--log", str(tmp_path / "mm.jsonl")])
+    assert asyncio.run(args.func(args)) == 0
+    pulled = re.findall(r"先回り (\d+)回", capsys.readouterr().out)
+    assert pulled and int(pulled[-1]) >= 1

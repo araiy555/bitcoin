@@ -4965,12 +4965,28 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
             return "A"
         return "AB"[int(time.time() // (args.switch_min * 60)) % 2]
 
+    lead_ref: dict = {}
+    """Each lead's mid at the last grid step: a jump from it between steps
+    pulls the quotes it threatens at once."""
+
+    def lead_jump(src: str) -> None:
+        if args.pull_bps <= 0 or src not in ("bybit", "binance"):
+            return
+        ref, now_mid = lead_ref.get(src), grid.mid(src)
+        if not ref or not now_mid:
+            return
+        move = (now_mid / ref - 1) * 1e4
+        if abs(move) >= args.pull_bps and maker.pull(-1 if move > 0 else 1):
+            lead_ref[src] = now_mid   # once per jump
+
     async def quoter() -> None:
         """Every grid step, as in the replay: price GMO and move the quotes."""
         step = int(model.get("step_ms", 100)) / 1000
         while not maker.stopping:
             await _asyncio.sleep(step - (time.time() % step))
             grid.push(time.time_ns())
+            for k in ("bybit", "binance"):
+                lead_ref[k] = grid.mid(k)
             now = time.time_ns()
             bid, ask = touch()
             gm = grid.mid("gmo")
@@ -5041,6 +5057,7 @@ async def cmd_gmomm(args: argparse.Namespace) -> int:
                 continue
             books[src].apply(event)
             last_seen[src] = rx
+            lead_jump(src)
     finally:
         if not maker.stopping:
             await maker.flatten("プログラムが止まりました")
@@ -8627,6 +8644,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_gm.add_argument("--max-loss-jpy", type=float, default=500.0)
     p_gm.add_argument("--stop-jpy", type=float, default=None,
                       help="この損失で止め始める（省略で上限の8割。決済の間の値動きの余裕）")
+    p_gm.add_argument("--pull-bps", type=float, default=2.0,
+                      help="Bybit か Binance が前の刻みからこれだけ動いたら、0.1秒を待たずに危ない側の指値を引っ込める（0で無効）")
     p_gm.add_argument("--max-fair-gap-bps", type=float, default=20.0,
                       help="フェア価格が中値からこれ以上離れたら指値を出さない（式の異常よけ）")
     p_gm.add_argument("--time-in-force", default="SOK", help="SOK＝板に載るだけ（Post-only）")

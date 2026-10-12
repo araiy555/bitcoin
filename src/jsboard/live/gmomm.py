@@ -109,6 +109,8 @@ class Stats:
     """Orders GMO cancelled before any fill without our asking (post-only)."""
     cancels: int = 0
     held: int = 0
+    pulls: int = 0
+    """Quotes taken away at once because a lead market jumped at them."""
     fills: int = 0
     fill_qty: float = 0.0
     notional: float = 0.0
@@ -269,6 +271,19 @@ class Maker:
                 self._ask_cancel(act[1])
             else:
                 self._send(act[1], act[2])
+
+    def pull(self, side: int) -> int:
+        """Take `side`'s quotes away now, between grid steps: a lead market
+        just jumped at them (up at the asks, down at the bids), and waiting
+        for the next step is how they get picked off. The next step quotes
+        again from the moved fair price."""
+        n = 0
+        for q in self.quotes:
+            if q.side == side and q.live and q.cancel_ns is None:
+                self._ask_cancel(q)
+                n += 1
+        self.stats.pulls += n
+        return n
 
     def _ask_cancel(self, q: Quote) -> None:
         if q.cancel_ns is None:
@@ -622,7 +637,7 @@ class Maker:
                if self.equity is not None and self.equity0 is not None else "")
         return (f"{gmo}損益（約定から計算）{money}  建玉 {self.position:+g}枚（最大 {s.max_position:g}）\n"
                 f"  指値 {s.placed}回（受付 {s.acked}・拒否 {s.refused}・板に載らず {s.unlanded}）  "
-                f"取消 {s.cancels}回  在庫枠で見送り {s.held}回  エラー {s.errors}回\n"
+                f"取消 {s.cancels}回（うち海外の急変で先回り {s.pulls}回）  在庫枠で見送り {s.held}回  エラー {s.errors}回\n"
                 f"  約定 {s.fills}回 {s.fill_qty:g}枚（うち取消を出した後 {s.late}回 {s.late_qty:g}枚）\n"
                 f"  約定時の取り分 {edge}bps  約定後の値動き（bps、プラスが有利）{after}\n"
                 f"  注文→受付 {_median(s.ack_ms)}ms  取消→受付 {_median(s.cancel_ack_ms)}ms  "
