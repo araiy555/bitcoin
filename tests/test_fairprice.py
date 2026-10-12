@@ -330,3 +330,59 @@ def test_the_report_says_which_features_were_really_in_the_training_data():
     assert cov["GMO 約定の買い越し 1秒"] == (0.0, 0.0, 0.0)  # no prints: absent
     assert "データなし: " in coverage_summary(r) and "GMO 約定の買い越し 1秒" in coverage_summary(r)
     assert any("← データなし" in line for line in coverage_text(r))
+
+
+async def test_the_command_runs_with_every_extra_and_all_moments(monkeypatch, capsys, tmp_path):
+    """The exact flags the comparison runs use: it must not stop early."""
+    import gzip
+    import io
+    import json
+    from datetime import UTC, datetime
+
+    import jsboard.cli as cli
+    import jsboard.sim.s3 as s3
+    from jsboard.feed.replay import _encode
+    from jsboard.sim.s3 import S3Target
+
+    rows, mid, end = flow_tape(minutes=6)
+    lines = []
+    for src, rx, event in rows:
+        r = _encode(event)
+        r.update(src=src, rx_ns=rx)
+        lines.append(json.dumps(r))
+    target = S3Target(bucket="b", prefix="raw/lead")
+    spec = {"base": "XRP", "quote": "JPY"}
+    objects = {
+        target.key_for("XRP_JPY", T0, 1): gzip.compress(("\n".join(lines) + "\n").encode()),
+        target.meta_key("XRP_JPY"): json.dumps({"sources": {
+            "gmo": {**spec, "symbol": "XRP_JPY", "tick_size": "0.001", "lot_size": "1",
+                    "taker_bps": 0.0, "min_order": "1"},
+            "bybit": {**spec, "symbol": "XRPUSDT", "tick_size": "0.0001", "lot_size": "1"},
+        }}).encode(),
+    }
+
+    class Bucket:
+        def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+            keys = sorted(k for k in objects if k.startswith(Prefix))
+            return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            return {"Body": io.BytesIO(objects[Key])}
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            if Key not in objects:
+                raise KeyError(Key)
+
+    def iso(ns):
+        return datetime.fromtimestamp(ns / NS, UTC).isoformat()
+
+    monkeypatch.setattr(s3, "default_client", Bucket)
+    args = cli.build_parser().parse_args([
+        "fairprice", "s3://b/raw/lead/", "--only", "XRP_JPY", "--cross", "BTC_JPY,ETH_JPY",
+        "--min-gaps", "0", "--train", f"{iso(T0)},{iso(mid)}", "--test", f"{iso(mid)},{iso(end)}",
+        "--extras", "flow,volume,depth", "--save-model", str(tmp_path)])
+    assert await args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "材料が学習データに本当に入っているか" in out
+    saved = json.loads((tmp_path / "XRP_JPY.json").read_text())
+    assert saved["extras"] == ["flow", "volume", "depth"]
