@@ -5160,6 +5160,64 @@ async def cmd_gmofollow_report(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_fairtake(args: argparse.Namespace) -> int:
+    """On the recording: buy GMO when it is well under the leader's fair
+    value, sell when it is back; fixed gaps, nothing fitted, real book."""
+    import heapq
+    import re
+    from datetime import UTC, datetime
+
+    from .feed.base import FeedStatus as _Status
+    from .feed.replay import iter_tagged_timed
+    from .research.fairtake import HEADER, NOTE, rows_of, run, slack_summary
+    from .sim.s3 import exists, list_parts, read_bytes
+
+    def when(text: str) -> datetime:
+        t = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=UTC)
+
+    a, _, b = args.test.partition(",")
+    start = when(a)
+    end = when(b) if b.strip() else datetime.now(UTC)
+    root = args.path if args.path.endswith("/") else args.path + "/"
+    symbol = args.symbol
+    meta = f"{root}symbol={symbol}/meta.json"
+    specs = json.loads(read_bytes(meta)).get("sources", {}) if exists(meta) else {}
+    if "gmo" not in specs:
+        console.print(f"[red]{symbol} の録画がありません。[/red]")
+        return 1
+    gmo = _instrument_from_spec(specs["gmo"])
+    leads = {k: _instrument_from_spec(specs[k]) for k in ("bybit", "binance") if k in specs}
+    days = sorted({m[1] for uri in list_parts(f"{root}symbol={symbol}/")
+                   if (m := re.search(r"date=(\d{4}-\d{2}-\d{2})/", uri))
+                   and start.date().isoformat() <= m[1] <= end.date().isoformat()})
+
+    def stream():
+        for day in days:
+            for src, rx, event in iter_tagged_timed(f"{root}symbol={symbol}/date={day}/"):
+                if not isinstance(event, _Status) and src in ("gmo", "bybit", "binance"):
+                    yield src, rx, event
+
+    print(f"{symbol}: {start:%Y-%m-%d %H:%M}〜{end:%Y-%m-%d %H:%M} UTC の録画で、フェア価格からのずれを取りに行きます"
+          f"（1回 {args.size:g}枚・ずれ {args.gaps}bps・最長 {args.max_hold_s:g}秒）", flush=True)
+    r = run(heapq.merge(stream(), key=lambda row: row[1]), gmo, leads, label=symbol,
+            test=(int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)),
+            gaps=tuple(float(x) for x in args.gaps.split(",")), size=args.size,
+            latency_ms=args.latency_ms, max_hold_s=args.max_hold_s)
+    if r.hours <= 0:
+        console.print("[red]その時間帯に使える録画がありません。[/red]")
+        return 1
+    print(f"録画のある時間 {r.hours:.1f}時間")
+    print(HEADER)
+    for line in rows_of(r):
+        print(line, flush=True)
+    print()
+    print(NOTE)
+    if args.slack:
+        await _post_slack(slack_summary(r))
+    return 0
+
+
 async def cmd_fairmm(args: argparse.Namespace) -> int:
     """Quote GMO around the saved fair-price model on a recording, after the
     model's training window: fills estimated cautiously, three cancel delays."""
@@ -8703,6 +8761,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_gr.add_argument("--since", default=None, help="この時刻（UTC）以降の合図だけ")
     p_gr.add_argument("--slack", action="store_true")
     p_gr.set_defaults(func=cmd_gmofollow_report)
+
+    p_ft = sub.add_parser("fairtake", help="フェア価格（海外の値段×比率）から GMO が十分ずれたら成行で取り、戻ったら閉じる（録画で再現、注文なし）")
+    p_ft.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
+    p_ft.add_argument("--symbol", default="XRP_JPY")
+    p_ft.add_argument("--test", required=True, help="試す時間帯（UTC、「始め,終わり」、終わりを空けると今まで）")
+    p_ft.add_argument("--gaps", default="4,6,8", help="入るずれ（bps）。全部並べて出す")
+    p_ft.add_argument("--size", type=float, default=50.0, help="1回の枚数")
+    p_ft.add_argument("--latency-ms", type=float, default=200.0, help="注文が約定するまでの遅れ")
+    p_ft.add_argument("--max-hold-s", type=float, default=60.0, help="戻らなくてもこれだけ持ったら閉じる")
+    p_ft.add_argument("--slack", action="store_true")
+    p_ft.set_defaults(func=cmd_fairtake)
 
     p_mm = sub.add_parser("fairmm", help="フェア価格のまわりに GMO で指値を置いたら（録画で再現、約定は保守的に推定、注文なし）")
     p_mm.add_argument("path", help="録画のフォルダ（例: s3://jsboard-capture/raw/lead/）")
