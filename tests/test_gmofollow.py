@@ -285,3 +285,70 @@ def test_the_summary_shows_hours_and_the_result_without_the_extremes():
     text = "\n".join(summary(recs))
     assert "時間帯ごと" in text and "プラスだった時間帯" in text and "勝率 100%" in text
     assert "一番良い 2回を除くと 1回あたり +1.00bps" in text
+
+
+def test_a_position_is_closed_as_soon_as_the_price_is_back_at_fair():
+    clock = Clock()
+    venue = Venue([100.0, 100.05])
+    back = {"at": T0 + 3 * NS}
+    f, records, _ = follower(venue, clock, hold_s=60.0,
+                             exit_when=lambda side: clock() >= back["at"])
+    rec = asyncio.run(f.trade("フェア価格のずれ", 1, 5.0, clock()))
+    assert rec["exit_reason"] == "フェア価格に戻った" and rec["held_s"] < 4
+    assert rec["gmo_pnl_jpy"] == 0.0 and abs(rec["pnl_jpy"] - 0.5) < 1e-9   # 0.5 yen floored to 0
+    assert f.tally.gmo_pnl == 0.0
+
+
+def test_without_the_price_coming_back_the_longest_hold_closes_it():
+    clock = Clock()
+    f, records, _ = follower(Venue([100.0, 99.9]), clock, hold_s=30.0, exit_when=lambda side: False)
+    rec = asyncio.run(f.trade("フェア価格のずれ", 1, 5.0, clock()))
+    assert rec["exit_reason"] == "時間" and rec["held_s"] >= 30
+    assert rec["gmo_pnl_jpy"] == -1.0                                      # -1.0 yen stays -1
+
+
+def test_the_command_takes_the_gap_to_the_leaders_fair_value(monkeypatch, tmp_path):
+    import json
+    from decimal import Decimal
+
+    import jsboard.cli as cli
+    from jsboard.core.types import Instrument
+    from jsboard.feed.base import DepthSnapshot
+
+    gmo = Instrument("XRP_JPY", Decimal("0.001"), Decimal("1"), "XRP", "JPY")
+    perp = Instrument("XRPUSDT", Decimal("0.0001"), Decimal("1"), "XRP", "USDT")
+
+    class Script:
+        def __init__(self, prices, tick):
+            self.prices, self.tick = prices, tick
+
+        async def __aiter__(self):
+            for p in self.prices:
+                await asyncio.sleep(0.05)
+                b = round(p / self.tick)
+                yield DepthSnapshot(((b, 10_000),), ((b + 2, 10_000),), 1)
+            await asyncio.sleep(3600)
+
+    # Bybit jumps 20 bps; GMO follows a second later.
+    async def live_book(target):
+        return gmo, Script([150.0] * 60 + [150.3] * 60, 0.001)
+
+    async def bybit_inst(sym, cat="linear"):
+        return perp
+
+    async def no_binance(sym):
+        raise RuntimeError("off")
+
+    monkeypatch.setattr(cli, "_live_book", live_book)
+    monkeypatch.setattr(cli, "fetch_bybit_instrument", bybit_inst)
+    monkeypatch.setattr(cli, "BybitFeed", lambda inst, **kw: Script([1.0] * 40 + [1.002] * 80, 0.0001))
+    monkeypatch.setattr(cli, "fetch_futures_instrument", no_binance)
+    log = tmp_path / "t.jsonl"
+    args = cli.build_parser().parse_args([
+        "gmofollow", "--fair-leader", "--gap-bps", "4", "--hold-s", "60", "--size", "50",
+        "--hours", "0.0019", "--log", str(log)])
+    assert asyncio.run(args.func(args)) == 0
+    recs = [json.loads(x) for x in log.read_text().splitlines()]
+    done = [r for r in recs if "pnl_jpy" in r]
+    assert done and done[0]["side"] == "BUY" and done[0]["lead"] == "フェア価格のずれ"
+    assert done[0]["exit_reason"] == "フェア価格に戻った" and done[0]["pnl_jpy"] > 0

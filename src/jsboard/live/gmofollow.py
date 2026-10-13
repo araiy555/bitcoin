@@ -131,6 +131,8 @@ class Tally:
     signals: int = 0
     skipped: int = 0
     """Signals that came while a trade was already open, so were not taken."""
+    gmo_pnl: float = 0.0
+    """As GMO pays it: each closed position's profit floored to the yen."""
 
     def text(self) -> str:
         head = f"合図 {self.signals}回（取引中で見送り {self.skipped}回）  "
@@ -139,6 +141,7 @@ class Tally:
         bps = self.pnl / self.notional * 1e4
         exp = self.expected_pnl / self.notional * 1e4
         return head + (f"取引 {self.n}回  勝率 {self.wins / self.n:.0%}  損益 {self.pnl:+,.1f}円（{bps:+.1f}bps）"
+                f"  GMO の決済損益 {self.gmo_pnl:+,.0f}円"
                 f"  検証の計算なら {exp:+.1f}bps  入りの値段のずれ 平均 {self.slip_bps / self.n:+.1f}bps"
                 f"  注文→受付 平均 {self.send_to_ack_ms / self.n:.0f}ms  エラー {self.errors}回")
 
@@ -166,6 +169,12 @@ class Follower:
     open_back: str = "SELL"
     """The side that closes what is open."""
     tally: Tally = field(default_factory=Tally)
+    exit_when: object = None
+    """(side) -> True once the position should be closed before hold_s
+    (the price is back at fair); hold_s is then the longest hold."""
+    gmo_pnl_from_fills: bool = False
+    """Live: take GMO's own lossGain from the closing fills. Shadow: floor
+    the profit to the yen as GMO does."""
     _consecutive_errors: int = 0
 
     def ready(self) -> bool:
@@ -235,12 +244,17 @@ class Follower:
         bid, ask = self.touch()
         rec: dict = {"signal_ns": signal_ns, "lead": lead, "gap_bps": round(gap, 2), "side": word,
                      "size": self.size, "bid_at_signal": bid, "ask_at_signal": ask, **extra}
-        expected = asyncio.ensure_future(self._expected(side, signal_ns, size))
+        # The replay's book-walk prices for a fixed hold; an early close at
+        # fair has its own reference (the book when it was decided).
+        expected = (None if self.exit_when is not None
+                    else asyncio.ensure_future(self._expected(side, signal_ns, size)))
+        rec["entry_book"] = self.walk(side, size)
         t_send = self.clock()
         try:
             oid = await self.api.market_open(self.symbol, word, self.size)
         except Exception as exc:  # noqa: BLE001 - every refusal is recorded and counted
-            expected.cancel()
+            if expected:
+                expected.cancel()
             return await self._failed(rec, "入りの注文", exc)
         t_ack = self.clock()
         fills = await self._wait_fills(oid, size)
@@ -252,7 +266,8 @@ class Follower:
         if got < size - 1e-9:
             # Part or none of it shows as filled: a position may exist that
             # this process does not know the size of. Stop and say so.
-            expected.cancel()
+            if expected:
+                expected.cancel()
             self.open_positions = [(f.position_id, f"{f.size:g}") for f in fills if f.position_id]
             rec["error"] = f"入りの約定が {got:g}/{size:g} しか確認できない"
             self._record(rec)
@@ -263,11 +278,20 @@ class Follower:
         rec.update(entry_price=entry, entry_fee=sum(f.fee for f in fills),
                    entry_fill_time=fills[-1].timestamp, positions=self.open_positions)
 
-        await self.sleep(max(0.0, (t_ack + self.hold_s * NS - self.clock()) / NS))
+        deadline = t_ack + int(self.hold_s * NS)
+        reason = "時間"
+        while self.clock() < deadline:
+            if self.exit_when is not None and self.exit_when(side):
+                reason = "フェア価格に戻った"
+                break
+            await self.sleep(min(0.1, max(0.0, (deadline - self.clock()) / NS)))
+        rec.update(exit_reason=reason, exit_book=self.walk(-side, size),
+                   held_s=round((self.clock() - t_ack) / NS, 2))
         exit_fills, rec2 = await self.close(back)
         rec.update(rec2)
         if not exit_fills:
-            expected.cancel()
+            if expected:
+                expected.cancel()
             self._record(rec)
             await self.stop("決済できませんでした。GMO の画面でポジションを決済してください")
             return rec
@@ -275,7 +299,8 @@ class Follower:
         exit_ = sum(f.price * f.size for f in exit_fills) / out
         fees = rec["entry_fee"] + sum(f.fee for f in exit_fills)
         pnl = side * (exit_ - entry) * size - fees
-        exp = await expected
+        exp = (await expected) if expected else {"expected_entry": rec["entry_book"],
+                                                 "expected_exit": rec["exit_book"]}
         rec.update(exit_price=exit_, fees=fees, pnl_jpy=pnl, pnl_bps=pnl / (entry * size) * 1e4,
                    loss_gain=sum(f.loss_gain for f in exit_fills), **exp)
         if exp["expected_entry"] and exp["expected_exit"]:
@@ -283,6 +308,9 @@ class Follower:
             rec["expected_pnl_bps"] = side * (e_out - e_in) / e_in * 1e4
             rec["entry_slip_bps"] = side * (entry - e_in) / e_in * 1e4
             rec["exit_slip_bps"] = side * (e_out - exit_) / e_out * 1e4
+        gmo = (sum(f.loss_gain for f in exit_fills) if self.gmo_pnl_from_fills
+               else float(math.floor(pnl + 1e-9)))
+        rec["gmo_pnl_jpy"] = gmo
         self._record(rec)
         t = self.tally
         t.n += 1
@@ -292,8 +320,9 @@ class Follower:
         t.expected_pnl += rec.get("expected_pnl_bps", 0.0) / 1e4 * entry * size
         t.slip_bps += rec.get("entry_slip_bps", 0.0)
         t.send_to_ack_ms += rec["send_to_ack_ms"]
+        t.gmo_pnl += gmo
         self._consecutive_errors = 0
-        if t.pnl <= -self.max_loss_jpy:
+        if min(t.pnl, t.gmo_pnl) <= -self.max_loss_jpy:
             await self.stop(f"損失が上限 {self.max_loss_jpy:,.0f}円 に達しました")
         elif t.n >= self.max_trades:
             await self.stop(f"取引回数が上限 {self.max_trades}回 に達しました")

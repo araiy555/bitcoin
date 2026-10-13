@@ -4601,6 +4601,13 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
             console.print("[red]式の材料の数が合いません。fairprice --save-model で作り直してください。[/red]")
             return 1
         books = grid.books
+    elif args.fair_leader:
+        from .research.fairprice import Grid
+
+        # Fair value as a market maker on a follower venue sets it: the
+        # leader's price now x the one-minute GMO/leader ratio.
+        grid = Grid(gm_inst, {k: v for k, v in insts.items() if k != "gmo"}, (), 100)
+        books = grid.books
     else:
         books = {k: _Book() for k in feeds}
 
@@ -4660,13 +4667,28 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
     else:
         api = ShadowApi(walk, latency_s=args.shadow_latency_ms / 1000)
 
+    lead_state = {"fair": None, "lag": 0.0}
+
+    def back_at_fair(side: int) -> bool:
+        """The position's way out: the price it can close at is back at fair."""
+        fair = lead_state["fair"]
+        bid, ask = touch()
+        if fair is None or bid is None:
+            return False
+        return bid >= fair if side > 0 else ask <= fair
+
     follower = Follower(api=api, symbol=symbol, size=args.size, walk=walk, touch=touch,
                         hold_s=args.hold_s, latency_ms=args.latency_ms,
                         max_loss_jpy=args.max_loss_jpy, max_trades=args.max_trades,
-                        log=record, notify=notify)
+                        log=record, notify=notify,
+                        exit_when=back_at_fair if args.fair_leader else None,
+                        gmo_pnl_from_fills=bool(args.live))
     detector = Detector(threshold_bps=args.threshold_bps)
     mode = "本番（実際に注文します）" if args.live else "シャドー（注文は出しません）"
-    if model and margin is None:
+    if args.fair_leader:
+        rule = (f"フェア価格（Binance の今の値段×GMO との比率の1分平均）より GMO が {args.gap_bps:g}bps 以上"
+                f"ずれたら成行で入り、フェア価格に戻ったら（最長 {args.hold_s:g}秒）成行で閉じる")
+    elif model and margin is None:
         rule = f"フェア価格の式（{Path(args.model).name}）は、学習期間でどの基準でも儲からなかったので入りません"
     elif model:
         scene = f"海外が {min_gap:g}bps 以上先に動いた場面で、" if min_gap else ""
@@ -4675,7 +4697,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
         rule = f"先行が {args.threshold_bps:g}bps 以上先に動いたとき"
     await notify(
         f":rocket: GMO 後追いを始めました: {mode}\n"
-        f"  {symbol} 1回 {args.size}枚・{args.hold_s:g}秒で決済・同時に1つまで・"
+        f"  {symbol} 1回 {args.size}枚・{'最長 ' if args.fair_leader else ''}{args.hold_s:g}秒で決済・同時に1つまで・"
         f"{rule}（{'/'.join(k for k in feeds if k != 'gmo')}）\n"
         f"  損失の上限 {args.max_loss_jpy:,.0f}円・最大 {args.max_trades}回・{args.hours:g}時間")
 
@@ -4734,8 +4756,65 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 trades.add(task)
                 task.add_done_callback(trades.discard)
 
+    async def leader_take() -> None:
+        """Every 0.1 s: GMO's gap to the leader's fair value; take it when it
+        is `gap_bps` or more and nothing is open."""
+        armed = [True]
+        while True:
+            await _asyncio.sleep(0.1 - (time.time() % 0.1))
+            now_ns = time.time_ns()
+            grid.push(now_ns)
+            gm = grid.mid("gmo")
+            if gm is None or not grid.ready():
+                continue
+            grid.features(gm)   # keeps the GMO/leader ratio's average current
+            fresh = (now_ns - last_seen.get("gmo", 0) <= 10 * NS and any(
+                now_ns - last_seen.get(k, 0) <= 10 * NS for k in ("bybit", "binance")))
+            lead_state["fair"] = grid.leader_fair() if fresh else None
+            fair = lead_state["fair"]
+            bid, ask = touch()
+            if fair is None or bid is None or lead_state["lag"] > args.max_lag_s:
+                armed[0] = True
+                continue   # a feed is quiet, or this program is behind it
+            side = (1 if (fair - ask) / fair * 1e4 >= args.gap_bps
+                    else -1 if (bid - fair) / fair * 1e4 >= args.gap_bps else 0)
+            if not side:
+                armed[0] = True
+                continue
+            # One gap is one signal; a run of steps above the line is not many.
+            fresh_signal, armed[0] = armed[0], False
+            if not (fresh_signal or follower.ready()):
+                continue
+            gap = (fair - ask if side > 0 else bid - fair) / fair * 1e4
+            extra = {"fair": round(fair, 4), "bid_at_signal": bid, "ask_at_signal": ask,
+                     "gap_bps_at_signal": round(gap, 2)}
+            if follower.saw_signal("フェア価格のずれ", side, gap, now_ns, extra):
+                task = _asyncio.create_task(follower.trade("フェア価格のずれ", side, gap, now_ns, extra))
+                trades.add(task)
+                task.add_done_callback(trades.discard)
+
+    async def equity_watch() -> None:
+        """Live: GMO's own valuation of the account against its start, so the
+        loss limit holds whatever the fills miss (GMO floors each close)."""
+        start_eq = None
+        while follower.stopped is None:
+            try:
+                eq = float((await api.margin()).get("actualProfitLoss") or 0)
+            except Exception:  # noqa: BLE001 - try again next time
+                eq = None
+            if eq is not None:
+                start_eq = eq if start_eq is None else start_eq
+                if start_eq - eq >= 0.8 * args.max_loss_jpy:
+                    await follower.stop(f"GMO の口座で損失が {start_eq - eq:,.0f}円 になりました")
+                    return
+            await _asyncio.sleep(10)
+
     if model:
         pumps.append(_asyncio.create_task(fair_price()))
+    elif args.fair_leader:
+        pumps.append(_asyncio.create_task(leader_take()))
+    if args.live:
+        pumps.append(_asyncio.create_task(equity_watch()))
     halt = _asyncio.Event()
     import signal as _signal
 
@@ -4757,6 +4836,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 if event.state != "live":
                     detector.reset(src)
                 continue
+            lead_state["lag"] = (time.time_ns() - rx) / NS
             if model and isinstance(event, TradeTick):
                 grid.trade(src, rx, event)   # momentum, when the model uses it
                 continue
@@ -4766,7 +4846,7 @@ async def cmd_gmofollow(args: argparse.Namespace) -> int:
                 continue
             books[src].apply(event)
             last_seen[src] = rx
-            signal = None if model else detector.update(src, rx, mid(src))
+            signal = None if (model or args.fair_leader) else detector.update(src, rx, mid(src))
             if signal and follower.saw_signal(*signal, rx):
                 lead, side, gap = signal
                 task = _asyncio.create_task(follower.trade(lead, side, gap, rx))
@@ -8707,6 +8787,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gf.add_argument("--hours", type=float, default=24.0)
     p_gf.add_argument("--model", default=None,
                       help="フェア価格の式（fairprice --save-model で作った JSON）。指定すると後追いの代わりにこれで入る")
+    p_gf.add_argument("--fair-leader", action="store_true",
+                      help="フェア価格（Binance の値段×比率）から --gap-bps ずれたら入り、戻ったら閉じる（--hold-s が最長）")
+    p_gf.add_argument("--gap-bps", type=float, default=4.0, help="--fair-leader で入るずれ")
+    p_gf.add_argument("--max-lag-s", type=float, default=1.0, help="このプログラムの処理がこれだけ遅れたら入らない")
     p_gf.add_argument("--live", action="store_true", help="実際に注文する")
     p_gf.add_argument("--shadow-latency-ms", type=float, default=200.0,
                       help="シャドーで、注文を出してから約定するまでの遅れ（その時点の板で約定させる）")
